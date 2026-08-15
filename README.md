@@ -69,9 +69,15 @@ cd magent
 ./scripts/install.sh
 ```
 
-The script builds a release binary and places it in `plugin/bin/`, which Claude
-Code adds to `PATH` while the plugin is enabled — so the hooks find `magent`
-without absolute paths.
+The script builds a release binary and places it twice, because Claude Code and
+a terminal resolve it differently:
+
+- `plugin/bin/magent` is what the plugin's manifests invoke through
+  `${CLAUDE_PLUGIN_ROOT}`. The plugin's `bin/` is added to the Bash tool's PATH
+  only, never to the environment hooks and MCP servers are launched in, so the
+  manifests use an explicit path.
+- `~/.local/bin/magent` is a symlink, so `magent import` and the rest work from
+  a terminal. Set `MAGENT_BIN_DIR` to put it elsewhere.
 
 Then, in Claude Code:
 

@@ -65,9 +65,11 @@ impl Store {
         let now = Utc::now().to_rfc3339();
 
         let existing: Option<String> = tx
-            .query_row("SELECT id FROM workspaces WHERE name = ?1", [name], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT id FROM workspaces WHERE name = ?1 AND explicit = 1",
+                [name],
+                |row| row.get(0),
+            )
             .ok();
 
         let workspace_id = if let Some(id) = existing {
@@ -75,7 +77,8 @@ impl Store {
         } else {
             let id = WorkspaceId::new();
             tx.execute(
-                "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
+                "INSERT INTO workspaces (id, name, created_at, explicit)
+                     VALUES (?1, ?2, ?3, 1)",
                 (id.to_string(), name, &now),
             )?;
             id
@@ -174,9 +177,11 @@ impl Store {
     pub fn workspace_id_by_name(&self, name: &str) -> Result<Option<WorkspaceId>, StoreError> {
         let connection = self.lock()?;
         let found: Option<String> = connection
-            .query_row("SELECT id FROM workspaces WHERE name = ?1", [name], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT id FROM workspaces WHERE name = ?1 AND explicit = 1",
+                [name],
+                |row| row.get(0),
+            )
             .ok();
 
         found.map(|id| parse_id(&id)).transpose()
@@ -200,6 +205,7 @@ impl Store {
         let mut statement = connection.prepare(
             "SELECT w.name, COUNT(r.id) FROM workspaces w
              LEFT JOIN repositories r ON r.workspace_id = w.id
+             WHERE w.explicit = 1
              GROUP BY w.id ORDER BY w.name",
         )?;
         let rows = statement

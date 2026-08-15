@@ -131,6 +131,12 @@ impl Store {
 
     /// # Errors
     /// Fails on a database error.
+    pub fn repository_count(&self) -> Result<usize, StoreError> {
+        self.scalar_count("SELECT COUNT(*) FROM repositories", [])
+    }
+
+    /// # Errors
+    /// Fails on a database error.
     pub fn total_checkpoint_count(&self) -> Result<usize, StoreError> {
         self.scalar_count("SELECT COUNT(*) FROM checkpoints", [])
     }
@@ -864,6 +870,46 @@ pub(crate) fn upsert_repository(
             repository_id: parse_id(&repository_id)?,
             identity_key,
             toplevel: PathBuf::from(canonical_root),
+            origin_url: probe.origin_url.clone(),
+            git: probe.git.clone(),
+            role: enum_from_sql(&role)?,
+        });
+    }
+
+    // A repository first seen while git was unavailable was filed under its
+    // path, because that was all that could be known. When git returns, the same
+    // directory resolves to an origin — and a second row for it would split the
+    // project's memory in two, silently and for good. The existing row is
+    // upgraded instead.
+    //
+    // Only ever path to origin: an origin identity is the better one, and
+    // downgrading would undo the merge on the next outage.
+    if probe.origin_url.is_some()
+        && let Some((repository_id, workspace_id, role)) = tx
+            .query_row(
+                "SELECT id, workspace_id, role FROM repositories
+                 WHERE canonical_root = ?1 AND identity_key LIKE 'path:%'",
+                [&root_text],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+    {
+        tx.execute(
+            "UPDATE repositories SET identity_key = ?1, origin_url = ?2 WHERE id = ?3",
+            (&identity_key, probe.origin_url.as_deref(), &repository_id),
+        )?;
+
+        return Ok(WorkspaceResolution {
+            workspace_id: parse_id(&workspace_id)?,
+            repository_id: parse_id(&repository_id)?,
+            identity_key,
+            toplevel: probe.root.clone(),
             origin_url: probe.origin_url.clone(),
             git: probe.git.clone(),
             role: enum_from_sql(&role)?,

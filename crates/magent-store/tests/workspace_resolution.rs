@@ -224,6 +224,46 @@ fn resolving_the_same_repository_twice_is_stable() {
     assert_eq!(first.workspace_id, second.workspace_id);
 }
 
+/// A repository first seen while git was unavailable gets a path identity,
+/// because that is all that can be known then. When git comes back, the same
+/// directory resolves to an origin identity — and creating a second row for it
+/// would split the project's memory in two, silently and permanently.
+///
+/// This is not hypothetical: it happened on this machine when the Xcode command
+/// line tools vanished mid-session and took `git` with them.
+#[test]
+fn a_repository_first_seen_without_git_is_upgraded_rather_than_duplicated() {
+    let (dir, store) = temp_store();
+
+    // An ordinary neighbour, so the count below distinguishes "upgraded" from
+    // "nothing was recorded at all".
+    let neighbour = dir.path().join("service");
+    init_repo(&neighbour, Some("git@github.com:acme/service.git"));
+    store.resolve_workspace_for(&neighbour).expect("neighbour");
+
+    // Stand in for a broken git: resolve the path before the repository is
+    // discoverable, which is the state a missing toolchain leaves behind.
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).expect("mkdir");
+    let degraded = store.resolve_workspace_for(&plain).expect("degraded");
+    assert!(degraded.identity_key.starts_with("path:"));
+
+    // Now give that same path an origin, as restoring git would.
+    init_repo(&plain, Some("git@github.com:acme/plain.git"));
+    let recovered = store.resolve_workspace_for(&plain).expect("recovered");
+
+    assert_eq!(
+        recovered.repository_id, degraded.repository_id,
+        "the repository was duplicated instead of upgraded, so its memory is now split"
+    );
+    assert_eq!(recovered.identity_key, "git:github.com/acme/plain");
+    assert_eq!(
+        store.repository_count().expect("count"),
+        2,
+        "one for each directory, not three"
+    );
+}
+
 // --- git state -------------------------------------------------------------
 
 #[test]
