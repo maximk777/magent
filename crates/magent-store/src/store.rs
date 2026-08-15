@@ -648,7 +648,7 @@ impl Store {
     /// A replay with the same request returns the recorded response. A replay
     /// carrying a *different* request is an error rather than a silent answer to
     /// a question that was never asked.
-    fn execute_operation<C, R>(
+    pub(crate) fn execute_operation<C, R>(
         &self,
         kind: &str,
         operation_id: OperationId,

@@ -9,7 +9,7 @@ use magent_core::{
     CheckpointCommand, CheckpointOrigin, FinishAction, FinishRunCommand, HarnessKind, OperationId,
     RunId, RunStatus, SessionId, StartRunCommand, WorkflowStage,
 };
-use magent_store::{Store, StoreError};
+use magent_store::{CURRENT_VERSION, Store, StoreError};
 
 /// Set on a re-invocation of this test binary to make it act as a competing
 /// writer process instead of running assertions.
@@ -69,7 +69,12 @@ fn open_sets_the_pragmas_the_design_depends_on() {
 
     assert_eq!(store.journal_mode().expect("journal_mode"), "wal");
     assert!(store.foreign_keys_enabled().expect("foreign_keys"));
-    assert_eq!(store.schema_version().expect("schema_version"), 1);
+    // Against the constant, not a literal: the property is that opening
+    // migrates to what this build understands, which changes every slice.
+    assert_eq!(
+        store.schema_version().expect("schema_version"),
+        CURRENT_VERSION
+    );
 }
 
 #[test]
@@ -78,7 +83,10 @@ fn opening_an_existing_database_is_a_no_op() {
     Store::open(&path).expect("first open");
     let reopened = Store::open(&path).expect("second open");
 
-    assert_eq!(reopened.schema_version().expect("schema_version"), 1);
+    assert_eq!(
+        reopened.schema_version().expect("schema_version"),
+        CURRENT_VERSION
+    );
 }
 
 // --- durability ------------------------------------------------------------

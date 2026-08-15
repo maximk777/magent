@@ -1,13 +1,8 @@
-use std::{
-    fmt,
-    path::{Path, PathBuf},
-    str::FromStr,
-};
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::error::{DomainError, Validate};
 
@@ -15,53 +10,54 @@ use crate::error::{DomainError, Validate};
 ///
 /// The hook binary, the Web UI and `jq` in the docs all read these ids by hand,
 /// so `{"0": "..."}` wrappers are not acceptable.
+#[macro_export]
 macro_rules! uuid_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
         #[derive(
             Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash,
-            Serialize, Deserialize, JsonSchema,
+            ::serde::Serialize, ::serde::Deserialize, ::schemars::JsonSchema,
         )]
         #[serde(transparent)]
-        pub struct $name(Uuid);
+        pub struct $name(::uuid::Uuid);
 
         impl $name {
             /// Generates a fresh random id.
             #[must_use]
             pub fn new() -> Self {
-                Self(Uuid::new_v4())
+                Self(::uuid::Uuid::new_v4())
             }
 
             /// Wraps an existing UUID.
             #[must_use]
-            pub const fn from_uuid(uuid: Uuid) -> Self {
+            pub const fn from_uuid(uuid: ::uuid::Uuid) -> Self {
                 Self(uuid)
             }
 
             /// The underlying UUID.
             #[must_use]
-            pub const fn as_uuid(&self) -> Uuid {
+            pub const fn as_uuid(&self) -> ::uuid::Uuid {
                 self.0
             }
         }
 
-        impl Default for $name {
+        impl ::core::default::Default for $name {
             fn default() -> Self {
                 Self::new()
             }
         }
 
-        impl fmt::Display for $name {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                fmt::Display::fmt(&self.0, formatter)
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                ::core::fmt::Display::fmt(&self.0, formatter)
             }
         }
 
-        impl FromStr for $name {
-            type Err = uuid::Error;
+        impl ::core::str::FromStr for $name {
+            type Err = ::uuid::Error;
 
-            fn from_str(value: &str) -> Result<Self, Self::Err> {
-                Ok(Self(Uuid::parse_str(value)?))
+            fn from_str(value: &str) -> ::core::result::Result<Self, Self::Err> {
+                Ok(Self(::uuid::Uuid::parse_str(value)?))
             }
         }
     };

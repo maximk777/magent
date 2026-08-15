@@ -19,6 +19,18 @@ pub enum DomainError {
 
     #[error("outcome must not be blank")]
     InvalidOutcome,
+
+    #[error("a fact name must be a lowercase slug")]
+    InvalidFactName,
+
+    #[error("a fact must have a title or a body")]
+    InvalidFactBody,
+
+    #[error("confidence must be between 0 and 1")]
+    InvalidConfidence,
+
+    #[error("a verified fact must cite evidence")]
+    VerifiedWithoutEvidence,
 }
 
 impl DomainError {
@@ -33,6 +45,10 @@ impl DomainError {
             Self::InvalidHandoffSummary => "invalid_handoff_summary",
             Self::InvalidCheckpointStage => "invalid_checkpoint_stage",
             Self::InvalidOutcome => "invalid_outcome",
+            Self::InvalidFactName => "invalid_fact_name",
+            Self::InvalidFactBody => "invalid_fact_body",
+            Self::InvalidConfidence => "invalid_confidence",
+            Self::VerifiedWithoutEvidence => "verified_without_evidence",
         }
     }
 }

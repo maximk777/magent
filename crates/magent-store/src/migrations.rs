@@ -4,9 +4,10 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::error::StoreError;
 
 /// Schema version this build writes and understands.
-pub const CURRENT_VERSION: i64 = 1;
+pub const CURRENT_VERSION: i64 = 2;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
+const MIGRATION_0002: &str = include_str!("../migrations/0002_facts.sql");
 
 /// Brings `connection` up to [`CURRENT_VERSION`].
 ///
@@ -21,12 +22,14 @@ pub fn apply(connection: &mut Connection) -> Result<(), StoreError> {
         return Err(StoreError::UnsupportedSchema(installed));
     }
 
-    if installed < 1 {
-        transaction.execute_batch(MIGRATION_0001)?;
-        transaction.execute(
-            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
-            (CURRENT_VERSION, Utc::now().to_rfc3339()),
-        )?;
+    for (version, sql) in [(1, MIGRATION_0001), (2, MIGRATION_0002)] {
+        if installed < version {
+            transaction.execute_batch(sql)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                (version, Utc::now().to_rfc3339()),
+            )?;
+        }
     }
 
     transaction.commit()?;
