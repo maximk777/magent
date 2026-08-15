@@ -8,8 +8,8 @@ use std::path::Path;
 
 use chrono::Utc;
 use magent_core::{
-    CheckpointOrigin, FileLedgerEntry, HarnessKind, RunId, RunSnapshot, SessionId, WorkflowStage,
-    WorkspaceId,
+    CheckpointOrigin, FileLedgerEntry, HarnessKind, RunId, RunSnapshot, SessionId, StartRunCommand,
+    StartRunResult, WorkflowStage, WorkspaceId,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 
@@ -164,6 +164,45 @@ impl Store {
         })
     }
 
+    /// Opens a run, or joins the one already in flight for this workspace.
+    ///
+    /// The hook layer opens a run on the first prompt, so by the time the model
+    /// calls `magent_start` there is usually one already. Creating a second
+    /// would split one task across two runs: the model would checkpoint into
+    /// one while the hooks recorded edits and the restoration packet into the
+    /// other, and neither would be complete.
+    ///
+    /// An explicit `resume_run_id` always wins, since that names a specific run.
+    ///
+    /// # Errors
+    /// Fails on a database error, or if the named run cannot be resumed.
+    pub fn adopt_or_start_run(
+        &self,
+        command: &StartRunCommand,
+        harness: HarnessKind,
+    ) -> Result<StartRunResult, StoreError> {
+        if command.resume_run_id.is_some() {
+            return self.start_run(command, harness);
+        }
+
+        let Some(root) = command.workspace_roots.first() else {
+            return self.start_run(command, harness);
+        };
+
+        let in_flight = self.latest_open_run_for_path(root)?;
+        let Some(existing) = in_flight else {
+            return self.start_run(command, harness);
+        };
+
+        self.start_run(
+            &StartRunCommand {
+                resume_run_id: Some(existing.run_id),
+                ..command.clone()
+            },
+            harness,
+        )
+    }
+
     /// # Errors
     /// Fails on a database error.
     pub fn run_for_external_session(&self, hint: &str) -> Result<Option<RunId>, StoreError> {
@@ -251,11 +290,16 @@ impl Store {
         self.get_run(run_id)
     }
 
-    /// Writes a checkpoint assembled from observation alone — no model call.
+    /// Writes a checkpoint from observation, carrying forward prior reasoning.
     ///
     /// `PreCompact` runs between the decision to compact and the compaction, so
-    /// it cannot wait for the distiller. This records what is provably true now;
-    /// the reasoning behind it is filled in later by an `enrich_checkpoint` job.
+    /// it cannot wait for the distiller. It records what is provably true now.
+    ///
+    /// Crucially it inherits the reasoning from the run's previous checkpoint
+    /// rather than replacing it with blanks. A decision does not become false
+    /// because time passed, and this checkpoint is the one the restoration
+    /// packet reads: dropping the reasoning here would mean the model's own
+    /// account of the work vanished at exactly the moment it was needed.
     ///
     /// # Errors
     /// Fails on a database error.
@@ -263,31 +307,72 @@ impl Store {
         &self,
         binding: SessionBinding,
         changed_files: Vec<String>,
-        verification: Vec<String>,
-        summary: String,
+        fallback_summary: &str,
     ) -> Result<(), StoreError> {
         use magent_core::{CheckpointCommand, OperationId};
 
-        let stage = self.get_run(binding.run_id)?.stage;
-        let stage = if stage == WorkflowStage::Completed {
+        let run = self.get_run(binding.run_id)?;
+
+        // `completed` is not a stage a checkpoint may claim; it is reached only
+        // through magent_finish.
+        let stage = if run.stage == WorkflowStage::Completed {
             WorkflowStage::Reviewing
         } else {
-            stage
+            run.stage
         };
+
+        let previous = run.latest_checkpoint;
+        let (
+            completed_steps,
+            next_steps,
+            decisions,
+            rejected,
+            verification,
+            risks,
+            summary,
+            origin,
+        ) = previous.map_or_else(
+            || {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    fallback_summary.to_owned(),
+                    CheckpointOrigin::Deterministic,
+                )
+            },
+            |checkpoint| {
+                (
+                    checkpoint.completed_steps,
+                    checkpoint.next_steps,
+                    checkpoint.decisions,
+                    checkpoint.rejected,
+                    checkpoint.verification,
+                    checkpoint.risks,
+                    checkpoint.handoff_summary,
+                    // The reasoning is as good as the checkpoint it came
+                    // from, so the label follows it.
+                    checkpoint.origin,
+                )
+            },
+        );
 
         self.save_checkpoint(&CheckpointCommand {
             operation_id: OperationId::new(),
             run_id: binding.run_id,
             session_id: binding.session_id,
             stage,
-            origin: CheckpointOrigin::Deterministic,
-            completed_steps: Vec::new(),
-            next_steps: Vec::new(),
-            decisions: Vec::new(),
-            rejected: Vec::new(),
+            origin,
+            completed_steps,
+            next_steps,
+            decisions,
+            rejected,
             changed_files,
             verification,
-            risks: Vec::new(),
+            risks,
             handoff_summary: summary,
         })?;
 

@@ -165,7 +165,7 @@ fn pre_compact(store: &Store, session: &str, cwd: &Path, input: &Value) -> anyho
     let git = magent_store::git_state(cwd);
     let summary = observed_summary(changed_files.len(), git.as_ref());
 
-    store.record_observed_checkpoint(binding, changed_files, Vec::new(), summary)?;
+    store.record_observed_checkpoint(binding, changed_files, &summary)?;
 
     store.enqueue_job(
         ENRICH_JOB,

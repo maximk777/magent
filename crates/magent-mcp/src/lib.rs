@@ -128,7 +128,7 @@ impl MagentMcp {
         render(
             &self
                 .store
-                .start_run(&command, self.harness)
+                .adopt_or_start_run(&command, self.harness)
                 .map_err(|error| render_error(&error))?,
         )
     }

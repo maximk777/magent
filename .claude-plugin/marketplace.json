@@ -1,0 +1,11 @@
+{
+  "name": "magent",
+  "owner": { "name": "Maxim Kirienkov" },
+  "plugins": [
+    {
+      "name": "magent",
+      "source": "./plugin",
+      "description": "Durable task memory for Claude Code: survives compaction, /clear and handoff"
+    }
+  ]
+}
