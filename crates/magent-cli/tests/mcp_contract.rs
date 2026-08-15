@@ -261,6 +261,170 @@ async fn start_does_not_accept_a_client_supplied_harness() {
 
 // --- behaviour -------------------------------------------------------------
 
+/// The checkpoint is the whole point of the server, and it was the hardest
+/// tool to call: the schema demanded a session id and an origin the model has
+/// no way to know, and every list field. Seven attempts to record one
+/// checkpoint is a tool that will be skipped instead.
+#[tokio::test]
+async fn a_checkpoint_needs_only_a_stage_and_a_summary() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "fix the payment timeout" }),
+    )
+    .await;
+
+    let saved = call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "owner traced; regression test is next"
+        }),
+    )
+    .await;
+
+    assert!(saved["checkpoint_id"].is_string(), "{saved}");
+
+    let status = call(&client, "magent_status", json!({})).await;
+    assert_eq!(
+        status["run"]["latest_checkpoint"]["handoff_summary"].as_str(),
+        Some("owner traced; regression test is next"),
+        "the checkpoint landed on the open run without being told which"
+    );
+    // A checkpoint the model wrote is enriched by definition; asking it to say
+    // so only gave it another field to get wrong.
+    assert_eq!(
+        status["run"]["latest_checkpoint"]["origin"].as_str(),
+        Some("enriched")
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Only the two fields a checkpoint cannot be written without.
+#[tokio::test]
+async fn the_checkpoint_schema_asks_for_almost_nothing() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let tools = client.list_all_tools().await.expect("tools");
+    let checkpoint = tools
+        .iter()
+        .find(|tool| tool.name == "magent_checkpoint")
+        .expect("magent_checkpoint");
+
+    let required: Vec<&str> = checkpoint
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("required fields")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    assert_eq!(
+        required,
+        ["operation_id", "stage", "handoff_summary"],
+        "the checkpoint asks for more than it needs"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Same reasoning for finishing: the run in flight is the one being finished.
+#[tokio::test]
+async fn finishing_needs_no_identifiers() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "fix the payment timeout" }),
+    )
+    .await;
+
+    call(
+        &client,
+        "magent_finish",
+        json!({
+            "operation_id": uuid(),
+            "action": "complete_run",
+            "outcome": "shipped and verified"
+        }),
+    )
+    .await;
+
+    let status = call(&client, "magent_status", json!({})).await;
+    assert_eq!(status["run"], Value::Null, "the run was completed");
+    client.cancel().await.expect("shutdown");
+}
+
+/// Guessing an open run is a convenience, not a licence to invent one. An
+/// explicit id still wins, and is still honoured when it names a different run.
+#[tokio::test]
+async fn an_explicit_run_id_still_wins() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let first = call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "first task" }),
+    )
+    .await;
+    let run_id = first["run_id"].as_str().expect("run_id").to_owned();
+
+    call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "run_id": run_id,
+            "session_id": first["session_id"],
+            "stage": "planning",
+            "handoff_summary": "named explicitly"
+        }),
+    )
+    .await;
+
+    let status = call(&client, "magent_status", json!({})).await;
+    assert_eq!(status["run"]["run_id"].as_str(), Some(run_id.as_str()));
+    assert_eq!(
+        status["run"]["latest_checkpoint"]["handoff_summary"].as_str(),
+        Some("named explicitly")
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Checkpointing with nothing open is a mistake worth naming, not a run to
+/// conjure: a run invented here would have no task and no reason to exist.
+#[tokio::test]
+async fn checkpointing_with_nothing_open_says_so() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let error = call_expecting_error(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "nothing is open"
+        }),
+    )
+    .await;
+
+    assert!(
+        error.contains("no_open_run"),
+        "the error should name the cause: {error}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn a_run_survives_a_reconnect_and_returns_its_checkpoint() {
     let fixture = Fixture::new();

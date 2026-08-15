@@ -28,6 +28,11 @@ pub enum StoreError {
 
     #[error("database schema version {0} is newer than this build understands")]
     UnsupportedSchema(i64),
+
+    /// A tool that works on "the run in flight" was called with nothing in
+    /// flight. Opening one here would produce a run with no task.
+    #[error("no run is open in this workspace; call magent_start first")]
+    NoOpenRun,
 }
 
 impl StoreError {
@@ -43,6 +48,7 @@ impl StoreError {
             Self::RunClosed(_) => "run_closed",
             Self::IdempotencyConflict(_) => "idempotency_conflict",
             Self::UnsupportedSchema(_) => "unsupported_schema",
+            Self::NoOpenRun => "no_open_run",
         }
     }
 }

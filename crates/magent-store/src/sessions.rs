@@ -309,6 +309,30 @@ impl Store {
         run_id.map(|run_id| self.get_run(run_id)).transpose()
     }
 
+    /// The session most recently opened against `run_id` and not yet ended.
+    ///
+    /// A checkpoint belongs to a session, but the model has no way to learn its
+    /// own session id: the server issued it. Rather than make it ask, the
+    /// server answers that question itself.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn latest_open_session(&self, run_id: RunId) -> Result<Option<SessionId>, StoreError> {
+        let connection = self.lock()?;
+        let found = connection
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE run_id = ?1 AND ended_at IS NULL
+                 ORDER BY started_at DESC, rowid DESC
+                 LIMIT 1",
+                [run_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+
+        Ok(found.and_then(|id| id.parse().ok()))
+    }
+
     /// The run's current state plus its most recent checkpoint.
     ///
     /// # Errors

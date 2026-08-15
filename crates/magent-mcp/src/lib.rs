@@ -9,8 +9,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use magent_core::{
-    CheckpointCommand, Fact, FinishRunCommand, HarnessKind, OperationId, RememberCommand, RunId,
-    StartRunCommand,
+    CheckpointCommand, CheckpointOrigin, Fact, FinishAction, FinishRunCommand, HarnessKind,
+    OperationId, RememberCommand, RunId, SessionId, StartRunCommand, WorkflowStage,
 };
 use magent_store::{FactContext, FactQuery, Store, StoreError};
 use rmcp::{
@@ -94,6 +94,73 @@ pub struct RecallToolInput {
     pub name: String,
 }
 
+/// What the client may supply when checkpointing.
+///
+/// Deliberately smaller than [`CheckpointCommand`]. Dogfooding this server
+/// found the checkpoint — the one tool the whole design exists for — to be the
+/// hardest to call: the domain command asks for a session id the server issued
+/// and never told anyone, an origin only the server can judge, and all eight
+/// list fields whether or not there is anything to put in them. A tool that
+/// takes seven attempts to satisfy is a tool that gets skipped.
+///
+/// So the server answers what it can answer itself, and asks only for what only
+/// the model knows.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct CheckpointToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
+    /// Where the work stands now.
+    pub stage: WorkflowStage,
+    /// What someone picking this up needs to know first, in a sentence or two.
+    pub handoff_summary: String,
+    /// The run to checkpoint. Omit to checkpoint the run open here.
+    #[serde(default)]
+    pub run_id: Option<RunId>,
+    /// Omit: the server knows which session this is.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    #[serde(default)]
+    pub completed_steps: Vec<String>,
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+    /// Decisions taken, and why.
+    #[serde(default)]
+    pub decisions: Vec<String>,
+    /// Alternatives considered and turned down. Without these a later session
+    /// re-litigates settled questions.
+    #[serde(default)]
+    pub rejected: Vec<String>,
+    /// Only files the harness would not have observed; edits are captured
+    /// automatically.
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    /// What was checked, and how.
+    #[serde(default)]
+    pub verification: Vec<String>,
+    #[serde(default)]
+    pub risks: Vec<String>,
+}
+
+/// What the client may supply when finishing.
+///
+/// Same reasoning as [`CheckpointToolInput`]: the run being finished is the run
+/// in flight.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct FinishToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
+    /// `close_session` when stepping away, `complete_run` when the task is done.
+    pub action: FinishAction,
+    /// How it ended, in one line.
+    pub outcome: String,
+    /// Omit to finish the run open here.
+    #[serde(default)]
+    pub run_id: Option<RunId>,
+    /// Omit: the server knows which session this is.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
 #[derive(Debug, Serialize)]
 struct SearchResult {
     facts: Vec<Fact>,
@@ -159,6 +226,39 @@ impl MagentMcp {
         }
     }
 
+    /// Fills in the run and session a tool was not told about.
+    ///
+    /// An explicit id always wins: guessing is a convenience for the common
+    /// case, not a licence to override what the caller named.
+    fn in_flight(
+        &self,
+        run_id: Option<RunId>,
+        session_id: Option<SessionId>,
+    ) -> Result<(RunId, SessionId), StoreError> {
+        let run_id = match run_id {
+            Some(named) => named,
+            None => {
+                self.store
+                    .latest_open_run_for_path(&self.workspace_roots[0])?
+                    .ok_or(StoreError::NoOpenRun)?
+                    .run_id
+            }
+        };
+
+        let session_id = match session_id {
+            Some(named) => named,
+            // Nothing open means the run was restored by a hook rather than
+            // opened here. Recording against the run itself still beats
+            // refusing: the checkpoint is what has to survive.
+            None => self
+                .store
+                .latest_open_session(run_id)?
+                .ok_or(StoreError::NoOpenRun)?,
+        };
+
+        Ok((run_id, session_id))
+    }
+
     /// Builds a server over `store`, working in `workspace_root`.
     #[must_use]
     pub fn new(store: Arc<Store>, harness: HarnessKind, workspace_root: PathBuf) -> Self {
@@ -207,12 +307,34 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Persist what only you know about this run: decisions, alternatives rejected, what was verified, open risks. Call at stage boundaries and before handing work over."
+        description = "Persist what only you know about this run: decisions, alternatives rejected, what was verified, open risks. Call at stage boundaries and before handing work over. Only stage and handoff_summary are needed; the server knows which run and session this is."
     )]
     async fn magent_checkpoint(
         &self,
-        Parameters(command): Parameters<CheckpointCommand>,
+        Parameters(input): Parameters<CheckpointToolInput>,
     ) -> Result<String, String> {
+        let (run_id, session_id) = self
+            .in_flight(input.run_id, input.session_id)
+            .map_err(|error| render_error(&error))?;
+
+        let command = CheckpointCommand {
+            operation_id: input.operation_id,
+            run_id,
+            session_id,
+            stage: input.stage,
+            // A checkpoint the model wrote is enriched by definition. Only the
+            // hooks write deterministic ones, and they do not come through here.
+            origin: CheckpointOrigin::Enriched,
+            completed_steps: input.completed_steps,
+            next_steps: input.next_steps,
+            decisions: input.decisions,
+            rejected: input.rejected,
+            changed_files: input.changed_files,
+            verification: input.verification,
+            risks: input.risks,
+            handoff_summary: input.handoff_summary,
+        };
+
         render(
             &self
                 .store
@@ -267,12 +389,24 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Close this session (close_session) or complete the whole run (complete_run). Closing a session does not finish the task."
+        description = "Close this session (close_session) or complete the whole run (complete_run). Applies to the run open here; closing a session does not finish the task."
     )]
     async fn magent_finish(
         &self,
-        Parameters(command): Parameters<FinishRunCommand>,
+        Parameters(input): Parameters<FinishToolInput>,
     ) -> Result<String, String> {
+        let (run_id, session_id) = self
+            .in_flight(input.run_id, input.session_id)
+            .map_err(|error| render_error(&error))?;
+
+        let command = FinishRunCommand {
+            operation_id: input.operation_id,
+            run_id,
+            session_id,
+            action: input.action,
+            outcome: input.outcome,
+        };
+
         render(
             &self
                 .store
