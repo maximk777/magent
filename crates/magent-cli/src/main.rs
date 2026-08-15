@@ -150,6 +150,13 @@ enum Command {
         state_dir: Option<std::path::PathBuf>,
     },
 
+    /// Report what is wrong, and what to do about it.
+    Doctor {
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Serve the Magent MCP tools over stdio.
     Mcp {
         /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
@@ -178,6 +185,7 @@ fn main() {
             state_dir,
         } => run_import(memory_dir, codex_rollouts, state_dir),
         Command::Deps { action, state_dir } => run_deps(action, state_dir),
+        Command::Doctor { state_dir } => run_doctor(state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
     }
 }
@@ -720,6 +728,21 @@ fn deps_remove(
 /// Commits are cited by their first seven characters everywhere else.
 fn short(revision: &str) -> String {
     revision.chars().take(7).collect()
+}
+
+/// Prints the diagnostic, exiting non-zero only when something is genuinely
+/// broken. A missing language server is a finding, not a failure.
+fn run_doctor(state_dir: Option<std::path::PathBuf>) {
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let mut out = String::new();
+    let healthy = magent_cli::doctor::report(&state_dir, &here, &mut out);
+    print!("{out}");
+
+    if !healthy {
+        std::process::exit(1);
+    }
 }
 
 fn report(message: &str) {

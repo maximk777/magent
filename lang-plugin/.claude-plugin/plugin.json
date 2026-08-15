@@ -1,0 +1,10 @@
+{
+  "name": "magent-lang",
+  "description": "Language servers and per-repository conventions for Go, Rust, TypeScript and Python",
+  "version": "0.1.0",
+  "author": {
+    "name": "Maxim Kirienkov"
+  },
+  "repository": "https://github.com/maximk777/magent",
+  "license": "Apache-2.0"
+}

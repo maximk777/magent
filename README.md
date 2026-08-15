@@ -64,6 +64,34 @@ personal memory, and it is not the daemon this design deliberately does
 without: it opens the same file every hook opens, holds nothing, and can be
 closed at any moment.
 
+Languages, as a second plugin.
+
+```
+/plugin install magent-lang@magent
+```
+
+`magent-lang` carries `.lsp.json` for gopls, rust-analyzer,
+typescript-language-server and pyright, plus one thin skill per language. It is
+separate from `magent` on purpose: memory and language tooling are different
+jobs, and someone who installs Magent for the former should not get four
+attempts to start language servers they never asked for.
+
+The skills are deliberately not tutorials. A model does not need to be told how
+to write Go; it needs to be told that `cargo test` without `--workspace` runs
+one crate and still says ok, that `npm install` in a pnpm repository rewrites
+`node_modules`, that a bare `pytest` uses the wrong interpreter, and that
+`go build` never compiles test files. Each one reads what the repository
+declares first, and records what it establishes through `magent_remember`.
+
+```bash
+magent doctor
+```
+
+Reports which language servers this repository's toolchain wants and whether
+they are installed, along with the profile it opened, its schema version, and
+whether this workspace is grouped. A missing server is a finding rather than a
+failure, so it stays usable in a script.
+
 Setting up, by being asked rather than by being configured.
 
 Magent registers a repository the first time a session opens in it, so nothing

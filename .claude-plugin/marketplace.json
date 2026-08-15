@@ -1,11 +1,18 @@
 {
   "name": "magent",
-  "owner": { "name": "Maxim Kirienkov" },
+  "owner": {
+    "name": "Maxim Kirienkov"
+  },
   "plugins": [
     {
       "name": "magent",
       "source": "./plugin",
       "description": "Durable task memory for Claude Code: survives compaction, /clear and handoff"
+    },
+    {
+      "name": "magent-lang",
+      "source": "./lang-plugin",
+      "description": "Language servers and per-repository conventions for Go, Rust, TypeScript and Python"
     }
   ]
 }

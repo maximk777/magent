@@ -79,6 +79,54 @@ for manifest in plugin/hooks/hooks.json plugin/.mcp.json; do
   fi
 done
 
+# --- the language plugin ----------------------------------------------------
+
+for required in \
+  lang-plugin/.claude-plugin/plugin.json \
+  lang-plugin/.lsp.json \
+  lang-plugin/skills/lang-go/SKILL.md \
+  lang-plugin/skills/lang-rust/SKILL.md \
+  lang-plugin/skills/lang-typescript/SKILL.md \
+  lang-plugin/skills/lang-python/SKILL.md
+do
+  if [ ! -f "$required" ]; then
+    fail "$required is missing"
+  elif ! "$git" ls-files --error-unmatch "$required" >/dev/null 2>&1; then
+    fail "$required exists but is not tracked; a clone would not get it"
+  fi
+done
+
+# A skill without a name in its frontmatter is invoked by directory name, which
+# changes when a marketplace updates.
+for skill in lang-plugin/skills/*/SKILL.md; do
+  [ -f "$skill" ] || continue
+  if ! head -5 "$skill" | grep -q '^name: '; then
+    fail "$skill has no name in its frontmatter"
+  fi
+done
+
+# Both plugins have to be offered, or one of them reaches nobody.
+for plugin in '"magent"' '"magent-lang"'; do
+  if ! grep -q "$plugin" .claude-plugin/marketplace.json; then
+    fail "the marketplace does not list $plugin"
+  fi
+done
+
+# doctor tells people to install a language server; the plugin is what launches
+# it. Recommending something the plugin never starts sends someone to install a
+# binary that then goes unused, so every server doctor names must appear here.
+#
+# Checked in that direction only: .lsp.json also carries nested "command" keys
+# that are server options rather than servers — rust-analyzer's clippy setting
+# is one — and matching those would report a failure that is not one.
+if [ -f lang-plugin/.lsp.json ] && [ -f crates/magent-cli/src/doctor.rs ]; then
+  for server in $(grep -oE 'command: "[a-z-]+"' crates/magent-cli/src/doctor.rs | cut -d'"' -f2); do
+    if ! grep -q "\"$server\"" lang-plugin/.lsp.json; then
+      fail "magent doctor recommends $server but the plugin never launches it"
+    fi
+  done
+fi
+
 # --- the events the design depends on are subscribed ------------------------
 
 for event in SessionStart UserPromptSubmit PreCompact PostToolUse SessionEnd; do

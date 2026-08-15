@@ -116,6 +116,24 @@ impl Store {
         Ok(connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?)
     }
 
+    /// How much background work is waiting, and how much gave up.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn job_counts(&self) -> Result<(usize, usize), StoreError> {
+        let connection = self.lock()?;
+        let count = |status: &str| -> Result<usize, StoreError> {
+            let value: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE status = ?1",
+                [status],
+                |row| row.get(0),
+            )?;
+            Ok(usize::try_from(value).unwrap_or(0))
+        };
+
+        Ok((count("pending")?, count("failed")?))
+    }
+
     /// # Errors
     /// Fails if the migration table cannot be read.
     pub fn schema_version(&self) -> Result<i64, StoreError> {

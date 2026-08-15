@@ -1,0 +1,32 @@
+{
+  "go": {
+    "command": "gopls",
+    "args": ["serve"],
+    "extensionToLanguage": { ".go": "go" }
+  },
+  "rust": {
+    "command": "rust-analyzer",
+    "extensionToLanguage": { ".rs": "rust" },
+    "initializationOptions": {
+      "check": { "command": "clippy" }
+    },
+    "startupTimeout": 30000
+  },
+  "typescript": {
+    "command": "typescript-language-server",
+    "args": ["--stdio"],
+    "extensionToLanguage": {
+      ".ts": "typescript",
+      ".tsx": "typescriptreact",
+      ".mts": "typescript",
+      ".cts": "typescript",
+      ".js": "javascript",
+      ".jsx": "javascriptreact"
+    }
+  },
+  "python": {
+    "command": "pyright-langserver",
+    "args": ["--stdio"],
+    "extensionToLanguage": { ".py": "python", ".pyi": "python" }
+  }
+}
