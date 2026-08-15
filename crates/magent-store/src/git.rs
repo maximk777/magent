@@ -54,24 +54,60 @@ pub fn discover(start: &Path) -> RepositoryProbe {
     };
 
     let root = std::fs::canonicalize(&toplevel).unwrap_or_else(|_| PathBuf::from(&toplevel));
-    let origin_url = run_git(&root, &["remote", "get-url", "origin"]);
-
-    // A detached HEAD reports the literal "HEAD", which is not a branch name.
-    let branch = run_git(&root, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .filter(|value| value != "HEAD" && !value.is_empty());
-
-    let git = Some(GitState {
-        branch,
-        sha: run_git(&root, &["rev-parse", "HEAD"]),
-        origin_url: origin_url.clone(),
-        dirty_files: count_dirty(&root),
-    });
 
     RepositoryProbe {
+        origin_url: run_git(&root, &["remote", "get-url", "origin"]),
+        git: state(&root),
         root,
-        origin_url,
-        git,
     }
+}
+
+/// The repository root containing `path`, if any.
+///
+/// Used to render file paths relative in the restoration packet: an absolute
+/// path repeated a dozen times is mostly one prefix, and the packet is paid for
+/// in context on every session.
+#[must_use]
+pub fn toplevel(path: &Path) -> Option<PathBuf> {
+    let raw = run_git(path, &["rev-parse", "--show-toplevel"])?;
+    Some(std::fs::canonicalize(&raw).unwrap_or_else(|_| PathBuf::from(raw)))
+}
+
+/// Point-in-time git state for an already known repository root.
+///
+/// One subprocess, not four: `PreCompact` runs this on the critical path with a
+/// 100 ms budget, and process spawns dominate that budget. `--porcelain=v2
+/// --branch` reports HEAD, the branch and every change in a single pass.
+#[must_use]
+pub fn state(root: &Path) -> Option<GitState> {
+    let output = run_git_raw(root, &["status", "--porcelain=v2", "--branch"])?;
+
+    let mut branch = None;
+    let mut sha = None;
+    let mut dirty_files = 0_u32;
+
+    for line in output.lines() {
+        if let Some(header) = line.strip_prefix("# ") {
+            if let Some(value) = header.strip_prefix("branch.oid ") {
+                // An unborn branch reports "(initial)" rather than an object id.
+                sha = (value != "(initial)").then(|| value.to_owned());
+            } else if let Some(value) = header.strip_prefix("branch.head ") {
+                // A detached HEAD reports "(detached)", which is not a branch.
+                branch = (value != "(detached)").then(|| value.to_owned());
+            }
+        } else if !line.trim().is_empty() {
+            // Changed ("1"/"2"), unmerged ("u") and untracked ("?") entries all
+            // count: a file the agent created but never committed is still work
+            // that must not be lost.
+            dirty_files = dirty_files.saturating_add(1);
+        }
+    }
+
+    Some(GitState {
+        branch,
+        sha,
+        dirty_files,
+    })
 }
 
 /// Normalises an origin URL so its SSH and HTTPS forms agree.
@@ -131,20 +167,6 @@ fn without_credentials(value: &str) -> String {
         }
         None => value.rsplit('@').next().unwrap_or(value).to_owned(),
     }
-}
-
-/// Files with uncommitted changes, counting untracked ones: a file the agent
-/// created but never committed is still work that must not be lost.
-fn count_dirty(root: &Path) -> u32 {
-    run_git_raw(root, &["status", "--porcelain"]).map_or(0, |output| {
-        u32::try_from(
-            output
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count(),
-        )
-        .unwrap_or(u32::MAX)
-    })
 }
 
 fn run_git(directory: &Path, args: &[&str]) -> Option<String> {

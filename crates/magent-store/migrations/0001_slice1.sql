@@ -103,6 +103,8 @@ CREATE TABLE jobs (
 
 CREATE INDEX checkpoints_run_rowid ON checkpoints(run_id, id);
 CREATE INDEX sessions_run_started ON sessions(run_id, started_at DESC);
+-- Every hook starts by mapping the harness session id back to a run.
+CREATE INDEX sessions_external_hint ON sessions(external_session_hint);
 CREATE INDEX file_ledger_run ON file_ledger(run_id, id DESC);
 CREATE INDEX runs_workspace_status ON runs(workspace_id, status, updated_at DESC);
 CREATE INDEX jobs_kind_status ON jobs(kind, status, retry_at, lease_until);

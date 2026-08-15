@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/magent-core", "crates/magent-store"]
+members = ["crates/magent-core", "crates/magent-store", "crates/magent-cli"]
 
 [workspace.package]
 version = "0.1.0"

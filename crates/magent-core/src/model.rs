@@ -145,12 +145,18 @@ pub enum HarnessKind {
 }
 
 /// Git state captured at a point in time, for context and handoff only.
+///
+/// Deliberately excludes the origin URL: that identifies the repository and
+/// does not change moment to moment, so keeping it here would force an extra
+/// subprocess on the `PreCompact` path, which has a 100 ms budget.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GitState {
+    /// `None` when HEAD is detached.
     pub branch: Option<String>,
+    /// Full object id, so it can be compared exactly.
     pub sha: Option<String>,
-    pub origin_url: Option<String>,
-    /// Number of files with uncommitted changes. Magent never cleans these.
+    /// Files with uncommitted changes, untracked ones included. Magent records
+    /// this and never cleans it.
     pub dirty_files: u32,
 }
 

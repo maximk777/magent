@@ -52,7 +52,7 @@ pub struct Job {
 /// The durable store. Owns one connection; concurrency across processes is
 /// handled by `SQLite` in WAL mode rather than by a coordinating daemon.
 pub struct Store {
-    connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Connection>,
 }
 
 impl Store {
@@ -84,7 +84,7 @@ impl Store {
         })
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+    pub(crate) fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.connection
             .lock()
             .map_err(|_| StoreError::Database("store mutex was poisoned".into()))
@@ -632,14 +632,14 @@ fn ensure_wal(connection: &Connection) -> Result<(), StoreError> {
     }
 }
 
-struct RunRow {
+pub(crate) struct RunRow {
     workspace_id: WorkspaceId,
     task: String,
     status: RunStatus,
     stage: WorkflowStage,
 }
 
-fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow, StoreError> {
+pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow, StoreError> {
     let row = tx
         .query_row(
             "SELECT workspace_id, task, status, stage FROM runs WHERE id = ?1",
@@ -735,7 +735,7 @@ fn latest_checkpoint(
 /// Grouping several repositories into one workspace stays an explicit action:
 /// guessing from directory layout is wrong often enough (`opensource/forks`,
 /// scratch clones) that a wrong guess would silently merge unrelated memories.
-fn upsert_repository(
+pub(crate) fn upsert_repository(
     tx: &Transaction<'_>,
     probe: &RepositoryProbe,
     now: &str,
@@ -837,25 +837,27 @@ fn lookup_operation(
 
 /// Enums are stored using their wire names, so the database and the JSON
 /// contract can never drift apart.
-fn enum_to_sql<T: Serialize>(value: &T) -> Result<String, StoreError> {
+pub(crate) fn enum_to_sql<T: Serialize>(value: &T) -> Result<String, StoreError> {
     serde_json::to_value(value)?
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| StoreError::Serialization("expected a string-valued enum".into()))
 }
 
-fn enum_from_sql<T: DeserializeOwned>(raw: &str) -> Result<T, StoreError> {
+pub(crate) fn enum_from_sql<T: DeserializeOwned>(raw: &str) -> Result<T, StoreError> {
     Ok(serde_json::from_value(serde_json::Value::String(
         raw.to_owned(),
     ))?)
 }
 
-fn parse_id<T: std::str::FromStr<Err = uuid::Error>>(raw: &str) -> Result<T, StoreError> {
+pub(crate) fn parse_id<T: std::str::FromStr<Err = uuid::Error>>(
+    raw: &str,
+) -> Result<T, StoreError> {
     raw.parse()
         .map_err(|error: uuid::Error| StoreError::Serialization(error.to_string()))
 }
 
-fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, StoreError> {
+pub(crate) fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, StoreError> {
     DateTime::parse_from_rfc3339(raw)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|error| StoreError::Serialization(error.to_string()))

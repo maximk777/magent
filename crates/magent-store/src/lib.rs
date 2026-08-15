@@ -8,9 +8,13 @@
 mod error;
 mod git;
 mod migrations;
+mod sessions;
 mod store;
 
 pub use error::StoreError;
-pub use git::{RepositoryProbe, discover, normalize_origin};
+pub use git::{
+    RepositoryProbe, discover, normalize_origin, state as git_state, toplevel as repository_root,
+};
 pub use migrations::CURRENT_VERSION;
+pub use sessions::SessionBinding;
 pub use store::{Job, Store, WorkspaceResolution};

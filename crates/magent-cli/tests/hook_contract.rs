@@ -1,0 +1,572 @@
+//! The hook contract.
+//!
+//! Hooks are what make Magent trustworthy: they fire whether or not the model
+//! cooperates. That cuts both ways — a hook that is slow, noisy or fatal
+//! degrades every session, so the rules below are absolute:
+//!
+//! 1. never block, never fail the session;
+//! 2. write nothing to stdout unless there is something worth injecting;
+//! 3. stay inside the latency budget.
+
+use std::{
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+
+use magent_core::{HarnessKind, OperationId, StartRunCommand};
+use magent_store::Store;
+use serde_json::{Value, json};
+
+const MAGENT: &str = env!("CARGO_BIN_EXE_magent");
+
+/// `PreCompact` runs on the critical path, between the decision to compact and
+/// the compaction itself.
+///
+/// The release budget is 100 ms. Debug builds are several times slower and are
+/// not what ships, so the assertion scales rather than being switched off:
+/// a silent budget is a budget that rots.
+fn precompact_budget() -> Duration {
+    if cfg!(debug_assertions) {
+        Duration::from_millis(400)
+    } else {
+        Duration::from_millis(100)
+    }
+}
+
+struct HookRun {
+    stdout: String,
+    stderr: String,
+    code: Option<i32>,
+    elapsed: Duration,
+}
+
+impl HookRun {
+    fn succeeded(&self) -> bool {
+        self.code == Some(0)
+    }
+}
+
+fn run_hook(state_dir: &Path, event: &str, input: &Value) -> HookRun {
+    let started = Instant::now();
+    let mut child = Command::new(MAGENT)
+        .args(["hook", event])
+        .env("MAGENT_STATE_DIR", state_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn magent");
+
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.to_string().as_bytes())
+        .expect("write hook input");
+
+    let output = child.wait_with_output().expect("wait");
+    HookRun {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        code: output.status.code(),
+        elapsed: started.elapsed(),
+    }
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn init_repo(root: &Path) {
+    std::fs::create_dir_all(root).expect("mkdir");
+    git(root, &["init", "-b", "main"]);
+    git(root, &["config", "user.email", "t@example.invalid"]);
+    git(root, &["config", "user.name", "T"]);
+    std::fs::write(root.join("README.md"), "seed\n").expect("write");
+    git(root, &["add", "."]);
+    git(root, &["commit", "-m", "seed"]);
+}
+
+/// A state directory plus a repository to run sessions in.
+struct Fixture {
+    _dir: tempfile::TempDir,
+    state_dir: std::path::PathBuf,
+    repo: std::path::PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let repo = dir.path().join("project");
+        std::fs::create_dir_all(&state_dir).expect("mkdir");
+        init_repo(&repo);
+        Self {
+            _dir: dir,
+            state_dir,
+            repo,
+        }
+    }
+
+    fn store(&self) -> Store {
+        Store::open(&self.state_dir.join("magent.db")).expect("open store")
+    }
+
+    fn base(&self, event: &str, session: &str) -> Value {
+        json!({
+            "session_id": session,
+            "transcript_path": self.state_dir.join("transcript.jsonl"),
+            "cwd": self.repo,
+            "hook_event_name": event,
+        })
+    }
+
+    fn hook(&self, event: &str, input: &Value) -> HookRun {
+        run_hook(&self.state_dir, event, input)
+    }
+}
+
+// --- degradation -----------------------------------------------------------
+
+/// The single most important property. Magent being broken must cost the user
+/// nothing: a failed hook that writes to stdout would inject garbage into the
+/// conversation, and a non-zero exit would surface as a session error.
+#[test]
+fn a_corrupt_database_never_breaks_a_session() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.state_dir.join("magent.db"),
+        b"this is definitely not a sqlite file",
+    )
+    .expect("corrupt the database");
+
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "post-tool-use",
+        "pre-compact",
+        "session-end",
+        "subagent-stop",
+        "stop",
+    ] {
+        let run = fixture.hook(event, &fixture.base(event, "s1"));
+        assert!(
+            run.succeeded(),
+            "{event} exited {:?}; hooks must never fail a session\n{}",
+            run.code,
+            run.stderr
+        );
+        assert!(
+            run.stdout.is_empty(),
+            "{event} wrote to stdout while degraded: {:?}",
+            run.stdout
+        );
+    }
+}
+
+#[test]
+fn malformed_hook_input_is_ignored_quietly() {
+    let fixture = Fixture::new();
+
+    let mut child = Command::new(MAGENT)
+        .args(["hook", "session-start"])
+        .env("MAGENT_STATE_DIR", &fixture.state_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"{not json at all")
+        .expect("write");
+    let output = child.wait_with_output().expect("wait");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+}
+
+// --- session start ---------------------------------------------------------
+
+/// Nothing has happened yet, so there is nothing to say. Announcing itself here
+/// would spend context on every single session for no benefit.
+#[test]
+fn session_start_is_silent_when_the_workspace_has_no_run() {
+    let fixture = Fixture::new();
+
+    let run = fixture.hook("session-start", &fixture.base("SessionStart", "s1"));
+
+    assert!(run.succeeded());
+    assert!(
+        run.stdout.trim().is_empty(),
+        "unexpected output: {}",
+        run.stdout
+    );
+}
+
+#[test]
+fn session_start_restores_an_open_run_after_compaction() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let started = store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "fix the payment timeout".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![fixture.repo.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start run");
+    drop(store);
+
+    let mut input = fixture.base("SessionStart", "s2");
+    input["startup_reason"] = json!("compact");
+    let run = fixture.hook("session-start", &input);
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("fix the payment timeout"),
+        "the packet must carry the task:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains(&started.run_id.to_string()),
+        "the packet must name the run so a later tool call can address it:\n{}",
+        run.stdout
+    );
+}
+
+/// The whole point of slice 1: the checkpoint written before compaction has to
+/// come back afterwards.
+#[test]
+fn session_start_replays_the_latest_checkpoint() {
+    let fixture = Fixture::new();
+    let session = "s3";
+
+    seed_run(&fixture, "trace the connection leak");
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("keep going"),
+        ),
+    );
+    fixture.hook("pre-compact", &fixture.base("PreCompact", session));
+
+    let mut restart = fixture.base("SessionStart", session);
+    restart["startup_reason"] = json!("compact");
+    let run = fixture.hook("session-start", &restart);
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("trace the connection leak"),
+        "missing task:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.to_lowercase().contains("deterministic"),
+        "the packet must say the checkpoint has not been enriched yet:\n{}",
+        run.stdout
+    );
+}
+
+// --- run creation ----------------------------------------------------------
+
+/// Hooks must not depend on the model calling `magent_start`. A prompt is the
+/// start of a task whether or not the model chooses to announce it.
+#[test]
+fn a_first_prompt_opens_a_run_without_the_model_asking() {
+    let fixture = Fixture::new();
+
+    let input = with(
+        fixture.base("UserPromptSubmit", "s4"),
+        "prompt",
+        json!("please fix the flaky payment test"),
+    );
+    let run = fixture.hook("user-prompt-submit", &input);
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+
+    let store = fixture.store();
+    assert_eq!(store.run_count().expect("count"), 1);
+}
+
+#[test]
+fn later_prompts_join_the_run_instead_of_opening_more() {
+    let fixture = Fixture::new();
+
+    for prompt in ["first thing", "second thing", "third thing"] {
+        fixture.hook(
+            "user-prompt-submit",
+            &with(
+                fixture.base("UserPromptSubmit", "s5"),
+                "prompt",
+                json!(prompt),
+            ),
+        );
+    }
+
+    assert_eq!(fixture.store().run_count().expect("count"), 1);
+}
+
+// --- the file ledger -------------------------------------------------------
+
+#[test]
+fn post_tool_use_records_edited_files() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "rework the client");
+    let session = "s6";
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("go"),
+        ),
+    );
+
+    let mut input = fixture.base("PostToolUse", session);
+    input["tool_name"] = json!("Edit");
+    input["tool_input"] = json!({ "file_path": fixture.repo.join("src/client.rs") });
+    let run = fixture.hook("post-tool-use", &input);
+
+    assert!(run.succeeded());
+    assert!(
+        run.stdout.is_empty(),
+        "the ledger is silent; it exists to be read later, not narrated"
+    );
+
+    let store = fixture.store();
+    let ledger = store
+        .ledger_for_external_session(session, 50)
+        .expect("ledger");
+    assert!(
+        ledger.iter().any(|entry| entry.path.ends_with("client.rs")),
+        "expected client.rs in {ledger:?}"
+    );
+}
+
+/// The ledger must store canonical paths.
+///
+/// Otherwise the restoration packet cannot shorten them: on macOS a temp or
+/// symlinked directory reaches the ledger as `/var/...` while the repository
+/// root resolves to `/private/var/...`, the prefixes fail to match, and every
+/// file is printed in full on every session.
+#[test]
+fn restored_file_paths_are_relative_to_the_repository() {
+    let fixture = Fixture::new();
+    let session = "s12";
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("touch a few files"),
+        ),
+    );
+
+    let edited = fixture.repo.join("crates/service/src/handler.rs");
+    std::fs::create_dir_all(edited.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&edited, "fn main() {}\n").expect("write");
+
+    let mut edit = fixture.base("PostToolUse", session);
+    edit["tool_name"] = json!("Edit");
+    edit["tool_input"] = json!({ "file_path": edited });
+    fixture.hook("post-tool-use", &edit);
+
+    let mut restart = fixture.base("SessionStart", "s13");
+    restart["startup_reason"] = json!("compact");
+    let run = fixture.hook("session-start", &restart);
+
+    assert!(
+        run.stdout.contains("crates/service/src/handler.rs"),
+        "missing the file:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout
+            .contains(&fixture.repo.to_string_lossy().to_string()),
+        "the repository prefix is repeated for every file:\n{}",
+        run.stdout
+    );
+}
+
+#[test]
+fn post_tool_use_without_a_file_path_is_a_no_op() {
+    let fixture = Fixture::new();
+    let session = "s7";
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("go"),
+        ),
+    );
+
+    let mut input = fixture.base("PostToolUse", session);
+    input["tool_name"] = json!("Bash");
+    input["tool_input"] = json!({ "command": "cargo test" });
+
+    assert!(fixture.hook("post-tool-use", &input).succeeded());
+}
+
+// --- pre-compact -----------------------------------------------------------
+
+#[test]
+fn pre_compact_writes_a_deterministic_checkpoint_and_queues_enrichment() {
+    let fixture = Fixture::new();
+    let session = "s8";
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("make the retry budget configurable"),
+        ),
+    );
+
+    let run = fixture.hook("pre-compact", &fixture.base("PreCompact", session));
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+
+    let store = fixture.store();
+    let run_id = store
+        .run_for_external_session(session)
+        .expect("lookup")
+        .expect("a run exists");
+    assert_eq!(
+        store.checkpoint_count(run_id).expect("count"),
+        1,
+        "compaction must never happen without a checkpoint behind it"
+    );
+    assert!(
+        store
+            .claim_job("enrich_checkpoint", Duration::from_mins(1))
+            .expect("claim")
+            .is_some(),
+        "the reasoning behind the work is enriched asynchronously"
+    );
+}
+
+/// Compaction is triggered by pressure. Blocking it, or making the user wait,
+/// turns a routine event into a stall.
+#[test]
+fn pre_compact_stays_inside_its_latency_budget() {
+    let fixture = Fixture::new();
+    let session = "s9";
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("wide refactor"),
+        ),
+    );
+
+    // A realistic ledger: a long session touches many files.
+    for index in 0..200 {
+        let mut input = fixture.base("PostToolUse", session);
+        input["tool_name"] = json!("Edit");
+        input["tool_input"] = json!({ "file_path": fixture.repo.join(format!("src/f{index}.rs")) });
+        fixture.hook("post-tool-use", &input);
+    }
+
+    let run = fixture.hook("pre-compact", &fixture.base("PreCompact", session));
+
+    assert!(run.succeeded());
+    assert!(
+        run.elapsed < precompact_budget(),
+        "pre-compact took {:?}, budget is {:?}",
+        run.elapsed,
+        precompact_budget()
+    );
+}
+
+/// `PreCompact` can only allow or deny; it cannot inject. Writing to stdout
+/// here would be discarded at best and confusing at worst.
+#[test]
+fn pre_compact_never_blocks_compaction() {
+    let fixture = Fixture::new();
+    let run = fixture.hook("pre-compact", &fixture.base("PreCompact", "s10"));
+
+    assert_eq!(
+        run.code,
+        Some(0),
+        "exit 2 would block compaction and wedge the session"
+    );
+    assert!(run.stdout.is_empty());
+}
+
+// --- session end -----------------------------------------------------------
+
+#[test]
+fn session_end_closes_the_session_but_leaves_the_run_open() {
+    let fixture = Fixture::new();
+    let session = "s11";
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("something"),
+        ),
+    );
+
+    assert!(
+        fixture
+            .hook("session-end", &fixture.base("SessionEnd", session))
+            .succeeded()
+    );
+
+    let store = fixture.store();
+    let run_id = store
+        .run_for_external_session(session)
+        .expect("lookup")
+        .expect("run");
+    assert_eq!(
+        store.get_run(run_id).expect("get_run").status,
+        magent_core::RunStatus::Open,
+        "closing the editor does not finish the task"
+    );
+}
+
+// --- helpers ---------------------------------------------------------------
+
+fn with(mut value: Value, key: &str, entry: Value) -> Value {
+    value[key] = entry;
+    value
+}
+
+fn seed_run(fixture: &Fixture, task: &str) {
+    let store = fixture.store();
+    store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: task.into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![fixture.repo.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("seed run");
+}

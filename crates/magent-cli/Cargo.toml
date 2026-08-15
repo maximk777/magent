@@ -1,0 +1,28 @@
+[package]
+name = "magent-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "magent_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "magent"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+magent-core = { path = "../magent-core" }
+magent-store = { path = "../magent-store" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
