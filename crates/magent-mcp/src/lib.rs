@@ -148,7 +148,13 @@ impl MagentMcp {
         FactQuery {
             text: Some(text),
             namespaces: magent_store::namespace_candidates(&root),
-            workspace_id: None,
+            // Without this, everything promoted to the workspace is invisible
+            // to the tools: the visibility clause has nothing to match on.
+            workspace_id: self
+                .store
+                .resolve_workspace_for(&root)
+                .ok()
+                .map(|resolved| resolved.workspace_id),
             limit: limit.unwrap_or(5).clamp(1, 25),
         }
     }

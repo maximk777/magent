@@ -194,13 +194,40 @@ impl Store {
             return self.start_run(command, harness);
         };
 
-        self.start_run(
+        let result = self.start_run(
             &StartRunCommand {
                 resume_run_id: Some(existing.run_id),
                 ..command.clone()
             },
             harness,
-        )
+        )?;
+
+        // The hook titles a run from the first raw prompt, which is the symptom
+        // rather than the task. When the model then states what it is doing,
+        // that is the better name and it replaces the derived one.
+        //
+        // Only here: an explicit resume_run_id means joining a run that is
+        // already named, and renaming it from a passing description would be
+        // rewriting someone else's work.
+        let refined = command.task.trim();
+        if !refined.is_empty() && refined != result.task {
+            let connection = self.lock()?;
+            connection.execute(
+                "UPDATE runs SET task = ?1, updated_at = ?2 WHERE id = ?3",
+                (
+                    refined,
+                    Utc::now().to_rfc3339(),
+                    existing.run_id.to_string(),
+                ),
+            )?;
+
+            return Ok(StartRunResult {
+                task: refined.to_owned(),
+                ..result
+            });
+        }
+
+        Ok(result)
     }
 
     /// # Errors

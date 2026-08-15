@@ -142,9 +142,15 @@ fn user_prompt_submit(
     input: &Value,
 ) -> anyhow::Result<String> {
     let prompt = prompt_text(input).unwrap_or_else(|| "(untitled session)".to_owned());
-    store.bind_session(session, cwd, &prompt, HarnessKind::ClaudeCode)?;
+    let binding = store.bind_session(session, cwd, &prompt, HarnessKind::ClaudeCode)?;
 
-    Ok(memory_index(store, session, cwd, &prompt))
+    Ok(memory_index(
+        store,
+        session,
+        cwd,
+        &prompt,
+        binding.workspace_id,
+    ))
 }
 
 /// Names what memory holds that bears on this prompt.
@@ -154,7 +160,13 @@ fn user_prompt_submit(
 /// retrieval it is meant to replace.
 ///
 /// Failure is swallowed: a prompt must never be held up by the memory layer.
-fn memory_index(store: &Store, session: &str, cwd: &Path, prompt: &str) -> String {
+fn memory_index(
+    store: &Store,
+    session: &str,
+    cwd: &Path,
+    prompt: &str,
+    workspace_id: magent_core::WorkspaceId,
+) -> String {
     let query = magent_store::FactQuery {
         text: Some(prompt.to_owned()),
         namespaces: magent_store::namespace_candidates(
@@ -162,7 +174,9 @@ fn memory_index(store: &Store, session: &str, cwd: &Path, prompt: &str) -> Strin
                 .unwrap_or_else(|| cwd.to_path_buf())
                 .as_path(),
         ),
-        workspace_id: None,
+        // Memory promoted to the workspace is meant to reach every repository
+        // in it, which it cannot do unless the query says which one this is.
+        workspace_id: Some(workspace_id),
         limit: INDEX_LIMIT,
     };
 
