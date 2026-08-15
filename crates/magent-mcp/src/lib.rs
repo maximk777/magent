@@ -9,9 +9,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use magent_core::{
-    CheckpointCommand, FinishRunCommand, HarnessKind, OperationId, RunId, StartRunCommand,
+    CheckpointCommand, Fact, FinishRunCommand, HarnessKind, OperationId, RememberCommand, RunId,
+    StartRunCommand,
 };
-use magent_store::{Store, StoreError};
+use magent_store::{FactContext, FactQuery, Store, StoreError};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -45,6 +46,12 @@ the task is done and verified. Closing a session does not finish the task.
 
 magent_status reports the current run and changes nothing.
 
+Memory outlives the run. magent_search finds what is already known about this \
+project and the user; magent_recall opens one fact by name, which is how the \
+memory index at the top of a prompt is meant to be followed up. magent_remember \
+records something durable: what is true of this codebase, or how the user wants \
+to work, with the evidence for it. A fact marked verified must cite evidence.
+
 Every mutating call takes an operation_id. Generate a fresh UUID per call, and \
 reuse the same one when retrying, so a retry cannot duplicate state.
 
@@ -70,6 +77,33 @@ pub struct StartToolInput {
     pub external_session_hint: Option<String>,
 }
 
+/// Free-text memory lookup.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct SearchToolInput {
+    /// What to look for. A phrase works as well as keywords.
+    pub text: String,
+    /// How many facts to return. Small by default: these are read by a model
+    /// with a context budget.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct RecallToolInput {
+    /// The fact's name, as shown in the memory index.
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResult {
+    facts: Vec<Fact>,
+}
+
+#[derive(Debug, Serialize)]
+struct RecallResult {
+    fact: Option<Fact>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusReport {
     run: Option<magent_core::RunSnapshot>,
@@ -86,6 +120,39 @@ pub struct MagentMcp {
 }
 
 impl MagentMcp {
+    /// Where memory written here is filed.
+    ///
+    /// Both a workspace id and a namespace: the id is the real binding, and the
+    /// namespace is what groups new facts with the imported corpus for the same
+    /// project.
+    fn fact_context(&self) -> FactContext {
+        let root = &self.workspace_roots[0];
+        FactContext {
+            workspace_id: self
+                .store
+                .resolve_workspace_for(root)
+                .ok()
+                .map(|resolved| resolved.workspace_id),
+            run_id: None,
+            namespace: root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            ..FactContext::default()
+        }
+    }
+
+    fn query(&self, text: String, limit: Option<usize>) -> FactQuery {
+        let root = magent_store::repository_root(&self.workspace_roots[0])
+            .unwrap_or_else(|| self.workspace_roots[0].clone());
+
+        FactQuery {
+            text: Some(text),
+            namespaces: magent_store::namespace_candidates(&root),
+            workspace_id: None,
+            limit: limit.unwrap_or(5).clamp(1, 25),
+        }
+    }
+
     /// Builds a server over `store`, working in `workspace_root`.
     #[must_use]
     pub fn new(store: Arc<Store>, harness: HarnessKind, workspace_root: PathBuf) -> Self {
@@ -146,6 +213,51 @@ impl MagentMcp {
                 .save_checkpoint(&command)
                 .map_err(|error| render_error(&error))?,
         )
+    }
+
+    #[tool(
+        description = "Search durable memory for what is already known about this project and the user. Free text; empty results are normal."
+    )]
+    async fn magent_search(
+        &self,
+        Parameters(input): Parameters<SearchToolInput>,
+    ) -> Result<String, String> {
+        let facts = self
+            .store
+            .search(&self.query(input.text, input.limit))
+            .map_err(|error| render_error(&error))?;
+
+        render(&SearchResult { facts })
+    }
+
+    #[tool(
+        description = "Open one remembered fact by name. This is how to follow up a name shown in the memory index."
+    )]
+    async fn magent_recall(
+        &self,
+        Parameters(input): Parameters<RecallToolInput>,
+    ) -> Result<String, String> {
+        let fact = self
+            .store
+            .recall(&input.name, &self.fact_context())
+            .map_err(|error| render_error(&error))?;
+
+        render(&RecallResult { fact })
+    }
+
+    #[tool(
+        description = "Record something durable: what is true of this codebase, or how the user wants to work, with the evidence for it."
+    )]
+    async fn magent_remember(
+        &self,
+        Parameters(command): Parameters<RememberCommand>,
+    ) -> Result<String, String> {
+        let fact_id = self
+            .store
+            .remember(&command, &self.fact_context())
+            .map_err(|error| render_error(&error))?;
+
+        render(&serde_json::json!({ "fact_id": fact_id }))
     }
 
     #[tool(

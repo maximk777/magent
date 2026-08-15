@@ -327,6 +327,133 @@ fn later_prompts_join_the_run_instead_of_opening_more() {
     assert_eq!(fixture.store().run_count().expect("count"), 1);
 }
 
+// --- the memory index ------------------------------------------------------
+
+/// The index is what makes memory usable without the model knowing to ask. It
+/// fires on every prompt, so it must be small, silent when it has nothing, and
+/// free of bodies.
+#[test]
+fn a_prompt_pulls_a_relevant_memory_index_into_context() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store
+        .remember(
+            &magent_core::RememberCommand {
+                operation_id: OperationId::new(),
+                name: "goose-table-locking".into(),
+                title: "goose v3.26 locks with NewPostgresTableLocker".into(),
+                body: "A LONG BODY THAT MUST NOT REACH THE CONTEXT WINDOW".into(),
+                kind: magent_core::FactKind::Project,
+                scope: magent_core::FactScope::Repository,
+                cardinality: magent_core::Cardinality::Set,
+                status: magent_core::FactStatus::Observed,
+                confidence: 0.8,
+                evidence: vec![],
+                relates_to: vec![],
+            },
+            &magent_store::FactContext {
+                namespace: Some(
+                    fixture
+                        .repo
+                        .file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..magent_store::FactContext::default()
+            },
+        )
+        .expect("remember");
+    drop(store);
+
+    let run = fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", "m1"),
+            "prompt",
+            json!("the goose migration hangs on a lock"),
+        ),
+    );
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("goose-table-locking"),
+        "the index must name what exists:\n{}",
+        run.stdout
+    );
+    assert!(
+        !run.stdout.contains("LONG BODY"),
+        "the index leaked a body into every prompt:\n{}",
+        run.stdout
+    );
+}
+
+/// Silence is the common case. A banner on every prompt with nothing behind it
+/// is a tax with no return.
+#[test]
+fn a_prompt_that_matches_nothing_stays_silent() {
+    let fixture = Fixture::new();
+
+    let run = fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", "m2"),
+            "prompt",
+            json!("something entirely unrelated to anything remembered"),
+        ),
+    );
+
+    assert!(run.succeeded());
+    assert!(run.stdout.trim().is_empty(), "{}", run.stdout);
+}
+
+/// Re-pushing the same facts on every prompt of a session would make a long
+/// session pay for the same tokens over and over.
+#[test]
+fn the_index_is_not_pushed_twice_in_one_session() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    store
+        .remember(
+            &magent_core::RememberCommand {
+                operation_id: OperationId::new(),
+                name: "no-autonomous-commits".into(),
+                title: "never commit without being asked".into(),
+                body: "the user makes the commits".into(),
+                kind: magent_core::FactKind::Feedback,
+                scope: magent_core::FactScope::User,
+                cardinality: magent_core::Cardinality::Set,
+                status: magent_core::FactStatus::Observed,
+                confidence: 0.9,
+                evidence: vec![],
+                relates_to: vec![],
+            },
+            &magent_store::FactContext::default(),
+        )
+        .expect("remember");
+    drop(store);
+
+    let prompt = with(
+        fixture.base("UserPromptSubmit", "m3"),
+        "prompt",
+        json!("should I commit this"),
+    );
+
+    let first = fixture.hook("user-prompt-submit", &prompt);
+    assert!(
+        first.stdout.contains("no-autonomous-commits"),
+        "{}",
+        first.stdout
+    );
+
+    let second = fixture.hook("user-prompt-submit", &prompt);
+    assert!(
+        !second.stdout.contains("no-autonomous-commits"),
+        "the same fact was pushed twice:\n{}",
+        second.stdout
+    );
+}
+
 // --- the file ledger -------------------------------------------------------
 
 #[test]

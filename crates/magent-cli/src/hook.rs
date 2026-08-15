@@ -22,6 +22,10 @@ use crate::packet;
 /// Ledger entries folded into a deterministic checkpoint.
 const LEDGER_LIMIT: usize = 200;
 
+/// Facts named per prompt. Small deliberately: this is paid for on every turn,
+/// and a long list gets skimmed rather than used.
+const INDEX_LIMIT: usize = 5;
+
 /// Job kind for turning a transcript into reasoning.
 pub const ENRICH_JOB: &str = "enrich_checkpoint";
 /// Job kind for turning a finished session into durable facts.
@@ -124,7 +128,42 @@ fn user_prompt_submit(
 ) -> anyhow::Result<String> {
     let prompt = prompt_text(input).unwrap_or_else(|| "(untitled session)".to_owned());
     store.bind_session(session, cwd, &prompt, HarnessKind::ClaudeCode)?;
-    Ok(String::new())
+
+    Ok(memory_index(store, session, cwd, &prompt))
+}
+
+/// Names what memory holds that bears on this prompt.
+///
+/// Titles only. The point is to tell the model what exists so it can ask for
+/// what it needs; carrying bodies would cost as much on every prompt as the
+/// retrieval it is meant to replace.
+///
+/// Failure is swallowed: a prompt must never be held up by the memory layer.
+fn memory_index(store: &Store, session: &str, cwd: &Path, prompt: &str) -> String {
+    let query = magent_store::FactQuery {
+        text: Some(prompt.to_owned()),
+        namespaces: magent_store::namespace_candidates(
+            magent_store::repository_root(cwd)
+                .unwrap_or_else(|| cwd.to_path_buf())
+                .as_path(),
+        ),
+        workspace_id: None,
+        limit: INDEX_LIMIT,
+    };
+
+    let Ok(fresh) = store.unpushed_index(session, &query) else {
+        return String::new();
+    };
+    if fresh.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("## Magent: memory\n");
+    for summary in fresh {
+        let _ = writeln!(out, "{} · {}", summary.name, summary.title.trim());
+    }
+    out.push_str("Use magent_recall <name> for the detail.\n");
+    out
 }
 
 /// Appends one observed mutation to the ledger. Deliberately silent: the ledger

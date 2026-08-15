@@ -26,16 +26,24 @@ const INSTRUCTIONS_LIMIT: usize = 2048;
 /// Slice 1 exposes exactly these. The old "only four tools" constraint was
 /// about context cost, and tool search removed it — only names and server
 /// instructions load at session start — but the set still grows deliberately.
-const EXPECTED_TOOLS: [&str; 4] = [
+const EXPECTED_TOOLS: [&str; 7] = [
     "magent_checkpoint",
     "magent_finish",
+    "magent_recall",
+    "magent_remember",
+    "magent_search",
     "magent_start",
     "magent_status",
 ];
 
 /// Tools that change state. Each must take an `operation_id` so a retry after a
 /// dropped connection cannot duplicate work.
-const MUTATING_TOOLS: [&str; 3] = ["magent_checkpoint", "magent_finish", "magent_start"];
+const MUTATING_TOOLS: [&str; 4] = [
+    "magent_checkpoint",
+    "magent_finish",
+    "magent_remember",
+    "magent_start",
+];
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -454,6 +462,103 @@ async fn stdout_carries_protocol_frames_and_nothing_else() {
     assert_eq!(parsed["id"], 1);
 
     child.kill().await.expect("kill");
+}
+
+// --- memory ----------------------------------------------------------------
+
+#[tokio::test]
+async fn a_remembered_fact_can_be_searched_and_recalled() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(
+        &client,
+        "magent_remember",
+        json!({
+            "operation_id": uuid(),
+            "name": "goose-table-locking",
+            "title": "goose v3.26 locks with NewPostgresTableLocker",
+            "body": "goose_lock is auto-created and needs DDL rights.",
+            "kind": "project",
+            "scope": "repository",
+            "cardinality": "single",
+            "status": "observed",
+            "confidence": 0.8
+        }),
+    )
+    .await;
+
+    let found = call(
+        &client,
+        "magent_search",
+        json!({ "text": "migration locking needs DDL rights" }),
+    )
+    .await;
+    let facts = found["facts"].as_array().expect("facts");
+    assert_eq!(facts.len(), 1, "{found}");
+    assert_eq!(facts[0]["name"].as_str(), Some("goose-table-locking"));
+
+    let recalled = call(
+        &client,
+        "magent_recall",
+        json!({ "name": "goose-table-locking" }),
+    )
+    .await;
+    assert!(
+        recalled["fact"]["body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("DDL rights"),
+        "recall must return the body: {recalled}"
+    );
+}
+
+/// Search is what the index defers to, so an empty result has to be an ordinary
+/// answer rather than an error the model has to interpret.
+#[tokio::test]
+async fn searching_for_nothing_returns_an_empty_list() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let found = call(
+        &client,
+        "magent_search",
+        json!({ "text": "something nobody ever wrote down" }),
+    )
+    .await;
+
+    assert_eq!(found["facts"].as_array().map(Vec::len), Some(0), "{found}");
+    client.cancel().await.expect("shutdown");
+}
+
+/// The strongest status must not be the cheapest to assert.
+#[tokio::test]
+async fn remembering_a_verified_fact_without_evidence_is_refused() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let message = call_expecting_error(
+        &client,
+        "magent_remember",
+        json!({
+            "operation_id": uuid(),
+            "name": "unchecked-claim",
+            "title": "asserted without checking",
+            "body": "no evidence at all",
+            "kind": "project",
+            "scope": "repository",
+            "cardinality": "single",
+            "status": "verified",
+            "confidence": 1.0
+        }),
+    )
+    .await;
+
+    assert!(
+        message.contains("verified_without_evidence"),
+        "got: {message}"
+    );
+    client.cancel().await.expect("shutdown");
 }
 
 fn uuid() -> String {

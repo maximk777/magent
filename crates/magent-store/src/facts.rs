@@ -12,7 +12,7 @@ use magent_core::{
     Cardinality, Evidence, Fact, FactId, FactKind, FactScope, FactStatus, FactSummary,
     RelationKind, RememberCommand, RunId, Validate, WorkspaceId,
 };
-use rusqlite::Transaction;
+use rusqlite::{Transaction, TransactionBehavior};
 
 use crate::{
     error::StoreError,
@@ -277,6 +277,46 @@ impl Store {
             .collect())
     }
 
+    /// Facts worth pushing into `session`'s context that it has not seen yet.
+    ///
+    /// Recording what was pushed is what keeps a long session from paying for
+    /// the same handful of facts on every single turn.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn unpushed_index(
+        &self,
+        session: &str,
+        query: &FactQuery,
+    ) -> Result<Vec<FactSummary>, StoreError> {
+        let candidates = self.fact_index(query)?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+
+        let mut fresh = Vec::new();
+        for candidate in candidates {
+            let inserted = tx.execute(
+                "INSERT INTO retrieval_events (external_session_hint, fact_id, pushed_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (external_session_hint, fact_id) DO NOTHING",
+                (session, candidate.fact_id.to_string(), &now),
+            )?;
+
+            // A row that was already there means this session has seen it.
+            if inserted == 1 {
+                fresh.push(candidate);
+            }
+        }
+        tx.commit()?;
+
+        Ok(fresh)
+    }
+
     /// Names this fact links to, with the kind of link.
     ///
     /// # Errors
@@ -342,8 +382,8 @@ fn select_visible(tx: &Transaction<'_>, query: &FactQuery) -> Result<Vec<FactPar
             OR (?2 IS NOT NULL AND f.workspace_id = ?2)
         )";
 
-    // Ordered by specificity first: a repository-level fact about a subject
-    // should outrank a general one, since it was learned here.
+    // Without a text query, specificity decides: a repository-level fact should
+    // outrank a general one, since it was learned here.
     let ordering = "
         ORDER BY CASE f.scope
                      WHEN 'run' THEN 0 WHEN 'repository' THEN 1
@@ -352,25 +392,44 @@ fn select_visible(tx: &Transaction<'_>, query: &FactQuery) -> Result<Vec<FactPar
                  f.updated_at DESC
         LIMIT ?3";
 
+    // With one, relevance decides. OR semantics mean weak matches are in the
+    // result set, so bm25 is what keeps them out of the top of it. Lower is a
+    // better match.
+    let ranked_ordering = "
+        ORDER BY bm25(facts_fts), f.confidence DESC, f.updated_at DESC
+        LIMIT ?3";
+
     let mut rows: Vec<FactParts> = Vec::new();
 
     if let Some(expression) = fts_expression(query.text.as_deref()) {
         let sql = format!(
             "SELECT f.id, f.name, f.title, f.body, f.kind, f.scope, f.cardinality,
-                        f.status, f.confidence, f.namespace, f.updated_at
+                        f.status, f.confidence, f.namespace, f.updated_at, bm25(facts_fts)
                  FROM facts_fts
                  JOIN facts f ON f.rowid = facts_fts.rowid
-                 WHERE facts_fts MATCH ?4 AND {visibility} {ordering}"
+                 WHERE facts_fts MATCH ?4 AND {visibility} {ranked_ordering}"
         );
         let mut statement = tx.prepare(&sql)?;
         let mapped = statement.query_map(
             rusqlite::params![&namespace_list, &workspace, limit, &expression],
-            |row| Ok(row_to_parts(row)),
+            |row| Ok((row.get::<_, f64>(11)?, row_to_parts(row))),
         )?;
-        for part in mapped {
-            // Two layers: rusqlite's row error, then our own conversion error.
-            rows.push(part??);
+
+        let mut scored = Vec::new();
+        for entry in mapped {
+            let (score, part) = entry?;
+            scored.push((score, part?));
         }
+
+        // bm25 is negative and more negative is better, so the best score is
+        // the smallest. Anything less than half as good is noise, and with only
+        // a handful of slots it would displace something that is on topic.
+        if let Some(best) = scored.first().map(|(score, _)| *score) {
+            let cutoff = best * RELEVANCE_FLOOR;
+            scored.retain(|(score, _)| *score <= cutoff);
+        }
+
+        rows.extend(scored.into_iter().map(|(_, part)| part));
     } else {
         let sql = format!(
             "SELECT f.id, f.name, f.title, f.body, f.kind, f.scope, f.cardinality,
@@ -391,19 +450,37 @@ fn select_visible(tx: &Transaction<'_>, query: &FactQuery) -> Result<Vec<FactPar
     Ok(rows)
 }
 
+/// How much worse than the best match a result may be and still be shown.
+///
+/// Relative rather than absolute: bm25 scores depend on corpus size and term
+/// distribution, so a fixed threshold would be meaningless on a small store and
+/// wrong on a large one. Halfway to the best match is the cut.
+const RELEVANCE_FLOOR: f64 = 0.5;
+
+/// Shortest token worth matching on.
+///
+/// Below this the words are almost all grammar — "the", "on", "a" — and with
+/// OR semantics they would match everything and rank nothing.
+const MIN_TOKEN: usize = 3;
+
 /// Builds an FTS5 expression from free text.
 ///
-/// The text comes from a model or a user prompt and may contain anything, so
-/// tokens are extracted and quoted rather than passed through: an unbalanced
-/// quote or a bare `*` would otherwise turn a search into a syntax error.
+/// Tokens are joined with OR, not AND. The text is often a whole prompt rather
+/// than chosen keywords, and requiring every word to appear in one fact means
+/// retrieval that almost never fires. Precision comes from ranking instead: see
+/// the bm25 ordering in [`select_visible`].
+///
+/// Tokens are extracted and quoted rather than passed through, because the text
+/// comes from a model or a raw prompt and an unbalanced quote or a bare `*`
+/// would turn a search into a syntax error.
 fn fts_expression(text: Option<&str>) -> Option<String> {
     let tokens: Vec<String> = text?
         .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .filter(|token| !token.is_empty())
+        .filter(|token| token.chars().count() >= MIN_TOKEN)
         .map(|token| format!("\"{token}\""))
         .collect();
 
-    (!tokens.is_empty()).then(|| tokens.join(" AND "))
+    (!tokens.is_empty()).then(|| tokens.join(" OR "))
 }
 
 fn json_array(values: &[String]) -> String {

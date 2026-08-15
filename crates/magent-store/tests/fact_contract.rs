@@ -293,6 +293,54 @@ fn search_honours_its_limit() {
     assert_eq!(found.len(), 3);
 }
 
+/// OR semantics put weak matches in the result set, and the index has only a
+/// handful of slots. A fact that shares one incidental word must not push out
+/// one that is actually about the subject.
+#[test]
+fn a_weak_match_does_not_crowd_out_a_strong_one() {
+    let (_dir, store) = temp_store();
+    let context = in_namespace("service");
+
+    store
+        .remember(
+            &RememberCommand {
+                cardinality: Cardinality::Set,
+                ..remember(
+                    "goose-migration-lock",
+                    "goose migration hangs on the advisory lock",
+                    "the goose migration lock contends with the probe budget",
+                )
+            },
+            &context,
+        )
+        .expect("strong");
+    store
+        .remember(
+            &RememberCommand {
+                cardinality: Cardinality::Set,
+                ..remember(
+                    "unrelated-note",
+                    "the office coffee machine",
+                    "nothing to do with migrations at all",
+                )
+            },
+            &context,
+        )
+        .expect("weak");
+
+    let found = store
+        .search(&query("the goose migration hangs on a lock", &["service"]))
+        .expect("search");
+
+    assert_eq!(
+        found.len(),
+        1,
+        "a fact matching only \"the\" was returned: {:?}",
+        found.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+    assert_eq!(found[0].name, "goose-migration-lock");
+}
+
 // --- the pushed index ------------------------------------------------------
 
 /// The index is injected on every prompt, so it carries titles and names only.
