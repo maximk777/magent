@@ -140,6 +140,25 @@ pub enum HarnessKind {
     Unknown,
 }
 
+/// How freely a repository may be touched.
+///
+/// Recorded rather than inferred: an agent cannot tell a service it was asked
+/// to change from the infrastructure that deploys a dozen of them by looking at
+/// the code, and the cost of guessing wrong is not symmetric.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryRole {
+    /// The thing being worked on.
+    #[default]
+    Primary,
+    /// Context. Changed only by an explicit decision.
+    Related,
+    /// Never changed.
+    ReadOnly,
+    /// Changing it affects everything else in the group.
+    Infrastructure,
+}
+
 /// Git state captured at a point in time, for context and handoff only.
 ///
 /// Deliberately excludes the origin URL: that identifies the repository and

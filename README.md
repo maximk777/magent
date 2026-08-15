@@ -33,7 +33,18 @@ Slice 2: durable memory.
 - The existing corpus imports and exports losslessly, so the store is not a
   one-way door.
 
-Dependency indexing and the local Web UI are later slices.
+Slice 3, in progress: workspaces.
+
+- A repository's toolchain is read from its manifests on first sight: language
+  and version, package manager, declared scripts, linter configuration. All of
+  it observed and cited, none of it claimed to have been run.
+- Repositories can be gathered into a workspace, so what is true of a group of
+  services reaches all of them. Imported memory filed under one project can be
+  promoted to the whole group.
+- Each repository carries a role, so infrastructure that deploys a dozen
+  services is not treated like the service being worked on.
+
+Dependency indexing and the local Web UI are still to come.
 
 ## How it is put together
 
@@ -108,6 +119,22 @@ magent export --into ~/memory-export
 Import, export and import again returns the same facts and the same relations.
 That round trip is covered by a test, because a store you cannot leave is a
 store you should not adopt.
+
+## Grouping repositories
+
+```bash
+magent workspace group --name wbbank ~/programming/wbbank/*/
+magent workspace promote --namespace wbbank-project-expert --into wbbank
+magent workspace list
+```
+
+Grouping is always explicit. Guessing it from directory layout is wrong often
+enough — vendored checkouts, forks, scratch clones — that a wrong guess would
+merge unrelated projects' memory, which is the failure that makes a memory
+layer worth switching off.
+
+Two checkouts of one repository collapse into a single identity, because they
+are one project and its memory should not fragment across them.
 
 ## Cost
 

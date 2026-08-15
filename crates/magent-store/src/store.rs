@@ -8,8 +8,8 @@ use chrono::{DateTime, Utc};
 use magent_core::{
     CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
     FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState, HarnessKind,
-    OperationId, RepositoryId, RunId, RunSnapshot, RunStatus, SessionId, StartRunCommand,
-    StartRunResult, Validate, WorkflowStage, WorkspaceId,
+    OperationId, RepositoryId, RepositoryRole, RunId, RunSnapshot, RunStatus, SessionId,
+    StartRunCommand, StartRunResult, Validate, WorkflowStage, WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Serialize, de::DeserializeOwned};
@@ -38,6 +38,8 @@ pub struct WorkspaceResolution {
     pub origin_url: Option<String>,
     /// `None` when the path is not inside a git repository.
     pub git: Option<GitState>,
+    /// How freely this repository may be touched.
+    pub role: RepositoryRole,
 }
 
 /// Where a queued job currently stands.
@@ -842,19 +844,21 @@ pub(crate) fn upsert_repository(
 
     let existing = tx
         .query_row(
-            "SELECT id, workspace_id, canonical_root FROM repositories WHERE identity_key = ?1",
+            "SELECT id, workspace_id, canonical_root, role FROM repositories
+             WHERE identity_key = ?1",
             [&identity_key],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()?;
 
-    if let Some((repository_id, workspace_id, canonical_root)) = existing {
+    if let Some((repository_id, workspace_id, canonical_root, role)) = existing {
         return Ok(WorkspaceResolution {
             workspace_id: parse_id(&workspace_id)?,
             repository_id: parse_id(&repository_id)?,
@@ -862,6 +866,7 @@ pub(crate) fn upsert_repository(
             toplevel: PathBuf::from(canonical_root),
             origin_url: probe.origin_url.clone(),
             git: probe.git.clone(),
+            role: enum_from_sql(&role)?,
         });
     }
 
@@ -896,6 +901,7 @@ pub(crate) fn upsert_repository(
         toplevel: probe.root.clone(),
         origin_url: probe.origin_url.clone(),
         git: probe.git.clone(),
+        role: RepositoryRole::default(),
     })
 }
 

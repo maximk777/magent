@@ -8,6 +8,7 @@
 mod error;
 mod facts;
 mod git;
+mod grouping;
 mod migrations;
 mod sessions;
 mod store;
@@ -18,6 +19,7 @@ pub use facts::{FactContext, FactQuery, namespace_candidates};
 pub use git::{
     RepositoryProbe, discover, normalize_origin, state as git_state, toplevel as repository_root,
 };
+pub use grouping::WorkspaceGrouping;
 pub use migrations::CURRENT_VERSION;
 pub use sessions::SessionBinding;
 pub use store::{Job, JobState, Store, WorkspaceResolution};

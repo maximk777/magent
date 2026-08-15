@@ -15,11 +15,50 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum WorkspaceAction {
+    /// Put repositories into one named workspace.
+    Group {
+        /// The workspace's name.
+        #[arg(long)]
+        name: String,
+
+        /// Repository paths. Directories that are not repositories are grouped
+        /// by path instead of being refused.
+        paths: Vec<std::path::PathBuf>,
+    },
+
+    /// Move an imported namespace's facts up to a workspace, so they reach
+    /// every repository in it.
+    Promote {
+        /// The namespace as imported, for example `wbbank-project-expert`.
+        #[arg(long)]
+        namespace: String,
+
+        /// The workspace to promote into.
+        #[arg(long)]
+        into: String,
+    },
+
+    /// Show what workspaces exist and how many repositories each holds.
+    List,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Handle a harness lifecycle event. Reads the event JSON on stdin.
     Hook {
         /// Event name, for example `session-start` or `pre-compact`.
         event: String,
+    },
+
+    /// Gather repositories that belong together, and move memory up to them.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
     },
 
     /// Import existing memory into the store.
@@ -80,6 +119,7 @@ fn main() {
         Command::Hook { event } => run_hook(&event),
         Command::Distill { once, state_dir } => run_distill(once, state_dir),
         Command::Export { into, state_dir } => run_export(&into, state_dir),
+        Command::Workspace { action, state_dir } => run_workspace(action, state_dir),
         Command::Import {
             memory_dir,
             codex_rollouts,
@@ -113,6 +153,65 @@ fn run_export(into: &std::path::Path, state_dir: Option<std::path::PathBuf>) {
             report(&format!("export failed: {error:#}"));
             std::process::exit(1);
         }
+    }
+}
+
+/// Groups repositories and promotes memory between scopes.
+fn run_workspace(action: WorkspaceAction, state_dir: Option<std::path::PathBuf>) {
+    use magent_store::Store;
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let store = match Store::open(&paths::database_path(&state_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            report(&format!("could not open the store: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        WorkspaceAction::Group { name, paths } => match store.group_into_workspace(&name, &paths) {
+            Ok(grouped) => {
+                println!("workspace {name}: {} repositor(ies)", grouped.repositories);
+                for (path, reason) in &grouped.skipped {
+                    println!("  skipped {}: {reason}", path.display());
+                }
+            }
+            Err(error) => {
+                report(&format!("could not group: {error}"));
+                std::process::exit(1);
+            }
+        },
+
+        WorkspaceAction::Promote { namespace, into } => {
+            let Ok(Some(workspace_id)) = store.workspace_id_by_name(&into) else {
+                report(&format!(
+                    "no workspace called {into}; group some repositories into it first"
+                ));
+                std::process::exit(1);
+            };
+
+            match store.promote_namespace(&namespace, workspace_id) {
+                Ok(moved) => println!("promoted {moved} fact(s) from {namespace} to {into}"),
+                Err(error) => {
+                    report(&format!("could not promote: {error}"));
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        WorkspaceAction::List => match store.workspaces() {
+            Ok(all) if all.is_empty() => println!("no workspaces yet"),
+            Ok(all) => {
+                for (name, repositories) in all {
+                    println!("{name}\t{repositories} repositor(ies)");
+                }
+            }
+            Err(error) => {
+                report(&format!("could not list: {error}"));
+                std::process::exit(1);
+            }
+        },
     }
 }
 

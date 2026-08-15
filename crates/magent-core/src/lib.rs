@@ -16,6 +16,6 @@ pub use fact::{
 pub use model::{
     CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
     FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState, HarnessKind,
-    OperationId, Repository, RepositoryId, RunId, RunSnapshot, RunStatus, SessionId,
-    StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
+    OperationId, Repository, RepositoryId, RepositoryRole, RunId, RunSnapshot, RunStatus,
+    SessionId, StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
 };
