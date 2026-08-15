@@ -11,6 +11,7 @@ mod git;
 mod migrations;
 mod sessions;
 mod store;
+mod toolchain;
 
 pub use error::StoreError;
 pub use facts::{FactContext, FactQuery, namespace_candidates};
@@ -20,3 +21,4 @@ pub use git::{
 pub use migrations::CURRENT_VERSION;
 pub use sessions::SessionBinding;
 pub use store::{Job, JobState, Store, WorkspaceResolution};
+pub use toolchain::detect_toolchain;

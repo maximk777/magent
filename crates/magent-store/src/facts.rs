@@ -317,6 +317,54 @@ impl Store {
         Ok(fresh)
     }
 
+    /// Records what `root` declares about its toolchain, once.
+    ///
+    /// Detection is cheap but not free, and its facts only change when a
+    /// manifest does, so it runs when a repository is first seen rather than on
+    /// every session. Returns how many facts were written; zero means either
+    /// the repository declares nothing or it has already been read.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn detect_toolchain_once(
+        &self,
+        root: &Path,
+        context: &FactContext,
+    ) -> Result<usize, StoreError> {
+        if self.has_detected_facts(context)? {
+            return Ok(0);
+        }
+
+        let detected = crate::toolchain::detect_toolchain(root);
+        let mut written = 0;
+
+        for command in &detected {
+            self.remember(
+                command,
+                &FactContext {
+                    provenance: "detected".to_owned(),
+                    ..context.clone()
+                },
+            )?;
+            written += 1;
+        }
+
+        Ok(written)
+    }
+
+    /// Whether this repository's manifests have already been read.
+    fn has_detected_facts(&self, context: &FactContext) -> Result<bool, StoreError> {
+        let connection = self.lock()?;
+        Ok(connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM facts
+                 WHERE provenance = 'detected' AND namespace IS ?1 AND superseded_by IS NULL
+             )",
+            [context.namespace.as_deref()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Every namespace memory has been filed under.
     ///
     /// Used by the exporter, which must reach all of them rather than only the

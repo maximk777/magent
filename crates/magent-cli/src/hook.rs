@@ -101,6 +101,21 @@ fn session_start(store: &Store, session: &str, cwd: &Path) -> anyhow::Result<Str
         return Ok(String::new());
     };
 
+    // First sight of a repository is when its manifests are worth reading: the
+    // facts only change when a manifest does, so this is a one-off rather than
+    // a per-session cost.
+    let root = magent_store::repository_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let _ = store.detect_toolchain_once(
+        &root,
+        &magent_store::FactContext {
+            workspace_id: Some(binding.workspace_id),
+            namespace: root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            ..magent_store::FactContext::default()
+        },
+    );
+
     let snapshot = store.snapshot(binding.run_id)?;
     let ledger = store.ledger(binding.run_id, LEDGER_LIMIT)?;
     let git = magent_store::git_state(cwd);

@@ -327,6 +327,60 @@ fn later_prompts_join_the_run_instead_of_opening_more() {
     assert_eq!(fixture.store().run_count().expect("count"), 1);
 }
 
+// --- toolchain detection ---------------------------------------------------
+
+/// What a repository declares should be known before the model guesses at it.
+/// Reading the manifests once, on first sight, costs a few file reads and
+/// removes a whole class of confident wrong commands.
+#[test]
+fn first_sight_of_a_repository_reads_its_manifests() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.repo.join("go.mod"),
+        "module github.com/acme/service\n\ngo 1.24.3\n",
+    )
+    .expect("write go.mod");
+
+    // A run has to exist for session-start to attach to.
+    fixture.hook(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", "t1"),
+            "prompt",
+            json!("start work"),
+        ),
+    );
+    fixture.hook("session-start", &fixture.base("SessionStart", "t2"));
+
+    let store = fixture.store();
+    let found = store
+        .search(&magent_store::FactQuery {
+            text: Some("go module version".into()),
+            namespaces: vec![
+                fixture
+                    .repo
+                    .file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            ..magent_store::FactQuery::default()
+        })
+        .expect("search");
+
+    let go = found
+        .iter()
+        .find(|fact| fact.name == "toolchain-go")
+        .expect("the go toolchain should have been detected");
+
+    assert!(go.title.contains("1.24.3"), "{}", go.title);
+    assert_eq!(
+        go.status,
+        magent_core::FactStatus::Observed,
+        "reading a manifest is not the same as running anything"
+    );
+}
+
 // --- the memory index ------------------------------------------------------
 
 /// The index is what makes memory usable without the model knowing to ask. It
