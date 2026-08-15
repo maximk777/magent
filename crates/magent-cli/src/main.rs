@@ -21,6 +21,13 @@ enum Command {
         /// Event name, for example `session-start` or `pre-compact`.
         event: String,
     },
+
+    /// Serve the Magent MCP tools over stdio.
+    Mcp {
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
 }
 
 /// Hooks must never fail a session, so this process exits 0 no matter what.
@@ -33,6 +40,47 @@ fn main() {
 
     match cli.command {
         Command::Hook { event } => run_hook(&event),
+        Command::Mcp { state_dir } => run_mcp(state_dir),
+    }
+}
+
+/// Serves MCP on stdio.
+///
+/// Unlike a hook, this failing is worth reporting: the harness shows the server
+/// as errored in `/mcp` instead of silently offering no tools. Nothing but
+/// protocol frames may reach stdout, so every diagnostic goes to stderr.
+fn run_mcp(state_dir: Option<std::path::PathBuf>) {
+    use std::sync::Arc;
+
+    use magent_core::HarnessKind;
+    use magent_store::Store;
+    use rmcp::{ServiceExt, transport::stdio};
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            report(&format!("could not start the runtime: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    let result = runtime.block_on(async move {
+        let store = Arc::new(Store::open(&paths::database_path(&state_dir))?);
+        let server = magent_mcp::MagentMcp::new(store, HarnessKind::ClaudeCode, workspace_root);
+        let service = server.serve(stdio()).await?;
+        service.waiting().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    if let Err(error) = result {
+        report(&format!("mcp server stopped: {error:#}"));
+        std::process::exit(1);
     }
 }
 

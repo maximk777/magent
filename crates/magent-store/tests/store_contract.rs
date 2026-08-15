@@ -440,3 +440,42 @@ fn enqueueing_the_same_job_key_twice_does_not_duplicate_work() {
             .is_none()
     );
 }
+
+// --- reentrancy ------------------------------------------------------------
+
+/// The store guards one connection with a non-reentrant mutex, so a method that
+/// calls another public method while still holding the guard deadlocks.
+///
+/// That failure mode is silent and total: it hangs the MCP server or a hook
+/// rather than returning an error. Asserted with a timeout so a regression
+/// fails the suite instead of stalling it forever.
+#[test]
+fn public_methods_never_deadlock_on_the_store_itself() {
+    use std::sync::mpsc;
+
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+    let root = std::env::temp_dir();
+
+    store
+        .start_run(
+            &start_command("something in flight"),
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start");
+
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = store.latest_open_run_for_path(&root);
+        let _ = sender.send(outcome.map(|run| run.is_some()));
+    });
+
+    match receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(found)) => assert!(found, "the open run should have been found"),
+        Ok(Err(error)) => panic!("lookup failed: {error}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("latest_open_run_for_path deadlocked")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the lookup thread died"),
+    }
+}

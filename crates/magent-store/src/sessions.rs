@@ -216,6 +216,33 @@ impl Store {
         Ok(())
     }
 
+    /// The most recently touched open run for whatever workspace `path`
+    /// belongs to.
+    ///
+    /// Read-only, and registers the repository on first sight so that asking
+    /// about an unknown directory answers "nothing in flight" rather than
+    /// failing.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn latest_open_run_for_path(&self, path: &Path) -> Result<Option<RunSnapshot>, StoreError> {
+        let resolved = self.resolve_workspace_for(path)?;
+
+        // The guard is scoped so it is released before `get_run` runs. The
+        // store's mutex is not reentrant, so holding it across a call to
+        // another public method deadlocks — silently and totally, hanging the
+        // MCP server or a hook rather than returning an error.
+        let run_id = {
+            let mut connection = self.lock()?;
+            let tx = connection.transaction()?;
+            let found = latest_open_run(&tx, resolved.workspace_id)?;
+            drop(tx);
+            found
+        };
+
+        run_id.map(|run_id| self.get_run(run_id)).transpose()
+    }
+
     /// The run's current state plus its most recent checkpoint.
     ///
     /// # Errors
