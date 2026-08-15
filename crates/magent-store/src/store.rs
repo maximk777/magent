@@ -40,6 +40,14 @@ pub struct WorkspaceResolution {
     pub git: Option<GitState>,
 }
 
+/// Where a queued job currently stands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JobState {
+    pub status: String,
+    pub retry_remaining: i64,
+    pub last_error: Option<String>,
+}
+
 /// A job handed to a worker, already leased.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Job {
@@ -530,6 +538,95 @@ impl Store {
             payload_json,
             retry_remaining,
         }))
+    }
+
+    /// Current state of a queued job, for diagnosis and for tests.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn job_state(&self, kind: &str, job_key: &str) -> Result<Option<JobState>, StoreError> {
+        let connection = self.lock()?;
+        Ok(connection
+            .query_row(
+                "SELECT status, retry_remaining, last_error FROM jobs
+                 WHERE kind = ?1 AND job_key = ?2",
+                (kind, job_key),
+                |row| {
+                    Ok(JobState {
+                        status: row.get(0)?,
+                        retry_remaining: row.get(1)?,
+                        last_error: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Records a failed attempt, scheduling a retry or giving up.
+    ///
+    /// A job that can never succeed must stop being handed out: without a floor
+    /// it would be retried, and paid for, for as long as the database exists.
+    /// The reason is kept either way, because a job that failed silently is
+    /// indistinguishable from one that never ran.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn fail_job(
+        &self,
+        kind: &str,
+        job_key: &str,
+        error: &str,
+        backoff: Duration,
+    ) -> Result<(), StoreError> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let remaining: Option<i64> = tx
+            .query_row(
+                "SELECT retry_remaining FROM jobs WHERE kind = ?1 AND job_key = ?2",
+                (kind, job_key),
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(remaining) = remaining else {
+            drop(tx);
+            return Ok(());
+        };
+
+        let now = Utc::now();
+        let left = remaining.saturating_sub(1);
+
+        if left > 0 {
+            let retry_at = now
+                + chrono::Duration::from_std(backoff)
+                    .map_err(|error| StoreError::Database(error.to_string()))?;
+            tx.execute(
+                "UPDATE jobs SET status = 'pending', retry_remaining = ?1, retry_at = ?2,
+                                 lease_until = NULL, worker_id = NULL, last_error = ?3,
+                                 updated_at = ?4
+                 WHERE kind = ?5 AND job_key = ?6",
+                (
+                    left,
+                    retry_at.to_rfc3339(),
+                    error,
+                    now.to_rfc3339(),
+                    kind,
+                    job_key,
+                ),
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE jobs SET status = 'failed', retry_remaining = 0, retry_at = NULL,
+                                 lease_until = NULL, worker_id = NULL, last_error = ?1,
+                                 updated_at = ?2
+                 WHERE kind = ?3 AND job_key = ?4",
+                (error, now.to_rfc3339(), kind, job_key),
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// # Errors

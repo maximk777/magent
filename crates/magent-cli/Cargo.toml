@@ -21,6 +21,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 magent-core = { path = "../magent-core" }
+magent-distill = { path = "../magent-distill" }
 magent-mcp = { path = "../magent-mcp" }
 magent-store = { path = "../magent-store" }
 serde_json.workspace = true

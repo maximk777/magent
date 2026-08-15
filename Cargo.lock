@@ -503,6 +503,7 @@ dependencies = [
  "chrono",
  "clap",
  "magent-core",
+ "magent-distill",
  "magent-mcp",
  "magent-store",
  "rmcp",
@@ -521,6 +522,19 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "magent-distill"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "magent-core",
+ "magent-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

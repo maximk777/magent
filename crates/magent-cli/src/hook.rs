@@ -178,8 +178,28 @@ fn pre_compact(store: &Store, session: &str, cwd: &Path, input: &Value) -> anyho
         .to_string(),
     )?;
 
+    spawn_worker();
+
     // PreCompact can only allow or deny; anything written here is discarded.
     Ok(String::new())
+}
+
+/// Starts a detached worker to drain the queue.
+///
+/// Detached because the hook must return in milliseconds and a distillation
+/// takes seconds. Failure is ignored on purpose: the job is already durable, so
+/// the next hook or the next session will pick it up.
+fn spawn_worker() {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+
+    let _ = std::process::Command::new(executable)
+        .args(["distill", "--once"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn session_end(store: &Store, session: &str, input: &Value) -> anyhow::Result<String> {
@@ -198,6 +218,7 @@ fn session_end(store: &Store, session: &str, input: &Value) -> anyhow::Result<St
 
     // The run stays open: closing an editor is not finishing a task.
     store.close_external_session(session)?;
+    spawn_worker();
     Ok(String::new())
 }
 

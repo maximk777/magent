@@ -22,6 +22,17 @@ enum Command {
         event: String,
     },
 
+    /// Drain the background distillation queue.
+    Distill {
+        /// Process one job and exit. This is how hooks invoke the worker.
+        #[arg(long, default_value_t = true)]
+        once: bool,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Serve the Magent MCP tools over stdio.
     Mcp {
         /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
@@ -40,7 +51,46 @@ fn main() {
 
     match cli.command {
         Command::Hook { event } => run_hook(&event),
+        Command::Distill { once, state_dir } => run_distill(once, state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
+    }
+}
+
+/// Drains the distillation queue.
+///
+/// Spawned detached by a hook, so it must not assume a terminal, must not write
+/// to the hook's stdout, and must exit rather than loop: a long-running worker
+/// would outlive the session that started it.
+fn run_distill(once: bool, state_dir: Option<std::path::PathBuf>) {
+    use magent_distill::{ClaudeHeadless, Outcome, WorkerConfig, run_once};
+    use magent_store::Store;
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let store = match Store::open(&paths::database_path(&state_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            report(&format!("could not open the store: {error}"));
+            return;
+        }
+    };
+
+    let engine = ClaudeHeadless::default();
+    let config = WorkerConfig::default();
+
+    loop {
+        match run_once(&store, &engine, &config) {
+            Ok(Outcome::Idle) => return,
+            Ok(Outcome::Enriched(run_id)) => report(&format!("enriched run {run_id}")),
+            Ok(Outcome::Failed(message)) => report(&format!("distillation failed: {message}")),
+            Err(error) => {
+                report(&format!("worker stopped: {error:#}"));
+                return;
+            }
+        }
+
+        if once {
+            return;
+        }
     }
 }
 

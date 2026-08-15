@@ -4,6 +4,7 @@ members = [
     "crates/magent-core",
     "crates/magent-store",
     "crates/magent-mcp",
+    "crates/magent-distill",
     "crates/magent-cli",
 ]
 

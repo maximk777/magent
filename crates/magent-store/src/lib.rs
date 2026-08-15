@@ -17,4 +17,4 @@ pub use git::{
 };
 pub use migrations::CURRENT_VERSION;
 pub use sessions::SessionBinding;
-pub use store::{Job, Store, WorkspaceResolution};
+pub use store::{Job, JobState, Store, WorkspaceResolution};
