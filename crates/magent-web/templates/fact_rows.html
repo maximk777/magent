@@ -1,0 +1,27 @@
+{% if facts.is_empty() %}
+  <tr><td colspan="5"><div class="empty">Nothing matches.</div></td></tr>
+{% else %}
+  {% for fact in facts %}
+  <tr>
+    <td>
+      <a href="/facts/{{ fact.id }}">{{ fact.title }}</a>
+      <div class="mono muted">{{ fact.name }}</div>
+    </td>
+    <td class="muted">{{ fact.namespace }}</td>
+    <td><span class="pill">{{ fact.scope }}</span></td>
+    <td><span class="pill {{ fact.status }}">{{ fact.status }}</span></td>
+    <td class="tight">
+      {% if fact.revoked %}
+        <form class="inline" method="post" action="/facts/{{ fact.id }}/reinstate">
+          <button class="small" type="submit">Reinstate</button>
+        </form>
+      {% else %}
+        <form class="inline" method="post" action="/facts/{{ fact.id }}/revoke">
+          <input type="hidden" name="reason" value="withdrawn from the console">
+          <button class="small danger" type="submit">Withdraw</button>
+        </form>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+{% endif %}

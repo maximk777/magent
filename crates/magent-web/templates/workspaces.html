@@ -1,0 +1,44 @@
+{% extends "layout.html" %}
+{% block title %}Workspaces — Magent{% endblock %}
+{% block content %}
+<h1>Workspaces</h1>
+<p class="lede">Repositories that belong together share what is true of the group.</p>
+
+{% if groups.is_empty() %}
+  <div class="empty">No groups yet. <code class="mono">magent workspace group --name &lt;name&gt; &lt;paths&gt;</code></div>
+{% else %}
+<table>
+  <thead><tr><th>Workspace</th><th>Repositories</th></tr></thead>
+  <tbody>
+  {% for group in groups %}
+    <tr><td>{{ group.0 }}</td><td class="muted">{{ group.1 }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h2>Projects memory is filed under</h2>
+<p class="lede">Imported memory is filed by directory name. Promote one into a workspace to reach every repository in it.</p>
+<table>
+  <thead><tr><th>Namespace</th><th>Facts</th><th></th></tr></thead>
+  <tbody>
+  {% for row in namespaces %}
+    <tr>
+      <td class="mono">{{ row.0 }}</td>
+      <td class="muted">{{ row.1 }}</td>
+      <td class="tight">
+        {% if !groups.is_empty() %}
+        <form class="inline" method="post" action="/workspaces/promote">
+          <input type="hidden" name="namespace" value="{{ row.0 }}">
+          <select name="workspace">
+            {% for group in groups %}<option value="{{ group.0 }}">{{ group.0 }}</option>{% endfor %}
+          </select>
+          <button class="small" type="submit">Promote</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

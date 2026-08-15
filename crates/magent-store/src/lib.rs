@@ -5,6 +5,7 @@
 //! writes. Every mutation is idempotent on its `operation_id`, so a hook that
 //! retries after a crash cannot duplicate state.
 
+mod curation;
 mod error;
 mod facts;
 mod git;
@@ -14,6 +15,7 @@ mod sessions;
 mod store;
 mod toolchain;
 
+pub use curation::{FactFilter, Overview, RunRow};
 pub use error::StoreError;
 pub use facts::{FactContext, FactQuery, namespace_candidates};
 pub use git::{

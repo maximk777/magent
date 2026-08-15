@@ -1,0 +1,38 @@
+{% extends "layout.html" %}
+{% block title %}Memory — Magent{% endblock %}
+{% block content %}
+<h1>Memory</h1>
+<p class="lede">What Magent knows, and what it would tell an agent working here.</p>
+
+<form class="bar" hx-get="/facts/rows" hx-target="#rows" hx-trigger="submit, input from:input[type=search] delay:220ms, change from:select" hx-swap="innerHTML">
+  <input type="search" name="q" value="{{ filter_text }}" placeholder="Search name, title or body" autocomplete="off">
+  <select name="namespace">
+    <option value="">every project</option>
+    {% for ns in namespaces %}
+      <option value="{{ ns }}"{% if filter_namespace == ns.as_str() %} selected{% endif %}>{{ ns }}</option>
+    {% endfor %}
+  </select>
+  <select name="status">
+    <option value="">retrievable</option>
+    <option value="verified"{% if filter_status == "verified" %} selected{% endif %}>verified</option>
+    <option value="observed"{% if filter_status == "observed" %} selected{% endif %}>observed</option>
+    <option value="inferred"{% if filter_status == "inferred" %} selected{% endif %}>inferred</option>
+    <option value="revoked"{% if filter_status == "revoked" %} selected{% endif %}>withdrawn</option>
+  </select>
+  <select name="scope">
+    <option value="">any scope</option>
+    <option value="user"{% if filter_scope == "user" %} selected{% endif %}>user</option>
+    <option value="workspace"{% if filter_scope == "workspace" %} selected{% endif %}>workspace</option>
+    <option value="repository"{% if filter_scope == "repository" %} selected{% endif %}>repository</option>
+  </select>
+</form>
+
+<table>
+  <thead>
+    <tr><th>Fact</th><th>Project</th><th>Scope</th><th>Status</th><th></th></tr>
+  </thead>
+  <tbody id="rows">
+    {% include "fact_rows.html" %}
+  </tbody>
+</table>
+{% endblock %}

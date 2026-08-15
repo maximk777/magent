@@ -24,6 +24,7 @@ magent-core = { path = "../magent-core" }
 magent-distill = { path = "../magent-distill" }
 magent-mcp = { path = "../magent-mcp" }
 magent-store = { path = "../magent-store" }
+magent-web = { path = "../magent-web" }
 serde_json.workspace = true
 uuid.workspace = true
 rmcp.workspace = true

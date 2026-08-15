@@ -1,0 +1,56 @@
+{% extends "layout.html" %}
+{% block title %}Magent console{% endblock %}
+{% block content %}
+<h1>Overview</h1>
+<p class="lede">{{ database }}</p>
+
+<h2>Memory</h2>
+<div class="tiles">
+  <div class="tile"><div class="n">{{ overview.facts }}</div><div class="k">live facts</div></div>
+  <div class="tile"><div class="n">{{ overview.namespaces }}</div><div class="k">namespaces</div></div>
+  <div class="tile"><div class="n">{{ overview.superseded }}</div><div class="k">superseded</div></div>
+  <div class="tile"><div class="n">{{ overview.revoked }}</div><div class="k">withdrawn</div></div>
+</div>
+
+<h2>Work</h2>
+<div class="tiles">
+  <div class="tile"><div class="n">{{ overview.runs_open }}</div><div class="k">open runs</div></div>
+  <div class="tile"><div class="n">{{ overview.runs_completed }}</div><div class="k">completed</div></div>
+  <div class="tile"><div class="n">{{ overview.repositories }}</div><div class="k">repositories</div></div>
+  <div class="tile"><div class="n">{{ overview.workspaces }}</div><div class="k">workspaces</div></div>
+</div>
+
+<h2>Background</h2>
+<div class="tiles">
+  <div class="tile{% if overview.jobs_pending > 0 %} warn{% endif %}">
+    <div class="n">{{ overview.jobs_pending }}</div><div class="k">queued</div>
+  </div>
+  <div class="tile{% if overview.jobs_failed > 0 %} bad{% endif %}">
+    <div class="n">{{ overview.jobs_failed }}</div><div class="k">gave up</div>
+  </div>
+</div>
+{% if overview.jobs_failed > 0 %}
+<p class="note">Jobs that gave up have exhausted their retries. Their reason is kept; nothing was distilled for them.</p>
+{% endif %}
+
+{% if !duplicates.is_empty() %}
+<h2>Possible duplicates</h2>
+<p class="lede">Facts in the same project sharing a distinctive word. Judged by eye, not merged automatically.</p>
+<table>
+  <tbody>
+  {% for pair in duplicates %}
+    <tr>
+      <td><a href="/facts/{{ pair.0.id }}">{{ pair.0.title }}</a><br><span class="mono muted">{{ pair.0.name }}</span></td>
+      <td><a href="/facts/{{ pair.1.id }}">{{ pair.1.title }}</a><br><span class="mono muted">{{ pair.1.name }}</span></td>
+      <td class="tight">
+        <form class="inline" method="post" action="/facts/{{ pair.0.id }}/merge">
+          <input type="hidden" name="duplicate" value="{{ pair.1.id }}">
+          <button class="small" type="submit">Fold right into left</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Magent{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <span class="brand">magent <small>console</small></span>
+    <nav class="top">
+      <a href="/" class="{% if section == "overview" %}on{% endif %}">Overview</a>
+      <a href="/facts" class="{% if section == "facts" %}on{% endif %}">Memory</a>
+      <a href="/runs" class="{% if section == "runs" %}on{% endif %}">Runs</a>
+      <a href="/workspaces" class="{% if section == "workspaces" %}on{% endif %}">Workspaces</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

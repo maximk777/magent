@@ -44,7 +44,27 @@ Slice 3, in progress: workspaces.
 - Each repository carries a role, so infrastructure that deploys a dozen
   services is not treated like the service being worked on.
 
-Dependency indexing and the local Web UI are still to come.
+Slice 4: the console.
+
+```bash
+magent web
+```
+
+A local page for the half of curation automation cannot do: confirming what is
+true, withdrawing what is not, correcting wording, folding duplicates together,
+and moving a fact up to the workspace it actually belongs to.
+
+Nothing there destroys anything. A withdrawal is reversible, a correction
+supersedes rather than overwrites, and a merge leaves a relation pointing at
+what was folded in — curation is where mistakes are made on purpose, and it
+should never be frightening.
+
+It binds to loopback only. It is an unauthenticated read-write view of a
+personal memory, and it is not the daemon this design deliberately does
+without: it opens the same file every hook opens, holds nothing, and can be
+closed at any moment.
+
+Dependency indexing is still to come.
 
 ## How it is put together
 

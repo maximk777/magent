@@ -1,0 +1,32 @@
+{% extends "layout.html" %}
+{% block title %}Runs — Magent{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+<p class="lede">One run is one task. It outlives the session that opened it.</p>
+
+{% if runs.is_empty() %}
+  <div class="empty">Nothing has been worked on yet.</div>
+{% else %}
+<table>
+  <thead><tr><th>Task</th><th>Stage</th><th>Status</th><th>Touched</th><th></th></tr></thead>
+  <tbody>
+  {% for run in runs %}
+    <tr>
+      <td>{{ run.task }}<div class="mono muted">{{ run.run_id }}</div></td>
+      <td class="muted">{{ run.stage }}</td>
+      <td><span class="pill {% if run.open %}open{% endif %}">{{ run.status }}</span></td>
+      <td class="muted tight">{{ run.updated_at }}</td>
+      <td class="tight">
+        {% if run.open %}
+        <form class="inline" method="post" action="/runs/{{ run.run_id }}/close">
+          <button class="small" type="submit">Close</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="note">Closing a run stops it being restored into new sessions. It does not delete anything.</p>
+{% endif %}
+{% endblock %}

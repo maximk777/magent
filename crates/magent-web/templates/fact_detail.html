@@ -1,0 +1,104 @@
+{% extends "layout.html" %}
+{% block title %}{{ fact.name }} — Magent{% endblock %}
+{% block content %}
+<h1>{{ fact.title }}</h1>
+<p class="lede mono">{{ fact.name }}</p>
+
+<div class="split">
+  <div>
+    <div class="panel">
+      <h3>What it says</h3>
+      <div class="body-text">{{ fact.body }}</div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h3>Correct it</h3>
+      <form method="post" action="/facts/{{ fact.id }}/edit">
+        <input type="text" name="title" value="{{ fact.title }}" style="width:100%;margin-bottom:8px">
+        <textarea name="body" rows="7">{{ fact.body }}</textarea>
+        <div class="bar" style="margin:10px 0 0">
+          <button class="primary" type="submit">Save as a new version</button>
+        </div>
+      </form>
+      <p class="note">The current wording is kept and superseded, never overwritten: a decision may have been made on it.</p>
+    </div>
+
+    {% if !history.is_empty() %}
+    <div class="panel" style="margin-top:16px">
+      <h3>Earlier versions</h3>
+      <ul class="plain">
+        {% for old in history %}
+        <li>
+          <span class="pill {{ old.status }}">{{ old.status }}</span>
+          {{ old.title }}
+          <div class="muted mono">{{ old.updated }}</div>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+  </div>
+
+  <div>
+    <div class="panel">
+      <h3>Where it applies</h3>
+      <dl class="meta">
+        <dt>Project</dt><dd>{{ fact.namespace }}</dd>
+        <dt>Scope</dt><dd>{{ fact.scope }}</dd>
+        <dt>Kind</dt><dd>{{ fact.kind }}</dd>
+        <dt>Conflicts</dt><dd>{{ fact.cardinality }}</dd>
+        <dt>Status</dt><dd><span class="pill {{ fact.status }}">{{ fact.status }}</span></dd>
+        <dt>Trust</dt><dd>{{ fact.trust }}</dd>
+        <dt>Updated</dt><dd>{{ fact.updated }}</dd>
+      </dl>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h3>Evidence</h3>
+      {% if fact.evidence.is_empty() %}
+        <p class="muted">Nothing cited. A fact can only be confirmed once something backs it.</p>
+      {% else %}
+        <ul class="plain">
+          {% for item in fact.evidence %}
+          <li>
+            <span class="mono">{{ item.locator }}</span>
+            {% if !item.excerpt.is_empty() %}<div class="muted mono">{{ item.excerpt }}</div>{% endif %}
+          </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+
+      <form method="post" action="/facts/{{ fact.id }}/verify" style="margin-top:12px">
+        <input type="text" name="locator" placeholder="path/to/file.rs:41 or a URL" style="width:100%;margin-bottom:8px">
+        <button type="submit">Confirm with this</button>
+      </form>
+    </div>
+
+    {% if !relations.is_empty() %}
+    <div class="panel" style="margin-top:16px">
+      <h3>Related</h3>
+      <ul class="plain">
+        {% for name in relations %}<li class="mono">{{ name }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <div class="panel" style="margin-top:16px">
+      <h3>Move it</h3>
+      <form method="post" action="/facts/{{ fact.id }}/scope">
+        <select name="scope" style="width:100%;margin-bottom:8px">
+          <option value="repository"{% if fact.scope == "repository" %} selected{% endif %}>this repository</option>
+          <option value="workspace"{% if fact.scope == "workspace" %} selected{% endif %}>the whole workspace</option>
+          <option value="user"{% if fact.scope == "user" %} selected{% endif %}>me, everywhere</option>
+        </select>
+        <select name="workspace" style="width:100%;margin-bottom:8px">
+          <option value="">no workspace</option>
+          {% for group in workspaces %}<option value="{{ group.0 }}">{{ group.0 }}</option>{% endfor %}
+        </select>
+        <button type="submit">Move</button>
+      </form>
+      <p class="note">A workspace scope reaches every repository grouped into it.</p>
+    </div>
+  </div>
+</div>
+{% endblock %}

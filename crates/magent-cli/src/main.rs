@@ -76,6 +76,17 @@ enum Command {
         state_dir: Option<std::path::PathBuf>,
     },
 
+    /// Open the local console for managing memory.
+    Web {
+        /// Port to listen on. Loopback only.
+        #[arg(long, default_value_t = 7717)]
+        port: u16,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Write memory back out as a markdown corpus.
     Export {
         /// Directory to write into. Created if missing; existing files with the
@@ -119,6 +130,7 @@ fn main() {
         Command::Hook { event } => run_hook(&event),
         Command::Distill { once, state_dir } => run_distill(once, state_dir),
         Command::Export { into, state_dir } => run_export(&into, state_dir),
+        Command::Web { port, state_dir } => run_web(port, state_dir),
         Command::Workspace { action, state_dir } => run_workspace(action, state_dir),
         Command::Import {
             memory_dir,
@@ -126,6 +138,49 @@ fn main() {
             state_dir,
         } => run_import(memory_dir, codex_rollouts, state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
+    }
+}
+
+/// Serves the console.
+///
+/// Loopback only: it is an unauthenticated read-write view of a personal
+/// memory, and reachable from elsewhere it would be a way in.
+fn run_web(port: u16, state_dir: Option<std::path::PathBuf>) {
+    use std::sync::Arc;
+
+    use magent_store::Store;
+    use magent_web::Console;
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let database = paths::database_path(&state_dir);
+
+    let store = match Store::open(&database) {
+        Ok(store) => store,
+        Err(error) => {
+            report(&format!("could not open the store: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            report(&format!("could not start the runtime: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    let console = Console {
+        store: Arc::new(store),
+        database,
+    };
+
+    if let Err(error) = runtime.block_on(magent_web::serve(console, port)) {
+        report(&format!("console stopped: {error:#}"));
+        std::process::exit(1);
     }
 }
 

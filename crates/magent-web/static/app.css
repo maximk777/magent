@@ -1,0 +1,213 @@
+/* Magent console.
+ *
+ * Deep navy throughout: this is a tool that sits open in a background tab for
+ * hours, and a dark, low-contrast ground is what makes that bearable. Accents
+ * are used sparingly and only where they carry meaning — a status, a warning,
+ * a count that is not zero.
+ */
+
+:root {
+  --navy-900: #070d1c;
+  --navy-850: #0a1329;
+  --navy-800: #0e1a35;
+  --navy-700: #142445;
+  --navy-600: #1d3160;
+  --navy-500: #2a4a8c;
+  --line: #1c2f57;
+  --line-soft: #16264a;
+
+  --ink: #dfe7f7;
+  --ink-dim: #8ea3ca;
+  --ink-faint: #5d739c;
+
+  --accent: #5b8cff;
+  --accent-soft: #21386e;
+  --good: #4ec9a4;
+  --warn: #e8b04b;
+  --bad: #e8697d;
+
+  --radius: 6px;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--navy-900);
+  color: var(--ink);
+  font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+code, .mono { font-family: var(--mono); font-size: 0.88em; }
+
+/* --- shell --------------------------------------------------------------- */
+
+header.top {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding: 0 20px;
+  height: 52px;
+  background: var(--navy-850);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 620;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.brand small { color: var(--ink-faint); font-weight: 400; font-size: 11px; }
+
+nav.top { display: flex; gap: 4px; margin-left: auto; }
+nav.top a {
+  padding: 6px 12px;
+  border-radius: var(--radius);
+  color: var(--ink-dim);
+  font-weight: 500;
+}
+nav.top a:hover { background: var(--navy-700); color: var(--ink); text-decoration: none; }
+nav.top a.on { background: var(--accent-soft); color: var(--ink); }
+
+main { padding: 22px 20px 60px; max-width: 1180px; margin: 0 auto; }
+
+h1 { font-size: 19px; font-weight: 620; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2 { font-size: 14px; font-weight: 600; margin: 26px 0 10px; color: var(--ink-dim); }
+.lede { color: var(--ink-faint); margin: 0 0 20px; font-size: 13px; }
+
+/* --- cards --------------------------------------------------------------- */
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+
+.tile {
+  background: var(--navy-800);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 13px 15px;
+}
+.tile .n { font-size: 25px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }
+.tile .k { color: var(--ink-faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em; margin-top: 2px; }
+.tile.warn .n { color: var(--warn); }
+.tile.bad .n { color: var(--bad); }
+
+/* --- tables -------------------------------------------------------------- */
+
+table { width: 100%; border-collapse: collapse; }
+th {
+  text-align: left;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-faint);
+  font-weight: 600;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+}
+td { padding: 9px 10px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+tr:hover td { background: var(--navy-850); }
+td.tight { white-space: nowrap; width: 1%; }
+
+.empty {
+  padding: 34px 16px;
+  text-align: center;
+  color: var(--ink-faint);
+  border: 1px dashed var(--line);
+  border-radius: var(--radius);
+}
+
+/* --- pills --------------------------------------------------------------- */
+
+.pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 550;
+  background: var(--navy-700);
+  color: var(--ink-dim);
+  border: 1px solid var(--line);
+}
+.pill.verified { color: var(--good); border-color: #1d4a3d; background: #0d2a22; }
+.pill.revoked  { color: var(--bad);  border-color: #4a2029; background: #2a1016; }
+.pill.inferred { color: var(--warn); border-color: #4a3a1a; background: #2a2010; }
+.pill.open     { color: var(--accent); border-color: var(--accent-soft); background: #101f3f; }
+
+/* --- controls ------------------------------------------------------------ */
+
+.bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+
+input[type=text], input[type=search], select, textarea {
+  background: var(--navy-850);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  padding: 7px 10px;
+  font: inherit;
+  min-width: 0;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(91, 140, 255, 0.15);
+}
+input[type=search] { flex: 1 1 240px; }
+textarea { width: 100%; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; resize: vertical; }
+
+button, .btn {
+  background: var(--navy-700);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  padding: 7px 13px;
+  font: inherit;
+  font-weight: 520;
+  cursor: pointer;
+}
+button:hover, .btn:hover { background: var(--navy-600); }
+button.primary { background: var(--accent-soft); border-color: var(--accent); }
+button.danger:hover { background: #3a1620; border-color: #5c2734; color: var(--bad); }
+button.small { padding: 4px 9px; font-size: 12px; }
+
+form.inline { display: inline; }
+
+/* --- detail -------------------------------------------------------------- */
+
+.split { display: grid; grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 820px) { .split { grid-template-columns: 1fr; } }
+
+.panel {
+  background: var(--navy-800);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.panel h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-faint); font-weight: 600; }
+
+.body-text { white-space: pre-wrap; line-height: 1.6; }
+
+dl.meta { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13px; }
+dl.meta dt { color: var(--ink-faint); }
+dl.meta dd { margin: 0; }
+
+ul.plain { list-style: none; margin: 0; padding: 0; }
+ul.plain li { padding: 5px 0; border-bottom: 1px solid var(--line-soft); }
+ul.plain li:last-child { border-bottom: 0; }
+
+.muted { color: var(--ink-faint); }
+.note { color: var(--ink-faint); font-size: 12px; margin-top: 8px; }
+
+/* htmx marks the element it is about to swap; a brief dim is enough feedback
+ * on a localhost app where requests take single-digit milliseconds. */
+.htmx-request { opacity: 0.55; transition: opacity 90ms; }

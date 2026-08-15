@@ -12,7 +12,7 @@ use magent_core::{
     Cardinality, Evidence, Fact, FactId, FactKind, FactScope, FactStatus, FactSummary,
     RelationKind, RememberCommand, RunId, Validate, WorkspaceId,
 };
-use rusqlite::{Transaction, TransactionBehavior};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
     error::StoreError,
@@ -425,6 +425,98 @@ impl Store {
             .map(|(target, predicate)| Ok((target, enum_from_sql(&predicate)?)))
             .collect()
     }
+}
+
+// --- reading for the console -----------------------------------------------
+
+/// One fact by id, regardless of status.
+pub(crate) fn load_fact(tx: &Transaction<'_>, fact_id: FactId) -> Result<Option<Fact>, StoreError> {
+    let row = tx
+        .query_row(
+            "SELECT id, name, title, body, kind, scope, cardinality, status, confidence,
+                    namespace, updated_at
+             FROM facts WHERE id = ?1",
+            [fact_id.to_string()],
+            |row| Ok(row_to_parts(row)),
+        )
+        .optional()?;
+
+    match row {
+        None => Ok(None),
+        Some(parts) => Ok(Some(build_fact(tx, parts?)?)),
+    }
+}
+
+/// Facts matching a console filter, newest first.
+///
+/// Unlike retrieval this can show withdrawn and superseded facts, because a
+/// console that could not open what it had just withdrawn would be useless.
+pub(crate) fn browse(
+    tx: &Transaction<'_>,
+    filter: &crate::curation::FactFilter,
+) -> Result<Vec<Fact>, StoreError> {
+    let mut clauses = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(status) = filter.status {
+        clauses.push("f.status = ?".to_owned());
+        params.push(Box::new(enum_to_sql(&status)?));
+    } else {
+        // No status asked for means "what an agent would actually see".
+        clauses.push("f.superseded_by IS NULL AND f.status <> 'revoked'".to_owned());
+    }
+
+    if let Some(namespace) = &filter.namespace {
+        clauses.push("f.namespace = ?".to_owned());
+        params.push(Box::new(namespace.clone()));
+    }
+    if let Some(scope) = filter.scope {
+        clauses.push("f.scope = ?".to_owned());
+        params.push(Box::new(enum_to_sql(&scope)?));
+    }
+    if let Some(kind) = filter.kind {
+        clauses.push("f.kind = ?".to_owned());
+        params.push(Box::new(enum_to_sql(&kind)?));
+    }
+    if let Some(text) = filter
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        clauses.push("(f.name LIKE ? OR f.title LIKE ? OR f.body LIKE ?)".to_owned());
+        let pattern = format!("%{text}%");
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern.clone()));
+        params.push(Box::new(pattern));
+    }
+
+    let limit = i64::try_from(filter.limit.unwrap_or(200)).unwrap_or(200);
+    params.push(Box::new(limit));
+
+    let sql = format!(
+        "SELECT f.id, f.name, f.title, f.body, f.kind, f.scope, f.cardinality,
+                f.status, f.confidence, f.namespace, f.updated_at
+         FROM facts f WHERE {} ORDER BY f.updated_at DESC, f.rowid DESC LIMIT ?",
+        clauses.join(" AND ")
+    );
+
+    let mut statement = tx.prepare(&sql)?;
+    let borrowed: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(std::convert::AsRef::as_ref).collect();
+    let mapped = statement.query_map(borrowed.as_slice(), |row| Ok(row_to_parts(row)))?;
+
+    let mut parts = Vec::new();
+    for entry in mapped {
+        parts.push(entry??);
+    }
+    drop(statement);
+
+    let mut facts = Vec::new();
+    for part in parts {
+        facts.push(build_fact(tx, part)?);
+    }
+    Ok(facts)
 }
 
 // --- selection -------------------------------------------------------------
