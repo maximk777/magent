@@ -6,9 +6,11 @@
 //! retries after a crash cannot duplicate state.
 
 mod error;
+mod git;
 mod migrations;
 mod store;
 
 pub use error::StoreError;
+pub use git::{RepositoryProbe, discover, normalize_origin};
 pub use migrations::CURRENT_VERSION;
-pub use store::{Job, Store};
+pub use store::{Job, Store, WorkspaceResolution};

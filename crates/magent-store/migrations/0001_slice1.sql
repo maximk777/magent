@@ -18,7 +18,14 @@ CREATE TABLE workspaces (
 CREATE TABLE repositories (
     id             TEXT PRIMARY KEY,
     workspace_id   TEXT NOT NULL REFERENCES workspaces(id),
-    canonical_root TEXT NOT NULL UNIQUE,
+    -- 'git:<normalised origin>' when the repository has one, else
+    -- 'path:<canonical root>'. Origin-first so that clones, subdirectories and
+    -- linked worktrees of one project share a single identity and therefore a
+    -- single memory.
+    identity_key   TEXT NOT NULL UNIQUE,
+    -- The root this repository was first seen at. Informational: a worktree of
+    -- the same project resolves here under a different path.
+    canonical_root TEXT NOT NULL,
     origin_url     TEXT,
     created_at     TEXT NOT NULL
 );

@@ -7,14 +7,18 @@ use std::{
 use chrono::{DateTime, Utc};
 use magent_core::{
     CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
-    FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, HarnessKind, OperationId,
-    RunId, RunSnapshot, RunStatus, SessionId, StartRunCommand, StartRunResult, Validate,
-    WorkflowStage, WorkspaceId,
+    FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState, HarnessKind,
+    OperationId, RepositoryId, RunId, RunSnapshot, RunStatus, SessionId, StartRunCommand,
+    StartRunResult, Validate, WorkflowStage, WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::{error::StoreError, migrations};
+use crate::{
+    error::StoreError,
+    git::{self, RepositoryProbe},
+    migrations,
+};
 
 /// How long a writer waits for a competing writer before giving up.
 ///
@@ -22,6 +26,19 @@ use crate::{error::StoreError, migrations};
 /// same file. Five seconds is far beyond any legitimate write here, so hitting
 /// it means something is wedged rather than merely busy.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// What a working directory resolved to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceResolution {
+    pub workspace_id: WorkspaceId,
+    pub repository_id: RepositoryId,
+    /// See `repositories.identity_key` in the migration.
+    pub identity_key: String,
+    pub toplevel: PathBuf,
+    pub origin_url: Option<String>,
+    /// `None` when the path is not inside a git repository.
+    pub git: Option<GitState>,
+}
 
 /// A job handed to a worker, already leased.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,18 +158,38 @@ impl Store {
     ) -> Result<StartRunResult, StoreError> {
         command.validate()?;
 
+        // Probed before the transaction opens. Each git subprocess costs tens
+        // of milliseconds, and holding the single write lock for that long
+        // would stall every concurrent hook.
+        let probe = match command.resume_run_id {
+            Some(_) => None,
+            None => Some(git::discover(command.workspace_roots.first().ok_or(
+                StoreError::Domain(magent_core::DomainError::MissingWorkspaceRoot),
+            )?)),
+        };
+
         self.execute_operation("start_run", command.operation_id, command, |tx| {
             let now = Utc::now().to_rfc3339();
 
-            let (run_id, workspace_id, task, stage) = if let Some(run_id) = command.resume_run_id
+            let (run_id, workspace_id, task, stage) = match (command.resume_run_id, probe.as_ref())
             {
-                let row = load_run_row(tx, run_id)?;
-                if row.status == RunStatus::Completed {
-                    return Err(StoreError::RunClosed(run_id));
+                (Some(run_id), _) => {
+                    let row = load_run_row(tx, run_id)?;
+                    if row.status == RunStatus::Completed {
+                        return Err(StoreError::RunClosed(run_id));
+                    }
+                    (run_id, row.workspace_id, row.task, row.stage)
                 }
-                (run_id, row.workspace_id, row.task, row.stage)
-            } else {
-                    let workspace_id = resolve_workspace(tx, &command.workspace_roots, &now)?;
+                // Unreachable given how `probe` is built above, but expressed as
+                // an error rather than a panic: a hook must never abort a
+                // session over an internal invariant.
+                (None, None) => {
+                    return Err(StoreError::Domain(
+                        magent_core::DomainError::MissingWorkspaceRoot,
+                    ));
+                }
+                (None, Some(probe)) => {
+                    let workspace_id = upsert_repository(tx, probe, &now)?.workspace_id;
                     let run_id = RunId::new();
                     tx.execute(
                         "INSERT INTO runs (id, workspace_id, task, status, stage, created_at, updated_at)
@@ -171,6 +208,7 @@ impl Store {
                         command.task.clone(),
                         WorkflowStage::Discovering,
                     )
+                }
             };
 
             let session_id = SessionId::new();
@@ -319,6 +357,26 @@ impl Store {
             stage: row.stage,
             latest_checkpoint,
         })
+    }
+
+    /// Resolves a working directory to its repository and workspace, creating
+    /// them on first sight.
+    ///
+    /// Called from `SessionStart` on every session, so it must succeed for any
+    /// directory — including one outside git entirely.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn resolve_workspace_for(&self, path: &Path) -> Result<WorkspaceResolution, StoreError> {
+        // Outside the transaction: see the note in `start_run`.
+        let probe = git::discover(path);
+
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let resolved = upsert_repository(&tx, &probe, &Utc::now().to_rfc3339())?;
+        tx.commit()?;
+
+        Ok(resolved)
     }
 
     // --- file ledger -------------------------------------------------------
@@ -671,56 +729,77 @@ fn latest_checkpoint(
     }))
 }
 
-/// Maps the first workspace root onto a repository, creating both it and a
-/// single-repository workspace when unseen.
+/// Records a probed repository, creating it and a single-repository workspace
+/// when its identity is unseen.
 ///
-/// Slice 3 replaces path identity with git identity; until then a canonical
-/// path is enough to keep runs from leaking between projects.
-fn resolve_workspace(
+/// Grouping several repositories into one workspace stays an explicit action:
+/// guessing from directory layout is wrong often enough (`opensource/forks`,
+/// scratch clones) that a wrong guess would silently merge unrelated memories.
+fn upsert_repository(
     tx: &Transaction<'_>,
-    roots: &[PathBuf],
+    probe: &RepositoryProbe,
     now: &str,
-) -> Result<WorkspaceId, StoreError> {
-    let root = roots.first().ok_or(StoreError::Domain(
-        magent_core::DomainError::MissingWorkspaceRoot,
-    ))?;
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-    let canonical_text = canonical.to_string_lossy().to_string();
+) -> Result<WorkspaceResolution, StoreError> {
+    let identity_key = probe.identity_key();
+    let root_text = probe.root.to_string_lossy().to_string();
 
-    let existing: Option<String> = tx
+    let existing = tx
         .query_row(
-            "SELECT workspace_id FROM repositories WHERE canonical_root = ?1",
-            [&canonical_text],
-            |row| row.get(0),
+            "SELECT id, workspace_id, canonical_root FROM repositories WHERE identity_key = ?1",
+            [&identity_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
 
-    if let Some(workspace_id) = existing {
-        return parse_id(&workspace_id);
+    if let Some((repository_id, workspace_id, canonical_root)) = existing {
+        return Ok(WorkspaceResolution {
+            workspace_id: parse_id(&workspace_id)?,
+            repository_id: parse_id(&repository_id)?,
+            identity_key,
+            toplevel: PathBuf::from(canonical_root),
+            origin_url: probe.origin_url.clone(),
+            git: probe.git.clone(),
+        });
     }
 
     let workspace_id = WorkspaceId::new();
-    let name = canonical.file_name().map_or_else(
-        || canonical_text.clone(),
-        |n| n.to_string_lossy().to_string(),
-    );
+    let repository_id = RepositoryId::new();
+    let name = probe
+        .root
+        .file_name()
+        .map_or_else(|| root_text.clone(), |n| n.to_string_lossy().to_string());
 
     tx.execute(
         "INSERT INTO workspaces (id, name, created_at) VALUES (?1, ?2, ?3)",
         (workspace_id.to_string(), &name, now),
     )?;
     tx.execute(
-        "INSERT INTO repositories (id, workspace_id, canonical_root, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO repositories (id, workspace_id, identity_key, canonical_root, origin_url, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         (
-            magent_core::RepositoryId::new().to_string(),
+            repository_id.to_string(),
             workspace_id.to_string(),
-            &canonical_text,
+            &identity_key,
+            &root_text,
+            probe.origin_url.as_deref(),
             now,
         ),
     )?;
 
-    Ok(workspace_id)
+    Ok(WorkspaceResolution {
+        workspace_id,
+        repository_id,
+        identity_key,
+        toplevel: probe.root.clone(),
+        origin_url: probe.origin_url.clone(),
+        git: probe.git.clone(),
+    })
 }
 
 fn lookup_operation(
