@@ -37,6 +37,18 @@ enum Command {
         state_dir: Option<std::path::PathBuf>,
     },
 
+    /// Write memory back out as a markdown corpus.
+    Export {
+        /// Directory to write into. Created if missing; existing files with the
+        /// same names are overwritten.
+        #[arg(long)]
+        into: std::path::PathBuf,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Drain the background distillation queue.
     Distill {
         /// Process one job and exit. This is how hooks invoke the worker.
@@ -67,12 +79,40 @@ fn main() {
     match cli.command {
         Command::Hook { event } => run_hook(&event),
         Command::Distill { once, state_dir } => run_distill(once, state_dir),
+        Command::Export { into, state_dir } => run_export(&into, state_dir),
         Command::Import {
             memory_dir,
             codex_rollouts,
             state_dir,
         } => run_import(memory_dir, codex_rollouts, state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
+    }
+}
+
+/// Writes memory back out as markdown.
+fn run_export(into: &std::path::Path, state_dir: Option<std::path::PathBuf>) {
+    use magent_store::Store;
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let store = match Store::open(&paths::database_path(&state_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            report(&format!("could not open the store: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    match magent_cli::export::export_memory_dir(&store, into) {
+        Ok(summary) => println!(
+            "exported {} fact(s) across {} namespace(s) into {}",
+            summary.facts,
+            summary.namespaces,
+            summary.root.display()
+        ),
+        Err(error) => {
+            report(&format!("export failed: {error:#}"));
+            std::process::exit(1);
+        }
     }
 }
 

@@ -317,6 +317,38 @@ impl Store {
         Ok(fresh)
     }
 
+    /// Every namespace memory has been filed under.
+    ///
+    /// Used by the exporter, which must reach all of them rather than only the
+    /// project it happens to be standing in.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn known_namespaces(&self) -> Result<Vec<String>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare("SELECT DISTINCT namespace FROM facts WHERE namespace IS NOT NULL")?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Names one fact links to, addressed by id.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn relations_of_id(&self, fact_id: FactId) -> Result<Vec<String>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT to_name FROM fact_relations WHERE from_fact_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = statement
+            .query_map([fact_id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Names this fact links to, with the kind of link.
     ///
     /// # Errors

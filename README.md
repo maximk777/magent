@@ -21,8 +21,19 @@ Slice 1: context survival.
 - Reasoning the model alone knows (decisions, alternatives rejected, what was
   verified) is distilled from the transcript in the background.
 
-Memory of facts across projects, dependency indexing and the local Web UI are
-later slices. See `docs/` for the architecture they build toward.
+Slice 2: durable memory.
+
+- Facts carry where they apply, how they may conflict, how far they are
+  trusted, and what they were learned from. A new value supersedes the old one
+  without destroying it.
+- Retrieval is scoped: user-level facts travel everywhere, project facts stay
+  in their project.
+- A compact index of relevant facts is injected on each prompt — names and
+  titles only — and the model opens what it needs with `magent_recall`.
+- The existing corpus imports and exports losslessly, so the store is not a
+  one-way door.
+
+Dependency indexing and the local Web UI are later slices.
 
 ## How it is put together
 
@@ -78,6 +89,25 @@ State lives in `~/.magent/magent.db`, or in `$MAGENT_STATE_DIR` when set.
 ```bash
 sqlite3 ~/.magent/magent.db 'SELECT task, status, stage FROM runs ORDER BY updated_at DESC LIMIT 5;'
 ```
+
+## Bringing existing memory across
+
+```bash
+magent import --memory-dir ~/memory --codex-rollouts ~/.codex/memories/rollout_summaries
+```
+
+Re-running is safe: the import is idempotent. Nothing is written to the source
+corpus.
+
+To get it all back out as markdown:
+
+```bash
+magent export --into ~/memory-export
+```
+
+Import, export and import again returns the same facts and the same relations.
+That round trip is covered by a test, because a store you cannot leave is a
+store you should not adopt.
 
 ## Cost
 
