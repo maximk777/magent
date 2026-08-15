@@ -22,7 +22,7 @@ axum = { version = "0.8", features = ["macros"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive", "env"] }
 directories = "6"
-rmcp = { version = "3.1", features = ["server", "macros", "schemars", "transport-io"] }
+rmcp = { version = "3.1", features = ["server", "macros", "schemars", "transport-io", "elicitation"] }
 schemars = { version = "1.2", features = ["chrono04", "uuid1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

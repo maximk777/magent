@@ -12,7 +12,9 @@ use magent_core::{
     CheckpointCommand, CheckpointOrigin, Fact, FinishAction, FinishRunCommand, HarnessKind,
     OperationId, RememberCommand, RunId, SessionId, StartRunCommand, WorkflowStage,
 };
-use magent_store::{Dependency, FactContext, FactQuery, Store, StoreError, dependency_checkout};
+use magent_store::{
+    Dependency, FactContext, FactQuery, GroupingProposal, Store, StoreError, dependency_checkout,
+};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -61,6 +63,30 @@ reuse the same one when retrying, so a retry cannot duplicate state.
 
 Magent does not replace native approvals: dangerous actions are still confirmed \
 in this harness.";
+
+/// Appended when this workspace looks worth setting up.
+///
+/// The self-describing part of the design: rather than wait to be asked, the
+/// server says what it noticed, in the one place the model reads before it does
+/// anything. Only when there is something to say — an instruction that is
+/// always present is one the model learns to skip.
+fn setup_note(proposal: &GroupingProposal) -> Option<String> {
+    let name = proposal.suggested_name.as_ref()?;
+    if proposal.already_grouped {
+        return None;
+    }
+
+    Some(format!(
+        "\n\nThis workspace is not grouped: {} checkouts here share {}. \
+Memory learned in one of them will not reach the others until they are. Call \
+magent_setup to see what it would do, and offer it (suggested name: {name}).",
+        proposal.siblings.len(),
+        proposal
+            .organisation
+            .as_deref()
+            .unwrap_or("one organisation"),
+    ))
+}
 
 /// What the client may supply when opening a run.
 ///
@@ -190,6 +216,53 @@ struct DependencyReport {
     /// Present only when the last attempt failed, so that stale sources are
     /// never presented as current ones.
     last_error: Option<String>,
+}
+
+/// What setup was asked to do.
+///
+/// No `operation_id`: grouping is idempotent on the workspace name, so a retry
+/// lands on the same group and an idempotency key would be ceremony that can
+/// only be got wrong.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+pub struct SetupToolInput {
+    /// Look only. Applying regroups repositories, so it is never the default.
+    #[serde(default)]
+    pub apply: bool,
+    /// Overrides the suggested name. Only meaningful with `apply`.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// The name to group under, confirmed by the person.
+///
+/// A form rather than a yes/no: the suggested name is a guess from a directory
+/// or an organisation, and the one person who knows what this group is called
+/// is the one being asked.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+pub struct GroupConfirmation {
+    /// What to call this workspace.
+    pub name: String,
+}
+
+rmcp::elicit_safe!(GroupConfirmation);
+
+#[derive(Debug, Serialize)]
+struct SetupReport {
+    /// A sentence to say out loud. Everything below is the detail behind it.
+    summary: String,
+    root: PathBuf,
+    organisation: Option<String>,
+    suggested_name: Option<String>,
+    /// The other reasonable name, when the directory and the organisation
+    /// disagree. Worth offering rather than deciding.
+    alternative_name: Option<String>,
+    siblings: Vec<PathBuf>,
+    already_grouped: bool,
+    workspace_name: Option<String>,
+    /// Set once something was actually done.
+    grouped: Option<usize>,
+    /// The terminal equivalent, so a person can do it themselves.
+    command: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -439,6 +512,114 @@ impl MagentMcp {
     }
 
     #[tool(
+        description = "Inspect this workspace and report what is not set up — chiefly checkouts that belong together but are not grouped, so memory learned in one never reaches the others. Read-only unless apply is true, which asks the person to confirm first."
+    )]
+    async fn magent_setup(
+        &self,
+        peer: rmcp::Peer<rmcp::RoleServer>,
+        Parameters(input): Parameters<SetupToolInput>,
+    ) -> Result<String, String> {
+        let root = &self.workspace_roots[0];
+        let proposal = self
+            .store
+            .propose_grouping(root)
+            .map_err(|error| render_error(&error))?;
+
+        let siblings: Vec<PathBuf> = proposal
+            .siblings
+            .iter()
+            .map(|sibling| sibling.root.clone())
+            .collect();
+
+        let command = proposal.suggested_name.as_ref().map(|name| {
+            let paths = siblings
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("magent workspace group --name {name} {paths}")
+        });
+
+        let mut report = SetupReport {
+            summary: summarise(&proposal),
+            root: proposal.root.clone(),
+            organisation: proposal.organisation.clone(),
+            suggested_name: proposal.suggested_name.clone(),
+            alternative_name: alternative_name(&proposal),
+            siblings: siblings.clone(),
+            already_grouped: proposal.already_grouped,
+            workspace_name: proposal.workspace_name.clone(),
+            grouped: None,
+            command: command.clone(),
+        };
+
+        if !input.apply {
+            return render(&report);
+        }
+
+        let Some(suggested) = proposal.suggested_name.clone() else {
+            return Err(fail("nothing_to_set_up", "there is nothing here to group"));
+        };
+
+        // Regrouping a person's repositories is theirs to decide. Without a way
+        // to ask them, the honest answer is to say what to run — an agent
+        // deciding this on their behalf is exactly the failure this tool would
+        // otherwise introduce.
+        if peer.supported_elicitation_modes().is_empty() {
+            return Err(fail(
+                "cannot_ask",
+                &format!(
+                    "this client cannot show a confirmation, and grouping {} repositories is not mine to decide. Ask the person to run: {}",
+                    siblings.len(),
+                    command.unwrap_or_default()
+                ),
+            ));
+        }
+
+        let asked = peer
+            .elicit::<GroupConfirmation>(format!(
+                "Group {} checkouts of {} into one workspace? What is learned in any of them will then reach all of them.",
+                siblings.len(),
+                proposal.organisation.as_deref().unwrap_or("this project"),
+            ))
+            .await;
+
+        let name = match asked {
+            Ok(Some(confirmation)) => confirmation.name,
+            Ok(None) => input.name.unwrap_or(suggested),
+            Err(rmcp::service::ElicitationError::UserDeclined) => {
+                return Err(fail("declined", "the person declined; nothing was changed"));
+            }
+            Err(rmcp::service::ElicitationError::UserCancelled) => {
+                return Err(fail(
+                    "cancelled",
+                    "the request was dismissed; nothing was changed",
+                ));
+            }
+            Err(error) => return Err(fail("could_not_ask", &error.to_string())),
+        };
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(fail("empty_name", "a workspace needs a name"));
+        }
+
+        let grouped = self
+            .store
+            .group_into_workspace(name, &siblings)
+            .map_err(|error| render_error(&error))?;
+
+        report.grouped = Some(grouped.repositories);
+        report.workspace_name = Some(name.to_owned());
+        report.already_grouped = true;
+        report.summary = format!(
+            "{} repositories now share the workspace {name}.",
+            grouped.repositories
+        );
+        render(&report)
+    }
+
+    #[tool(
         description = "List the reference repositories checked out for this workspace and where their sources are on disk. Read those files directly; they are real paths. Read-only."
     )]
     async fn magent_deps(&self) -> Result<String, String> {
@@ -502,7 +683,16 @@ impl ServerHandler for MagentMcp {
         info.protocol_version = ProtocolVersion::LATEST;
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = identity;
-        info.instructions = Some(INSTRUCTIONS.to_owned());
+        // Built per connection rather than fixed, so the server can say what
+        // it found here. Truncated by the client at 2 KB, so the note is
+        // appended only when it earns the bytes.
+        let mut instructions = INSTRUCTIONS.to_owned();
+        if let Ok(proposal) = self.store.propose_grouping(&self.workspace_roots[0])
+            && let Some(note) = setup_note(&proposal)
+        {
+            instructions.push_str(&note);
+        }
+        info.instructions = Some(instructions);
         info
     }
 }
@@ -523,6 +713,39 @@ fn render<T: Serialize>(value: &T) -> Result<String, String> {
 /// The model needs to tell "you sent something invalid" from "this run is
 /// already finished" in order to react differently, so the code travels with
 /// the message rather than being flattened into prose.
+/// A tool failure in the same shape store failures take, so a caller parses
+/// one thing.
+fn fail(code: &str, message: &str) -> String {
+    serde_json::json!({ "code": code, "message": message }).to_string()
+}
+
+/// The sentence a person should hear.
+fn summarise(proposal: &GroupingProposal) -> String {
+    if proposal.already_grouped {
+        return proposal.workspace_name.as_ref().map_or_else(
+            || "This workspace is already grouped.".to_owned(),
+            |name| format!("Already grouped as {name}; nothing to set up."),
+        );
+    }
+
+    match (&proposal.suggested_name, &proposal.organisation) {
+        (Some(name), Some(organisation)) => format!(
+            "{} checkouts here share {organisation} but are not grouped, so what is learned in one does not reach the others. Grouping them as {name} would fix that.",
+            proposal.siblings.len(),
+        ),
+        _ => "Nothing here needs setting up: this is a single repository, and it is registered already.".to_owned(),
+    }
+}
+
+/// The name not suggested, when the directory and the organisation disagree.
+fn alternative_name(proposal: &GroupingProposal) -> Option<String> {
+    let suggested = proposal.suggested_name.as_ref()?;
+    let organisation = proposal.organisation.as_ref()?;
+    let from_origin = organisation.rsplit('/').next()?;
+
+    (from_origin != suggested).then(|| from_origin.to_owned())
+}
+
 fn render_error(error: &StoreError) -> String {
     serde_json::json!({
         "code": error.code(),

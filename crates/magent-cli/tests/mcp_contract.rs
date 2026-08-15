@@ -10,8 +10,11 @@
 use std::{path::Path, time::Duration};
 
 use rmcp::{
-    ServiceExt,
-    model::CallToolRequestParams,
+    ClientHandler, ServiceExt,
+    model::{
+        CallToolRequestParams, ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult,
+        ElicitationAction, ElicitationCapability,
+    },
     transport::{ConfigureCommandExt, TokioChildProcess},
 };
 use serde_json::{Map, Value, json};
@@ -26,13 +29,14 @@ const INSTRUCTIONS_LIMIT: usize = 2048;
 /// Slice 1 exposes exactly these. The old "only four tools" constraint was
 /// about context cost, and tool search removed it — only names and server
 /// instructions load at session start — but the set still grows deliberately.
-const EXPECTED_TOOLS: [&str; 8] = [
+const EXPECTED_TOOLS: [&str; 9] = [
     "magent_checkpoint",
     "magent_deps",
     "magent_finish",
     "magent_recall",
     "magent_remember",
     "magent_search",
+    "magent_setup",
     "magent_start",
     "magent_status",
 ];
@@ -95,11 +99,22 @@ fn init_repo(root: &Path) {
     }
 }
 
-type Client = rmcp::service::RunningService<rmcp::service::RoleClient, ()>;
+type Client = Connected<()>;
+
+/// A live session with a server. Generic over the client handler, because a
+/// test that answers an elicitation needs one that is not `()`.
+type Connected<H> = rmcp::service::RunningService<rmcp::service::RoleClient, H>;
 
 async fn connect(fixture: &Fixture) -> Client {
-    let state_dir = fixture.state_dir.clone();
     let repo = fixture.repo.clone();
+    connect_in(fixture, &repo).await
+}
+
+/// The server resolves its workspace from where it was launched, so the
+/// directory is what most of these tests are really varying.
+async fn connect_in(fixture: &Fixture, repo: &Path) -> Client {
+    let state_dir = fixture.state_dir.clone();
+    let repo = repo.to_path_buf();
 
     let transport = TokioChildProcess::new(Command::new(MAGENT).configure(|command| {
         command
@@ -117,7 +132,11 @@ async fn connect(fixture: &Fixture) -> Client {
 }
 
 /// Calls a tool and parses its JSON payload, failing loudly on a tool error.
-async fn call(client: &Client, tool: &'static str, arguments: Value) -> Value {
+async fn call<H: ClientHandler>(
+    client: &Connected<H>,
+    tool: &'static str,
+    arguments: Value,
+) -> Value {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         client.call_tool(request(tool, &arguments)),
@@ -136,7 +155,11 @@ async fn call(client: &Client, tool: &'static str, arguments: Value) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|error| panic!("{tool} returned non-JSON: {error}"))
 }
 
-async fn call_expecting_error(client: &Client, tool: &'static str, arguments: Value) -> String {
+async fn call_expecting_error<H: ClientHandler>(
+    client: &Connected<H>,
+    tool: &'static str,
+    arguments: Value,
+) -> String {
     let result = client
         .call_tool(request(tool, &arguments))
         .await
@@ -840,4 +863,314 @@ async fn deps_is_read_only_and_empty_is_normal() {
     assert_eq!(required, 0, "a read takes no arguments");
 
     client.cancel().await.expect("shutdown");
+}
+
+// --- setup ------------------------------------------------------------------
+
+/// Builds a directory of checkouts sharing one organisation.
+///
+/// `organisation` is `host/org`; the scp form puts the org after the colon, and
+/// getting that wrong silently gives every checkout a different organisation.
+fn checkouts(parent: &Path, organisation: &str, names: &[&str]) {
+    let (host, org) = organisation.split_once('/').expect("host/org");
+
+    for name in names {
+        let root = parent.join(name);
+        init_repo(&root);
+        let output = std::process::Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("git@{host}:{org}/{name}.git"),
+            ])
+            .current_dir(&root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(output.status.success());
+    }
+}
+
+/// The self-describing part. A server that knows it has not been set up should
+/// say so where the model will read it, rather than waiting to be asked.
+#[tokio::test]
+async fn the_instructions_say_when_setup_is_worth_running() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments"],
+    );
+
+    let client = connect_in(&fixture, &bank.join("clients")).await;
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("instructions");
+
+    assert!(
+        instructions.contains("magent_setup"),
+        "an ungrouped workspace should be mentioned: {instructions}"
+    );
+    assert!(
+        instructions.len() <= 2048,
+        "instructions grew past the truncation limit: {}",
+        instructions.len()
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// And should stop saying it once it is done, because an instruction that is
+/// always there is one the model learns to skip.
+#[tokio::test]
+async fn a_settled_workspace_is_not_nagged() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments"],
+    );
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    store
+        .group_into_workspace("fintech", &[bank.join("clients"), bank.join("payments")])
+        .expect("group");
+    drop(store);
+
+    let client = connect_in(&fixture, &bank.join("clients")).await;
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("instructions");
+
+    assert!(
+        !instructions.contains("magent_setup"),
+        "nothing left to set up, so nothing should be said: {instructions}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn setup_finds_the_checkouts_that_belong_together() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments", "ledger"],
+    );
+    checkouts(&bank, "github.com/someone", &["blog"]);
+
+    let client = connect_in(&fixture, &bank.join("clients")).await;
+    let proposal = call(&client, "magent_setup", json!({})).await;
+
+    assert_eq!(proposal["suggested_name"].as_str(), Some("bank"));
+    let found: Vec<_> = proposal["siblings"]
+        .as_array()
+        .expect("siblings")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(found.len(), 3, "{found:?}");
+    assert!(
+        !found.iter().any(|root| root.ends_with("blog")),
+        "unrelated work was swept in: {found:?}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Looking must not decide. An agent that ran setup to see what it said, and
+/// thereby regrouped a person's repositories, would be worse than one that
+/// never looked.
+#[tokio::test]
+async fn setup_without_applying_changes_nothing() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments"],
+    );
+
+    let client = connect_in(&fixture, &bank.join("clients")).await;
+    call(&client, "magent_setup", json!({})).await;
+    client.cancel().await.expect("shutdown");
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    assert!(
+        store.workspaces().expect("workspaces").is_empty(),
+        "a read created a group"
+    );
+}
+
+/// Claude Code does not offer elicitation to MCP servers today. Applying a
+/// change that regroups fifty repositories with nobody asked is not an
+/// acceptable fallback, so it refuses and says what to run instead.
+#[tokio::test]
+async fn applying_without_a_way_to_ask_refuses_and_says_what_to_run() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments"],
+    );
+
+    let client = connect_in(&fixture, &bank.join("clients")).await;
+    let refusal = call_expecting_error(&client, "magent_setup", json!({ "apply": true })).await;
+
+    assert!(
+        refusal.contains("magent workspace group"),
+        "the way forward has to be in the refusal: {refusal}"
+    );
+    client.cancel().await.expect("shutdown");
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    assert!(
+        store.workspaces().expect("workspaces").is_empty(),
+        "it refused and grouped anyway"
+    );
+}
+
+#[tokio::test]
+async fn setup_says_when_there_is_nothing_to_do() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let proposal = call(&client, "magent_setup", json!({})).await;
+
+    assert_eq!(proposal["suggested_name"], Value::Null);
+    assert!(
+        proposal["summary"]
+            .as_str()
+            .is_some_and(|summary| !summary.is_empty()),
+        "an empty proposal still has to explain itself: {proposal}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// A client that answers a server's confirmation, the way a harness with a UI
+/// would.
+///
+/// Without one of these the accept path is unreachable from a test, and the
+/// whole point of asking is what happens when the answer is yes.
+#[derive(Clone)]
+struct Answering {
+    action: ElicitationAction,
+    name: Option<&'static str>,
+}
+
+impl ClientHandler for Answering {
+    fn get_info(&self) -> ClientInfo {
+        // Both types are #[non_exhaustive], so they are adjusted rather than
+        // constructed literally.
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.elicitation = Some(ElicitationCapability::default());
+
+        let mut info = ClientInfo::default();
+        info.capabilities = capabilities;
+        info
+    }
+
+    async fn create_elicitation(
+        &self,
+        _request: ElicitRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleClient>,
+    ) -> Result<ElicitResult, rmcp::ErrorData> {
+        let mut result = ElicitResult::new(self.action.clone());
+        if let Some(name) = self.name {
+            result = result.with_content(json!({ "name": name }));
+        }
+        Ok(result)
+    }
+}
+
+async fn connect_answering(
+    fixture: &Fixture,
+    repo: &Path,
+    handler: Answering,
+) -> Connected<Answering> {
+    let state_dir = fixture.state_dir.clone();
+    let repo = repo.to_path_buf();
+
+    let transport = TokioChildProcess::new(Command::new(MAGENT).configure(|command| {
+        command
+            .arg("mcp")
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .current_dir(&repo);
+    }))
+    .expect("spawn magent mcp");
+
+    tokio::time::timeout(Duration::from_secs(10), handler.serve(transport))
+        .await
+        .expect("initialize did not time out")
+        .expect("initialize")
+}
+
+/// The point of asking: when the answer is yes, the group is made — and under
+/// the name the person typed, not the one that was guessed.
+#[tokio::test]
+async fn a_confirmed_setup_groups_the_repositories() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments", "ledger"],
+    );
+
+    let client = connect_answering(
+        &fixture,
+        &bank.join("clients"),
+        Answering {
+            action: ElicitationAction::Accept,
+            name: Some("wbbank"),
+        },
+    )
+    .await;
+
+    let applied = call(&client, "magent_setup", json!({ "apply": true })).await;
+    assert_eq!(applied["grouped"].as_u64(), Some(3), "{applied}");
+    assert_eq!(applied["workspace_name"].as_str(), Some("wbbank"));
+    drop(client);
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    let workspaces = store.workspaces().expect("workspaces");
+    assert_eq!(workspaces, vec![("wbbank".to_owned(), 3)]);
+}
+
+/// Declining must leave the world exactly as it was. A confirmation that
+/// changes things when refused is worse than no confirmation, because it
+/// teaches people not to read it.
+#[tokio::test]
+async fn a_declined_setup_changes_nothing() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments"],
+    );
+
+    let client = connect_answering(
+        &fixture,
+        &bank.join("clients"),
+        Answering {
+            action: ElicitationAction::Decline,
+            name: None,
+        },
+    )
+    .await;
+
+    let refusal = call_expecting_error(&client, "magent_setup", json!({ "apply": true })).await;
+    assert!(refusal.contains("declined"), "{refusal}");
+    drop(client);
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    assert!(store.workspaces().expect("workspaces").is_empty());
 }

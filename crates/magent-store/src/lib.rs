@@ -13,6 +13,7 @@ mod git;
 mod grouping;
 mod migrations;
 mod sessions;
+mod setup;
 mod store;
 mod toolchain;
 
@@ -26,5 +27,6 @@ pub use git::{
 pub use grouping::WorkspaceGrouping;
 pub use migrations::CURRENT_VERSION;
 pub use sessions::SessionBinding;
+pub use setup::{GroupingProposal, Sibling};
 pub use store::{Job, JobState, Store, WorkspaceResolution};
 pub use toolchain::detect_toolchain;

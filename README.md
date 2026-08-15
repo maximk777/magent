@@ -64,6 +64,25 @@ personal memory, and it is not the daemon this design deliberately does
 without: it opens the same file every hook opens, holds nothing, and can be
 closed at any moment.
 
+Setting up, by being asked rather than by being configured.
+
+Magent registers a repository the first time a session opens in it, so nothing
+has to be configured before it works. One thing it will not do silently is
+group: fifty checkouts of one organisation side by side are one project, and
+what is learned in any of them is true of all of them — but a parent directory
+is also where unrelated work lives, so that cannot be inferred safely.
+
+Instead the server says what it noticed. Its instructions are built per
+connection, and when this workspace looks worth grouping they say so, in the
+one place the model reads before doing anything. `magent_setup` then reports
+what it found; with `apply` it asks the person to confirm through MCP
+elicitation and only then groups.
+
+Where the client cannot show a confirmation — Claude Code does not offer
+elicitation to servers today — it refuses and prints the terminal command
+instead. Regrouping fifty repositories with nobody asked is not an acceptable
+fallback.
+
 Reference sources.
 
 ```bash
