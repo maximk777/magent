@@ -39,6 +39,7 @@ impl Fixture {
         let app = router(Console {
             store: Arc::clone(&store),
             database,
+            deps_root: dir.path().join("deps"),
         });
 
         Self { dir, store, app }
@@ -115,7 +116,7 @@ impl Fixture {
 async fn every_page_answers() {
     let fixture = Fixture::new();
 
-    for path in ["/", "/facts", "/runs", "/workspaces"] {
+    for path in ["/", "/facts", "/runs", "/workspaces", "/deps"] {
         let (status, body) = fixture.get(path).await;
         assert_eq!(status, StatusCode::OK, "{path} returned {status}");
         assert!(body.contains("magent"), "{path} rendered no page");
@@ -424,4 +425,149 @@ async fn promoting_into_an_unknown_workspace_is_refused() {
         .post("/workspaces/promote", "namespace=service&workspace=nope")
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// --- reference checkouts ----------------------------------------------------
+
+/// The console is where a dependency is added, because naming a git URL is a
+/// decision a person makes. What it must show afterwards is the path, since
+/// that is what the agent will be told to read.
+#[tokio::test]
+async fn a_dependency_can_be_declared_and_shows_its_path() {
+    let fixture = Fixture::new();
+    let upstream = seed_upstream(fixture.dir.path(), "package retry\n");
+    let workspace_id = fixture
+        .store
+        .resolve_workspace_for(fixture.dir.path())
+        .expect("resolve")
+        .workspace_id;
+
+    let status = fixture
+        .post(
+            "/deps",
+            &format!(
+                "workspace_id={workspace_id}&url={}",
+                urlencode(&format!("file://{}", upstream.display()))
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "a POST redirects back");
+
+    let (status, body) = fixture.get("/deps").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("present"), "{body}");
+    assert!(
+        body.contains("/deps/") || body.contains("deps"),
+        "the path has to be on the page"
+    );
+}
+
+/// Removing sources is destructive in the only way this console is, so it must
+/// be the sources and nothing else.
+#[tokio::test]
+async fn removing_a_dependency_leaves_the_rest_alone() {
+    let fixture = Fixture::new();
+    let first = seed_upstream(fixture.dir.path(), "one\n");
+    let second = seed_upstream_named(fixture.dir.path(), "other", "two\n");
+    let workspace_id = fixture
+        .store
+        .resolve_workspace_for(fixture.dir.path())
+        .expect("resolve")
+        .workspace_id;
+
+    for upstream in [&first, &second] {
+        fixture
+            .post(
+                "/deps",
+                &format!(
+                    "workspace_id={workspace_id}&url={}",
+                    urlencode(&format!("file://{}", upstream.display()))
+                ),
+            )
+            .await;
+    }
+
+    let declared = fixture.store.dependencies(workspace_id).expect("list");
+    assert_eq!(declared.len(), 2);
+
+    let status = fixture
+        .post(&format!("/deps/{}/remove", declared[0].id), "")
+        .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+
+    let left = fixture.store.dependencies(workspace_id).expect("list");
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, declared[1].id);
+}
+
+/// A checkout that could not be fetched must read as broken rather than as
+/// sources that happen to be empty.
+#[tokio::test]
+async fn a_failed_checkout_says_why_on_the_page() {
+    let fixture = Fixture::new();
+    let workspace_id = fixture
+        .store
+        .resolve_workspace_for(fixture.dir.path())
+        .expect("resolve")
+        .workspace_id;
+
+    fixture
+        .post(
+            "/deps",
+            &format!(
+                "workspace_id={workspace_id}&url={}",
+                urlencode(&format!("file://{}/nowhere", fixture.dir.path().display()))
+            ),
+        )
+        .await;
+
+    let (_, body) = fixture.get("/deps").await;
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        body.to_lowercase().contains("repository")
+            || body.to_lowercase().contains("not")
+            || body.contains("does not exist"),
+        "the reason has to be visible: {body}"
+    );
+}
+
+fn seed_upstream(root: &std::path::Path, contents: &str) -> std::path::PathBuf {
+    seed_upstream_named(root, "retry", contents)
+}
+
+fn seed_upstream_named(root: &std::path::Path, name: &str, contents: &str) -> std::path::PathBuf {
+    let path = root.join("upstream").join(name);
+    std::fs::create_dir_all(&path).expect("mkdir");
+
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&path)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}");
+    };
+
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.email", "t@example.invalid"]);
+    git(&["config", "user.name", "T"]);
+    std::fs::write(path.join("retry.go"), contents).expect("write");
+    git(&["add", "."]);
+    git(&["commit", "-m", "seed"]);
+    path
+}
+
+/// Enough of one for a file:// URL in a form body.
+fn urlencode(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | '/' | ':' => {
+                character.to_string()
+            }
+            other => format!("%{:02X}", other as u32),
+        })
+        .collect()
 }

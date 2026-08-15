@@ -24,3 +24,13 @@ pub fn state_dir() -> PathBuf {
 pub fn database_path(state_dir: &Path) -> PathBuf {
     state_dir.join("magent.db")
 }
+
+/// Where reference checkouts are materialised.
+///
+/// Derived rather than canonical: everything under here can be deleted and
+/// rebuilt from the `dependencies` table, which is why it sits beside the
+/// database instead of inside it.
+#[must_use]
+pub fn deps_root(state_dir: &Path) -> PathBuf {
+    state_dir.join("deps")
+}

@@ -1,0 +1,95 @@
+{% extends "layout.html" %}
+{% block title %}Reference sources — Magent{% endblock %}
+{% block content %}
+<h1>Reference sources</h1>
+<p class="lede">
+  Repositories this workspace reads but does not work in. Once they are on disk
+  the agent reads them with its own tools, so what matters here is the path.
+</p>
+
+<div class="callout">
+  <div class="callout-label">Everything lives under</div>
+  <code class="mono block">{{ root }}</code>
+  <div class="muted">One search here covers every dependency at once.</div>
+</div>
+
+{% if workspaces.is_empty() %}
+  <div class="empty">
+    No workspace yet. One is created the first time a session opens in a
+    repository.
+  </div>
+{% else %}
+<form method="post" action="/deps" class="row-form">
+  <label>
+    <span>Git URL</span>
+    <input type="text" name="url" required placeholder="git@github.com:acme/thing.git">
+  </label>
+  <label>
+    <span>Ref</span>
+    <input type="text" name="git_ref" placeholder="default branch">
+  </label>
+  <label>
+    <span>For</span>
+    <select name="workspace_id">
+      {% for workspace in workspaces %}
+        <option value="{{ workspace.0 }}">{{ workspace.1 }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button type="submit">Add and fetch</button>
+</form>
+{% endif %}
+
+{% if rows.is_empty() %}
+  <div class="empty">
+    Nothing declared. Add a library whose sources answer questions faster than
+    its documentation.
+  </div>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th>Project</th>
+      <th>Ref</th>
+      <th>State</th>
+      <th>Fetched</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <td>
+        <div class="mono">{{ row.slug }}</div>
+        <div class="muted small">{{ row.url }}</div>
+        <div class="mono small path">{{ row.path }}</div>
+        {% if row.last_error.is_some() %}
+          <div class="small bad">{{ row.last_error.as_ref().unwrap() }}</div>
+        {% endif %}
+      </td>
+      <td class="muted">
+        {{ row.reference }}
+        {% if !row.revision.is_empty() %}
+          <div class="mono small">{{ row.revision }}</div>
+        {% endif %}
+      </td>
+      <td><span class="pill {{ row.tone }}">{{ row.status }}</span></td>
+      <td class="muted">{{ row.synced }}</td>
+      <td class="tight">
+        <form method="post" action="/deps/{{ row.id }}/sync" class="inline">
+          <button type="submit" class="small">Fetch again</button>
+        </form>
+        <form method="post" action="/deps/{{ row.id }}/remove" class="inline">
+          <button type="submit" class="small danger">Remove</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="muted small">
+  Removing deletes the checkout as well. Nothing else is affected: reference
+  sources hold no memory of their own.
+</p>
+{% endif %}
+{% endblock %}

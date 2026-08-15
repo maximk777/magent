@@ -42,6 +42,9 @@ pub fn router(console: Console) -> Router {
         .route("/runs/{id}/close", post(close_run))
         .route("/workspaces", get(workspaces))
         .route("/workspaces/promote", post(promote))
+        .route("/deps", get(deps).post(declare_dependency))
+        .route("/deps/{id}/sync", post(sync_dependency))
+        .route("/deps/{id}/remove", post(remove_dependency))
         // Served from the binary rather than from disk: the console has to work
         // from any directory, and an install that lost its assets would be a
         // blank page with no explanation.
@@ -111,6 +114,65 @@ struct WorkspacesPage {
     section: &'static str,
     groups: Vec<(String, usize)>,
     namespaces: Vec<(String, usize)>,
+}
+
+/// One checkout, with everything already turned into the words the page shows.
+struct DependencyRow {
+    id: String,
+    slug: String,
+    url: String,
+    path: String,
+    status: &'static str,
+    /// Drives the colour: a stale checkout reading as current is the failure
+    /// mode worth designing against.
+    tone: &'static str,
+    reference: String,
+    revision: String,
+    synced: String,
+    last_error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "deps.html")]
+struct DepsPage {
+    section: &'static str,
+    root: String,
+    rows: Vec<DependencyRow>,
+    workspaces: Vec<(String, String)>,
+}
+
+fn dependency_row(console: &Console, dependency: &magent_store::Dependency) -> DependencyRow {
+    use magent_store::DependencyStatus;
+
+    let (status, tone) = match dependency.status {
+        DependencyStatus::Present => ("present", "good"),
+        DependencyStatus::Failed => ("failed", "bad"),
+        DependencyStatus::Declared => ("not fetched yet", "warn"),
+    };
+
+    DependencyRow {
+        id: dependency.id.to_string(),
+        slug: dependency.slug.clone(),
+        url: dependency.url.clone(),
+        path: magent_store::dependency_checkout(&console.deps_root, dependency)
+            .display()
+            .to_string(),
+        status,
+        tone,
+        reference: dependency
+            .git_ref
+            .clone()
+            .unwrap_or_else(|| "default branch".into()),
+        revision: dependency
+            .revision
+            .as_ref()
+            .map(|value| value.chars().take(7).collect())
+            .unwrap_or_default(),
+        synced: dependency
+            .synced_at
+            .map_or_else(|| "never".into(), view::when),
+        last_error: dependency.last_error.clone(),
+    }
 }
 
 // --- reads -----------------------------------------------------------------
@@ -506,4 +568,81 @@ impl IntoResponse for Failure {
 
         (status, message).into_response()
     }
+}
+
+// --- reference checkouts ----------------------------------------------------
+
+async fn deps(State(console): State<Console>) -> Result<Html<String>, Failure> {
+    let mut rows = Vec::new();
+    let mut workspaces = Vec::new();
+
+    for (name, id) in console.store.workspace_names()? {
+        workspaces.push((id.to_string(), name));
+        for dependency in console.store.dependencies(id)? {
+            rows.push(dependency_row(&console, &dependency));
+        }
+    }
+
+    render(&DepsPage {
+        section: "deps",
+        root: console.deps_root.display().to_string(),
+        rows,
+        workspaces,
+    })
+}
+
+#[derive(Deserialize)]
+struct DeclareForm {
+    workspace_id: String,
+    url: String,
+    #[serde(default)]
+    git_ref: String,
+}
+
+/// Declares and fetches in one gesture.
+///
+/// A declaration that has not been fetched is not yet useful, and leaving the
+/// fetch to a second click would put a row on the page that looks tracked and
+/// answers nothing. A failure still leaves the declaration, because the URL is
+/// usually right and the network usually comes back.
+async fn declare_dependency(
+    State(console): State<Console>,
+    Form(form): Form<DeclareForm>,
+) -> Result<Redirect, Failure> {
+    let workspace_id = form
+        .workspace_id
+        .parse()
+        .map_err(|_| Failure::BadRequest("not a workspace".into()))?;
+    let git_ref = form.git_ref.trim();
+
+    let declared = console.store.declare_dependency(
+        workspace_id,
+        &magent_store::DependencySpec {
+            url: form.url.trim().to_owned(),
+            git_ref: (!git_ref.is_empty()).then(|| git_ref.to_owned()),
+        },
+    )?;
+
+    console
+        .store
+        .sync_dependency(declared.id, &console.deps_root)?;
+    Ok(Redirect::to("/deps"))
+}
+
+async fn sync_dependency(
+    State(console): State<Console>,
+    Path(id): Path<String>,
+) -> Result<Redirect, Failure> {
+    let id = id.parse().map_err(|_| Failure::NotFound)?;
+    console.store.sync_dependency(id, &console.deps_root)?;
+    Ok(Redirect::to("/deps"))
+}
+
+async fn remove_dependency(
+    State(console): State<Console>,
+    Path(id): Path<String>,
+) -> Result<Redirect, Failure> {
+    let id = id.parse().map_err(|_| Failure::NotFound)?;
+    console.store.forget_dependency(id, &console.deps_root)?;
+    Ok(Redirect::to("/deps"))
 }

@@ -44,6 +44,36 @@ enum WorkspaceAction {
 }
 
 #[derive(Subcommand)]
+enum DepsAction {
+    /// Declare a repository to read, and check it out.
+    Add {
+        /// Any git URL, or a path. The SSH and HTTPS forms of one project are
+        /// the same dependency.
+        url: String,
+
+        /// A branch, tag or commit. Defaults to the remote's default branch.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+
+    /// Show what is declared, where it is, and whether it is on disk.
+    List,
+
+    /// Bring every checkout up to date.
+    Sync,
+
+    /// Drop a declaration and delete its sources.
+    Remove {
+        /// The URL as given, or the project part of it.
+        url: String,
+
+        /// The ref, when the same project is declared at more than one.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Handle a harness lifecycle event. Reads the event JSON on stdin.
     Hook {
@@ -110,6 +140,16 @@ enum Command {
         state_dir: Option<std::path::PathBuf>,
     },
 
+    /// Track repositories this workspace reads but does not work in.
+    Deps {
+        #[command(subcommand)]
+        action: DepsAction,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Serve the Magent MCP tools over stdio.
     Mcp {
         /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
@@ -137,6 +177,7 @@ fn main() {
             codex_rollouts,
             state_dir,
         } => run_import(memory_dir, codex_rollouts, state_dir),
+        Command::Deps { action, state_dir } => run_deps(action, state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
     }
 }
@@ -176,6 +217,7 @@ fn run_web(port: u16, state_dir: Option<std::path::PathBuf>) {
     let console = Console {
         store: Arc::new(store),
         database,
+        deps_root: paths::deps_root(&state_dir),
     };
 
     if let Err(error) = runtime.block_on(magent_web::serve(console, port)) {
@@ -392,7 +434,12 @@ fn run_mcp(state_dir: Option<std::path::PathBuf>) {
 
     let result = runtime.block_on(async move {
         let store = Arc::new(Store::open(&paths::database_path(&state_dir))?);
-        let server = magent_mcp::MagentMcp::new(store, HarnessKind::ClaudeCode, workspace_root);
+        let server = magent_mcp::MagentMcp::new(
+            store,
+            HarnessKind::ClaudeCode,
+            workspace_root,
+            paths::deps_root(&state_dir),
+        );
         let service = server.serve(stdio()).await?;
         service.waiting().await?;
         Ok::<(), anyhow::Error>(())
@@ -440,6 +487,241 @@ fn run_hook(event: &str) {
 }
 
 /// Stderr only. Anything on stdout reaches the model.
+/// Manages reference checkouts.
+///
+/// Every path this prints is meant to be pasted into a grep: the sources are
+/// the deliverable, and a command that told you a dependency was "present"
+/// without saying where would have done half the job.
+fn run_deps(action: DepsAction, state_dir: Option<std::path::PathBuf>) {
+    use magent_store::Store;
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let deps_root = paths::deps_root(&state_dir);
+    let store = match Store::open(&paths::database_path(&state_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            report(&format!("could not open the store: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    // Dependencies belong to the workspace the terminal is standing in, the
+    // same way a run does. Declaring one from inside a project is the whole
+    // gesture.
+    let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let workspace_id = match store.resolve_workspace_for(&here) {
+        Ok(resolved) => resolved.workspace_id,
+        Err(error) => {
+            report(&format!("could not resolve this workspace: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    match action {
+        DepsAction::Add { url, git_ref } => {
+            deps_add(&store, workspace_id, &deps_root, &url, git_ref);
+        }
+        DepsAction::List => deps_list(&store, workspace_id, &deps_root),
+        DepsAction::Sync => deps_sync(&store, workspace_id, &deps_root),
+        DepsAction::Remove { url, git_ref } => {
+            deps_remove(&store, workspace_id, &deps_root, &url, git_ref.as_deref());
+        }
+    }
+}
+
+fn deps_add(
+    store: &magent_store::Store,
+    workspace_id: magent_core::WorkspaceId,
+    deps_root: &std::path::Path,
+    url: &str,
+    git_ref: Option<String>,
+) {
+    use magent_store::{DependencySpec, DependencyStatus, dependency_checkout};
+
+    let declared = match store.declare_dependency(
+        workspace_id,
+        &DependencySpec {
+            url: url.to_owned(),
+            git_ref,
+        },
+    ) {
+        Ok(declared) => declared,
+        Err(error) => {
+            report(&format!("could not declare {url}: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    match store.sync_dependency(declared.id, deps_root) {
+        Ok(synced) if synced.status == DependencyStatus::Present => {
+            println!("{}", synced.slug);
+            println!(
+                "  path: {}",
+                dependency_checkout(deps_root, &synced).display()
+            );
+            if let Some(revision) = &synced.revision {
+                println!("  at:   {}", short(revision));
+            }
+        }
+        Ok(failed) => {
+            // The declaration stays. The URL is usually right and the network
+            // usually comes back, and re-typing it would be the wrong lesson.
+            report(&format!(
+                "declared {}, but could not fetch it: {}",
+                failed.slug,
+                failed.last_error.as_deref().unwrap_or("unknown reason")
+            ));
+            report("run `magent deps sync` to try again");
+            std::process::exit(1);
+        }
+        Err(error) => {
+            report(&format!("could not fetch: {error}"));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn deps_list(
+    store: &magent_store::Store,
+    workspace_id: magent_core::WorkspaceId,
+    deps_root: &std::path::Path,
+) {
+    use magent_store::{DependencyStatus, dependency_checkout};
+
+    let all = match store.dependencies(workspace_id) {
+        Ok(all) => all,
+        Err(error) => {
+            report(&format!("could not list: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    if all.is_empty() {
+        println!("no dependencies declared here");
+        println!("add one with: magent deps add <git-url>");
+        return;
+    }
+
+    for dependency in &all {
+        let status = match dependency.status {
+            DependencyStatus::Present => "present",
+            DependencyStatus::Failed => "failed",
+            DependencyStatus::Declared => "declared",
+        };
+        println!("{}\t{status}", dependency.slug);
+        println!(
+            "  path: {}",
+            dependency_checkout(deps_root, dependency).display()
+        );
+        if let Some(revision) = &dependency.revision {
+            println!("  at:   {}", short(revision));
+        }
+        if let Some(error) = &dependency.last_error {
+            println!("  why:  {error}");
+        }
+    }
+}
+
+fn deps_sync(
+    store: &magent_store::Store,
+    workspace_id: magent_core::WorkspaceId,
+    deps_root: &std::path::Path,
+) {
+    use magent_store::DependencyStatus;
+
+    let all = match store.dependencies(workspace_id) {
+        Ok(all) => all,
+        Err(error) => {
+            report(&format!("could not list: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    if all.is_empty() {
+        println!("no dependencies declared here");
+        return;
+    }
+
+    // One unreachable remote must not strand the rest: the common cause of a
+    // failure here is a VPN that is not up, and the other nineteen checkouts
+    // are still worth refreshing.
+    let mut failures = 0;
+    for dependency in &all {
+        match store.sync_dependency(dependency.id, deps_root) {
+            Ok(synced) if synced.status == DependencyStatus::Present => println!(
+                "{}\t{}",
+                synced.slug,
+                synced.revision.as_deref().map_or_else(String::new, short)
+            ),
+            Ok(failed) => {
+                failures += 1;
+                report(&format!(
+                    "{}: {}",
+                    failed.slug,
+                    failed.last_error.as_deref().unwrap_or("unknown reason")
+                ));
+            }
+            Err(error) => {
+                failures += 1;
+                report(&format!("{}: {error}", dependency.slug));
+            }
+        }
+    }
+
+    if failures > 0 {
+        report(&format!("{failures} of {} could not be fetched", all.len()));
+    }
+}
+
+fn deps_remove(
+    store: &magent_store::Store,
+    workspace_id: magent_core::WorkspaceId,
+    deps_root: &std::path::Path,
+    url: &str,
+    git_ref: Option<&str>,
+) {
+    let wanted = magent_store::normalize_origin(url);
+    let all = store.dependencies(workspace_id).unwrap_or_default();
+    let matches: Vec<_> = all
+        .iter()
+        .filter(|dependency| {
+            dependency.identity_key == wanted
+                && git_ref.is_none_or(|reference| dependency.git_ref.as_deref() == Some(reference))
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => {
+            report(&format!("nothing declared for {url}"));
+            std::process::exit(1);
+        }
+        // Deleting sources is not the moment to guess which one was meant.
+        [_, _, ..] if git_ref.is_none() => {
+            report(&format!(
+                "{url} is declared at several refs; name one with --ref:"
+            ));
+            for dependency in matches {
+                report(&format!("  {}", dependency.slug));
+            }
+            std::process::exit(1);
+        }
+        found => {
+            for dependency in found {
+                if let Err(error) = store.forget_dependency(dependency.id, deps_root) {
+                    report(&format!("could not remove {}: {error}", dependency.slug));
+                    std::process::exit(1);
+                }
+                println!("removed {}", dependency.slug);
+            }
+        }
+    }
+}
+
+/// Commits are cited by their first seven characters everywhere else.
+fn short(revision: &str) -> String {
+    revision.chars().take(7).collect()
+}
+
 fn report(message: &str) {
     let _ = writeln!(std::io::stderr(), "magent: {message}");
 }

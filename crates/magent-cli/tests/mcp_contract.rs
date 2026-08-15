@@ -26,8 +26,9 @@ const INSTRUCTIONS_LIMIT: usize = 2048;
 /// Slice 1 exposes exactly these. The old "only four tools" constraint was
 /// about context cost, and tool search removed it — only names and server
 /// instructions load at session start — but the set still grows deliberately.
-const EXPECTED_TOOLS: [&str; 7] = [
+const EXPECTED_TOOLS: [&str; 8] = [
     "magent_checkpoint",
+    "magent_deps",
     "magent_finish",
     "magent_recall",
     "magent_remember",
@@ -46,7 +47,7 @@ const MUTATING_TOOLS: [&str; 4] = [
 ];
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     state_dir: std::path::PathBuf,
     repo: std::path::PathBuf,
 }
@@ -59,7 +60,7 @@ impl Fixture {
         std::fs::create_dir_all(&state_dir).expect("mkdir");
         init_repo(&repo);
         Self {
-            _dir: dir,
+            dir,
             state_dir,
             repo,
         }
@@ -737,4 +738,106 @@ fn uuid() -> String {
             .as_nanos()
             % 0xffff_ffff_ffff
     )
+}
+
+// --- reference checkouts ----------------------------------------------------
+
+/// The tool exists to hand over paths. Everything else the agent can do better
+/// with grep and read, so the one thing this must never do is describe sources
+/// without saying where they are.
+#[tokio::test]
+async fn deps_reports_where_the_sources_are() {
+    let fixture = Fixture::new();
+
+    let upstream = fixture.dir.path().join("upstream");
+    std::fs::create_dir_all(&upstream).expect("mkdir");
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "t@example.invalid"],
+        vec!["config", "user.name", "T"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&upstream)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(output.status.success());
+    }
+    std::fs::write(upstream.join("retry.go"), "package retry\n").expect("write");
+    for args in [vec!["add", "."], vec!["commit", "-m", "seed"]] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&upstream)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .expect("git");
+    }
+
+    let added = std::process::Command::new(env!("CARGO_BIN_EXE_magent"))
+        .args(["deps", "add", &format!("file://{}", upstream.display())])
+        .current_dir(&fixture.repo)
+        .env("MAGENT_STATE_DIR", &fixture.state_dir)
+        .output()
+        .expect("magent deps add");
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    let client = connect(&fixture).await;
+    let reported = call(&client, "magent_deps", json!({})).await;
+
+    let first = &reported["dependencies"][0];
+    let checkout = first["path"]
+        .as_str()
+        .expect("a path, or the tool is pointless");
+    assert_eq!(first["status"].as_str(), Some("present"));
+    assert!(
+        first["revision"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "a reference source is only citable at a revision: {first}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(checkout).join("retry.go")).expect("readable"),
+        "package retry\n"
+    );
+    assert!(
+        reported["root"].as_str().is_some(),
+        "the root is what makes one grep cover every dependency: {reported}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Reading never mutates, so it takes no `operation_id` — and an empty answer is
+/// normal rather than an error.
+#[tokio::test]
+async fn deps_is_read_only_and_empty_is_normal() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let reported = call(&client, "magent_deps", json!({})).await;
+    assert_eq!(
+        reported["dependencies"].as_array().map(Vec::len),
+        Some(0),
+        "{reported}"
+    );
+
+    let tools = client.list_all_tools().await.expect("tools");
+    let deps = tools
+        .iter()
+        .find(|tool| tool.name == "magent_deps")
+        .expect("magent_deps");
+    let required = deps
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    assert_eq!(required, 0, "a read takes no arguments");
+
+    client.cancel().await.expect("shutdown");
 }

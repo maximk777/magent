@@ -87,6 +87,11 @@ uuid_newtype!(
     /// A single git repository, identified by canonical path and origin.
     RepositoryId
 );
+uuid_newtype!(
+    /// A reference checkout: a repository the workspace reads but does not
+    /// work in.
+    DependencyId
+);
 
 /// Where a run currently sits in its workflow.
 ///

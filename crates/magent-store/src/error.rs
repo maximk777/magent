@@ -1,4 +1,4 @@
-use magent_core::{DomainError, OperationId, RunId, SessionId};
+use magent_core::{DependencyId, DomainError, OperationId, RunId, SessionId};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error)]
@@ -33,6 +33,9 @@ pub enum StoreError {
     /// flight. Opening one here would produce a run with no task.
     #[error("no run is open in this workspace; call magent_start first")]
     NoOpenRun,
+
+    #[error("dependency {0} does not exist")]
+    DependencyNotFound(DependencyId),
 }
 
 impl StoreError {
@@ -49,6 +52,7 @@ impl StoreError {
             Self::IdempotencyConflict(_) => "idempotency_conflict",
             Self::UnsupportedSchema(_) => "unsupported_schema",
             Self::NoOpenRun => "no_open_run",
+            Self::DependencyNotFound(_) => "dependency_not_found",
         }
     }
 }

@@ -12,7 +12,7 @@ use magent_core::{
     CheckpointCommand, CheckpointOrigin, Fact, FinishAction, FinishRunCommand, HarnessKind,
     OperationId, RememberCommand, RunId, SessionId, StartRunCommand, WorkflowStage,
 };
-use magent_store::{FactContext, FactQuery, Store, StoreError};
+use magent_store::{Dependency, FactContext, FactQuery, Store, StoreError, dependency_checkout};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -51,6 +51,10 @@ project and the user; magent_recall opens one fact by name, which is how the \
 memory index at the top of a prompt is meant to be followed up. magent_remember \
 records something durable: what is true of this codebase, or how the user wants \
 to work, with the evidence for it. A fact marked verified must cite evidence.
+
+magent_deps lists repositories checked out for reference and gives their paths \
+on disk. Read and grep those files directly rather than guessing at a \
+library's behaviour.
 
 Every mutating call takes an operation_id. Generate a fresh UUID per call, and \
 reuse the same one when retrying, so a retry cannot duplicate state.
@@ -171,6 +175,30 @@ struct RecallResult {
     fact: Option<Fact>,
 }
 
+/// One reference checkout, as the agent needs to see it.
+///
+/// The path leads: everything else on this record is context for deciding
+/// whether to trust what is at that path.
+#[derive(Debug, Serialize)]
+struct DependencyReport {
+    path: PathBuf,
+    slug: String,
+    url: String,
+    status: magent_store::DependencyStatus,
+    git_ref: Option<String>,
+    revision: Option<String>,
+    /// Present only when the last attempt failed, so that stale sources are
+    /// never presented as current ones.
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DepsReport {
+    /// The directory holding every checkout. One grep here covers them all.
+    root: PathBuf,
+    dependencies: Vec<DependencyReport>,
+}
+
 #[derive(Debug, Serialize)]
 struct StatusReport {
     run: Option<magent_core::RunSnapshot>,
@@ -183,6 +211,9 @@ pub struct MagentMcp {
     store: Arc<Store>,
     harness: HarnessKind,
     workspace_roots: Vec<PathBuf>,
+    /// Where reference checkouts are materialised. Held rather than derived so
+    /// the server reports the same paths the CLI wrote.
+    deps_root: PathBuf,
     tool_router: ToolRouter<Self>,
 }
 
@@ -226,6 +257,18 @@ impl MagentMcp {
         }
     }
 
+    fn report(&self, dependency: &Dependency) -> DependencyReport {
+        DependencyReport {
+            path: dependency_checkout(&self.deps_root, dependency),
+            slug: dependency.slug.clone(),
+            url: dependency.url.clone(),
+            status: dependency.status,
+            git_ref: dependency.git_ref.clone(),
+            revision: dependency.revision.clone(),
+            last_error: dependency.last_error.clone(),
+        }
+    }
+
     /// Fills in the run and session a tool was not told about.
     ///
     /// An explicit id always wins: guessing is a convenience for the common
@@ -259,13 +302,20 @@ impl MagentMcp {
         Ok((run_id, session_id))
     }
 
-    /// Builds a server over `store`, working in `workspace_root`.
+    /// Builds a server over `store`, working in `workspace_root`, with
+    /// reference checkouts under `deps_root`.
     #[must_use]
-    pub fn new(store: Arc<Store>, harness: HarnessKind, workspace_root: PathBuf) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        harness: HarnessKind,
+        workspace_root: PathBuf,
+        deps_root: PathBuf,
+    ) -> Self {
         Self {
             store,
             harness,
             workspace_roots: vec![workspace_root],
+            deps_root,
             tool_router: Self::tool_router(),
         }
     }
@@ -386,6 +436,30 @@ impl MagentMcp {
             .map_err(|error| render_error(&error))?;
 
         render(&serde_json::json!({ "fact_id": fact_id }))
+    }
+
+    #[tool(
+        description = "List the reference repositories checked out for this workspace and where their sources are on disk. Read those files directly; they are real paths. Read-only."
+    )]
+    async fn magent_deps(&self) -> Result<String, String> {
+        let workspace_id = self
+            .store
+            .resolve_workspace_for(&self.workspace_roots[0])
+            .map_err(|error| render_error(&error))?
+            .workspace_id;
+
+        let dependencies = self
+            .store
+            .dependencies(workspace_id)
+            .map_err(|error| render_error(&error))?
+            .iter()
+            .map(|dependency| self.report(dependency))
+            .collect();
+
+        render(&DepsReport {
+            root: self.deps_root.clone(),
+            dependencies,
+        })
     }
 
     #[tool(

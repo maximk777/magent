@@ -196,6 +196,31 @@ impl Store {
         Ok(usize::try_from(count).unwrap_or(0))
     }
 
+    /// Every workspace with its id, named groups first.
+    ///
+    /// Unlike [`Store::workspaces`] this includes the implicit ones — a
+    /// workspace created for a single repository is still somewhere a
+    /// dependency can be declared, and hiding it would make the console
+    /// unable to offer the one that a terminal already resolved.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn workspace_names(&self) -> Result<Vec<(String, WorkspaceId)>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement =
+            connection.prepare("SELECT name, id FROM workspaces ORDER BY explicit DESC, name")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(name, id)| id.parse().ok().map(|id| (name, id)))
+            .collect())
+    }
+
     /// Every workspace, with how many repositories it holds.
     ///
     /// # Errors

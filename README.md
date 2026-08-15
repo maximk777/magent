@@ -64,7 +64,22 @@ personal memory, and it is not the daemon this design deliberately does
 without: it opens the same file every hook opens, holds nothing, and can be
 closed at any moment.
 
-Dependency indexing is still to come.
+Reference sources.
+
+```bash
+magent deps add https://github.com/acme/thing --ref v1.2.0
+magent deps list
+```
+
+A repository the workspace reads but does not work in gets a shallow checkout
+under `~/.magent/deps/<host>/<org>/<project>@<ref>`, and `magent_deps` hands the
+agent that path.
+
+What this deliberately does not build is an index over those sources. The
+agent already has grep and read, and against a local checkout those are faster
+than a bespoke index, never stale, and cost nothing to maintain. The value here
+is materialisation, not search: put the right revision at a known path and say
+where it is.
 
 ## How it is put together
 

@@ -6,6 +6,7 @@
 //! retries after a crash cannot duplicate state.
 
 mod curation;
+mod deps;
 mod error;
 mod facts;
 mod git;
@@ -16,6 +17,7 @@ mod store;
 mod toolchain;
 
 pub use curation::{FactFilter, Overview, RunRow};
+pub use deps::{Dependency, DependencySpec, DependencyStatus, dependency_checkout};
 pub use error::StoreError;
 pub use facts::{FactContext, FactQuery, namespace_candidates};
 pub use git::{

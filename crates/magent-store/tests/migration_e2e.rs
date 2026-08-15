@@ -30,6 +30,7 @@ fn migration(version: i64) -> String {
         3 => "0003_retrieval.sql",
         4 => "0004_grouping.sql",
         5 => "0005_identity.sql",
+        6 => "0006_dependencies.sql",
         other => panic!("no migration {other}"),
     };
 

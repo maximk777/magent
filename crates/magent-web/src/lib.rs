@@ -26,6 +26,9 @@ pub struct Console {
     pub store: Arc<Store>,
     /// Shown on the overview, so it is obvious which profile is open.
     pub database: PathBuf,
+    /// Where reference checkouts are materialised. Held rather than derived so
+    /// the console shows the same paths the CLI and the MCP server report.
+    pub deps_root: PathBuf,
 }
 
 /// Builds the console's router.
