@@ -23,3 +23,6 @@ jobs:
       # Isolation is otherwise unenforced: a test missing MAGENT_STATE_DIR
       # would silently write to a real profile.
       - run: ./scripts/check-isolation.sh
+      # Properties of the repository rather than the code: whether a clean
+      # clone would actually install and run.
+      - run: ./scripts/check-plugin.sh

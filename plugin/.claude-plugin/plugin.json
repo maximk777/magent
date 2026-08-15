@@ -1,8 +1,10 @@
 {
   "name": "magent",
   "description": "Durable task memory: survives context compaction, /clear and handoff between agents",
-  "version": "0.1.0",
-  "author": { "name": "Maxim Kirienkov" },
+  "version": "0.1.1",
+  "author": {
+    "name": "Maxim Kirienkov"
+  },
   "repository": "https://github.com/maximk777/magent",
   "license": "Apache-2.0"
 }

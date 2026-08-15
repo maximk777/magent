@@ -1,0 +1,9 @@
+{
+  "magent": {
+    "type": "stdio",
+    "command": "${CLAUDE_PLUGIN_ROOT}/bin/magent",
+    "args": [
+      "mcp"
+    ]
+  }
+}

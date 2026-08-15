@@ -5,3 +5,8 @@
 .magent-test-state/
 plugin/bin/magent
 .DS_Store
+
+# A global ignore rule for .mcp.json would otherwise drop the plugin's MCP
+# server from the repository, leaving anyone who clones it with a plugin that
+# silently offers no tools. A repository rule outranks a global one.
+!plugin/.mcp.json
