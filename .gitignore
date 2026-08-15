@@ -1,0 +1,7 @@
+/target/
+*.db
+*.db-shm
+*.db-wal
+.magent-test-state/
+plugin/bin/magent
+.DS_Store
