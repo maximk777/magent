@@ -22,6 +22,21 @@ enum Command {
         event: String,
     },
 
+    /// Import existing memory into the store.
+    Import {
+        /// A `~/memory`-style directory: one subdirectory per project.
+        #[arg(long)]
+        memory_dir: Option<std::path::PathBuf>,
+
+        /// A Codex `rollout_summaries` directory.
+        #[arg(long)]
+        codex_rollouts: Option<std::path::PathBuf>,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Drain the background distillation queue.
     Distill {
         /// Process one job and exit. This is how hooks invoke the worker.
@@ -52,8 +67,69 @@ fn main() {
     match cli.command {
         Command::Hook { event } => run_hook(&event),
         Command::Distill { once, state_dir } => run_distill(once, state_dir),
+        Command::Import {
+            memory_dir,
+            codex_rollouts,
+            state_dir,
+        } => run_import(memory_dir, codex_rollouts, state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
     }
+}
+
+/// Imports existing memory.
+///
+/// Reports what it could not read rather than failing the whole run: the corpus
+/// is real and slightly ragged, and an importer that refuses the awkward tenth
+/// is an importer nobody runs.
+fn run_import(
+    memory_dir: Option<std::path::PathBuf>,
+    codex_rollouts: Option<std::path::PathBuf>,
+    state_dir: Option<std::path::PathBuf>,
+) {
+    use magent_cli::import::{import_codex_rollouts, import_memory_dir};
+    use magent_store::Store;
+
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let store = match Store::open(&paths::database_path(&state_dir)) {
+        Ok(store) => store,
+        Err(error) => {
+            report(&format!("could not open the store: {error}"));
+            std::process::exit(1);
+        }
+    };
+
+    let mut total = (0_usize, 0_usize, 0_usize);
+
+    for (label, outcome) in [
+        memory_dir.map(|dir| ("memory", import_memory_dir(&store, &dir))),
+        codex_rollouts.map(|dir| ("codex", import_codex_rollouts(&store, &dir))),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match outcome {
+            Ok(summary) => {
+                println!(
+                    "{label}: {} fact(s), {} relation(s), {} skipped",
+                    summary.facts,
+                    summary.relations,
+                    summary.skipped.len()
+                );
+                for (path, reason) in &summary.skipped {
+                    println!("  skipped {}: {reason}", path.display());
+                }
+                total.0 += summary.facts;
+                total.1 += summary.relations;
+                total.2 += summary.skipped.len();
+            }
+            Err(error) => report(&format!("{label} import failed: {error:#}")),
+        }
+    }
+
+    println!(
+        "total: {} fact(s), {} relation(s), {} skipped",
+        total.0, total.1, total.2
+    );
 }
 
 /// Drains the distillation queue.

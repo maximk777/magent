@@ -20,13 +20,27 @@ use crate::{
 };
 
 /// Where a fact is being written from.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FactContext {
     pub workspace_id: Option<WorkspaceId>,
     pub run_id: Option<RunId>,
     /// The name memory is filed under when no workspace is known yet, which is
     /// the case for everything imported from the markdown corpus.
     pub namespace: Option<String>,
+    /// How the fact was obtained. Imported memory is marked so it can be
+    /// re-imported idempotently and told apart from what was learned here.
+    pub provenance: String,
+}
+
+impl Default for FactContext {
+    fn default() -> Self {
+        Self {
+            workspace_id: None,
+            run_id: None,
+            namespace: None,
+            provenance: "session".to_owned(),
+        }
+    }
 }
 
 /// What to retrieve.
@@ -113,7 +127,7 @@ impl Store {
                     context.workspace_id.map(|id| id.to_string()),
                     context.run_id.map(|id| id.to_string()),
                     context.namespace.as_deref(),
-                    "session",
+                    &context.provenance,
                     &now,
                 ],
             )?;

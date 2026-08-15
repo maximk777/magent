@@ -6,5 +6,6 @@
 //! rather than a script.
 
 pub mod hook;
+pub mod import;
 pub mod packet;
 pub mod paths;

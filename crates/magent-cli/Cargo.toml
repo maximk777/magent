@@ -25,6 +25,7 @@ magent-distill = { path = "../magent-distill" }
 magent-mcp = { path = "../magent-mcp" }
 magent-store = { path = "../magent-store" }
 serde_json.workspace = true
+uuid.workspace = true
 rmcp.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
