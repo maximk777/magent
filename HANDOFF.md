@@ -71,9 +71,11 @@ Everything lands in one SQLite file, `~/.magent/magent.db`. There is no daemon.
   by reasoning: `git clone --depth 1` silently ignoring `--depth` for a local
   path, a doctor printing a heading with nothing under it, a proposal offering
   to group the home directory under the user's own name.
-- **Commit messages explain why, including what was rejected and what a test
-  found.** Read `git log` before writing one; the register is consistent and
-  deliberate.
+- **Commit messages are short and say why.** A subject line, and a sentence or
+  two only where the reason is not visible in the diff. Read `git log` before
+  writing one; the register is consistent and deliberate. Reasoning that needs
+  more room goes in a comment, next to what it explains — not into a wall of
+  text at `git log`. **Never add a `Co-Authored-By` trailer.**
 
 ## Where things stand
 

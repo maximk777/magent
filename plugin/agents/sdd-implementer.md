@@ -27,7 +27,8 @@ magent_search "<the area you are touching>"
 3. Write the minimal code that makes it pass.
 4. Run it. Confirm it passes.
 5. Run the task's stated verification — the exact command, not a similar one.
-6. Commit.
+6. Commit. Short: a subject line, and a sentence or two only where the reason
+   is not visible in the diff. Never add a `Co-Authored-By` trailer.
 7. Self-review: read your own diff as if someone else wrote it. Fix what you
    find before reporting.
 
