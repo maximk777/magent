@@ -1,11 +1,15 @@
-//! Opening a change: `Store::propose`.
+//! Opening a change and specifying it: `Store::propose`, `Store::specify`.
 //!
-//! Two properties carry this file. The write is one operation — a change row
-//! and its proposal artifact appear together or not at all — and it is
-//! idempotent on `operation_id` the same way every other mutation in this
-//! store is, so a retried `propose` after a crash cannot duplicate a change.
+//! Two properties carry this file. Each write is one operation — a change row
+//! and its proposal artifact appear together or not at all, and so do a
+//! change's deltas and their scenarios — and each is idempotent on
+//! `operation_id` the same way every other mutation in this store is, so a
+//! retry after a crash cannot duplicate state.
 
-use magent_core::{Classification, OperationId, ProposeCommand};
+use magent_core::{
+    ChangeId, ChangeStatus, Classification, DeltaOp, OperationId, ProposeCommand, RequirementDraft,
+    ScenarioDraft, SpecifyCommand,
+};
 use magent_store::{FactContext, Store, StoreError};
 use rusqlite::Connection;
 
@@ -41,6 +45,93 @@ fn propose_command(slug: &str) -> ProposeCommand {
         impact: Some("None known.".into()),
         skip_specs: false,
     }
+}
+
+/// Long enough to clear `magent-core`'s 50-character floor on a purpose.
+const PURPOSE: &str = "Retrying work that failed for a reason that may not repeat, without \
+                       hammering a service that is already struggling.";
+
+fn scenario(name: &str) -> ScenarioDraft {
+    ScenarioDraft {
+        name: name.into(),
+        given: None,
+        when: "the budget is exhausted".into(),
+        then: "the job is parked".into(),
+    }
+}
+
+/// An `Added` requirement carrying two scenarios, in the order given.
+fn added(name: &str) -> RequirementDraft {
+    RequirementDraft {
+        op: DeltaOp::Added,
+        name: name.into(),
+        text: Some("The worker SHALL stop retrying once the budget is spent.".into()),
+        rename_to: None,
+        reason: None,
+        migration: None,
+        requirement_id: None,
+        scenarios: vec![scenario("first"), scenario("second")],
+    }
+}
+
+/// A `Modified` requirement pointing at `requirement_id`.
+fn modified(name: &str, requirement_id: &str) -> RequirementDraft {
+    RequirementDraft {
+        op: DeltaOp::Modified,
+        name: name.into(),
+        text: Some("The worker SHALL stop retrying once the budget is spent.".into()),
+        rename_to: None,
+        reason: None,
+        migration: None,
+        requirement_id: Some(requirement_id.into()),
+        scenarios: vec![scenario("first")],
+    }
+}
+
+fn specify_command(
+    change: ChangeId,
+    capability_path: &str,
+    purpose: Option<&str>,
+    requirements: Vec<RequirementDraft>,
+) -> SpecifyCommand {
+    SpecifyCommand {
+        operation_id: OperationId::new(),
+        change,
+        capability_path: capability_path.into(),
+        purpose: purpose.map(Into::into),
+        requirements,
+    }
+}
+
+/// Capabilities and requirements have no store method yet — creating them is
+/// slice 2's archive step — so the rows these tests need are seeded straight
+/// through a connection, the way
+/// `a_slug_is_free_again_once_the_change_holding_it_is_archived` sets a status.
+fn seed_capability(connection: &Connection, workspace_id: &str, id: &str, path: &str) {
+    connection
+        .execute(
+            "INSERT INTO capabilities (id, workspace_id, namespace, path, purpose, created_at, updated_at)
+             VALUES (?1, ?2, NULL, ?3, ?4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![id, workspace_id, path, PURPOSE],
+        )
+        .expect("seed capability");
+}
+
+fn seed_requirement(connection: &Connection, capability_id: &str, id: &str, name: &str) {
+    connection
+        .execute(
+            "INSERT INTO requirements (id, capability_id, name, text, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'The worker SHALL retry.', 'live', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![id, capability_id, name],
+        )
+        .expect("seed requirement");
+}
+
+fn workspace_id(context: &FactContext) -> String {
+    context
+        .workspace_id
+        .expect("the fixture context names a workspace")
+        .to_string()
 }
 
 fn change_row(connection: &Connection, id: &str) -> (String, String, String) {
@@ -275,5 +366,334 @@ fn an_invalid_command_is_rejected_without_waiting_for_the_writer_lock() {
         matches!(result, Err(StoreError::Domain(_))),
         "a malformed command must be named as such without queueing behind a \
          writer; got {result:?}"
+    );
+}
+
+// --- specifying ----------------------------------------------------------
+
+#[test]
+fn specify_writes_a_delta_with_its_scenarios_and_moves_the_change_to_specified() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let report = store.specify(&command, &ctx).expect("specify");
+
+    assert_eq!(report.capability_path, "worker/retry");
+    assert_eq!(report.added, 1);
+    assert_eq!(report.modified, 0);
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.renamed, 0);
+    assert_eq!(report.status, ChangeStatus::Specified);
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        1
+    );
+
+    let (delta_id, op, name, capability_id): (String, String, String, Option<String>) = raw
+        .query_row(
+            "SELECT id, op, name, capability_id FROM spec_deltas WHERE change_id = ?1",
+            [change.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("delta row");
+    assert_eq!(op, "added");
+    assert_eq!(name, "a spent budget parks the job");
+    assert_eq!(
+        capability_id, None,
+        "a capability that does not exist yet cannot be pointed at"
+    );
+
+    let scenarios: Vec<(i64, String)> = raw
+        .prepare("SELECT seq, name FROM delta_scenarios WHERE delta_id = ?1 ORDER BY seq")
+        .expect("prepare")
+        .query_map([&delta_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("scenario rows");
+    assert_eq!(
+        scenarios,
+        vec![(0, "first".to_string()), (1, "second".to_string())],
+        "the scenarios must keep the order they were written in"
+    );
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "specified");
+}
+
+/// The point of moving specs into rows: a multi-requirement artifact is
+/// indivisible. A markdown file half-written by a crashed process still parses;
+/// a change whose first delta landed and whose second was rejected would be a
+/// spec nobody wrote and nobody reviewed.
+#[test]
+fn a_rejected_requirement_takes_the_whole_specify_with_it() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![
+            added("a spent budget parks the job"),
+            modified(
+                "the budget is configurable",
+                "requirement-that-never-existed",
+            ),
+        ],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::RequirementNotFound { requirement_id, .. })
+                if requirement_id == "requirement-that-never-existed"
+        ),
+        "expected the dangling requirement id to be named, got {result:?}"
+    );
+
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        0,
+        "the accepted first requirement must not survive the rejected second"
+    );
+    let scenarios: i64 = raw
+        .query_row("SELECT COUNT(*) FROM delta_scenarios", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(scenarios, 0, "no scenario may outlive its delta");
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        status, "drafting",
+        "a failed specify does not advance the change"
+    );
+}
+
+#[test]
+fn a_repeated_specify_returns_the_same_report_and_writes_nothing_twice() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let first = store.specify(&command, &ctx).expect("first specify");
+    let second = store.specify(&command, &ctx).expect("replayed specify");
+
+    assert_eq!(first, second);
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        1,
+        "the replay must not have inserted a second delta"
+    );
+    let scenarios: i64 = raw
+        .query_row("SELECT COUNT(*) FROM delta_scenarios", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        scenarios, 2,
+        "the replay must not have inserted second scenarios"
+    );
+}
+
+#[test]
+fn a_modified_delta_naming_a_requirement_of_this_capability_is_accepted() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(&raw, "cap-retry", "req-budget", "a budget caps retries");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![modified("a budget caps retries", "req-budget")],
+    );
+    let report = store.specify(&command, &ctx).expect("specify");
+
+    assert_eq!(report.modified, 1);
+    assert_eq!(report.added, 0);
+
+    let (requirement_id, capability_id): (Option<String>, Option<String>) = raw
+        .query_row(
+            "SELECT requirement_id, capability_id FROM spec_deltas WHERE change_id = ?1",
+            [change.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("delta row");
+    assert_eq!(requirement_id.as_deref(), Some("req-budget"));
+    assert_eq!(
+        capability_id.as_deref(),
+        Some("cap-retry"),
+        "an existing capability is pointed at, not re-created on archive"
+    );
+}
+
+#[test]
+fn a_modified_delta_naming_another_capabilitys_requirement_is_rejected() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let workspace = workspace_id(&ctx);
+    seed_capability(&raw, &workspace, "cap-retry", "worker/retry");
+    seed_capability(&raw, &workspace, "cap-queue", "worker/queue");
+    seed_requirement(
+        &raw,
+        "cap-queue",
+        "req-queue-depth",
+        "the queue has a depth",
+    );
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![modified("a budget caps retries", "req-queue-depth")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::RequirementNotFound { requirement_id, capability_path })
+                if requirement_id == "req-queue-depth" && capability_path == "worker/retry"
+        ),
+        "a requirement of another capability must be named as not belonging here, got {result:?}"
+    );
+}
+
+#[test]
+fn a_new_capability_without_a_purpose_is_rejected() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![added("a spent budget parks the job")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::CapabilityPurposeRequired(path)) if path == "worker/retry"
+        ),
+        "expected the missing purpose to be named, got {result:?}"
+    );
+}
+
+#[test]
+fn an_existing_capability_carrying_a_purpose_is_rejected_rather_than_ignored() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::CapabilityPurposeRedundant(path)) if path == "worker/retry"
+        ),
+        "a purpose written for a capability that already has one must not vanish \
+         silently, got {result:?}"
+    );
+}
+
+#[test]
+fn specify_on_an_archived_change_is_rejected() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'archived' WHERE id = ?1",
+        [change.to_string()],
+    )
+    .expect("archive");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(&result, Err(StoreError::ChangeClosed(id)) if *id == change),
+        "expected a closed change to be named as closed, got {result:?}"
+    );
+}
+
+#[test]
+fn specify_against_a_change_that_does_not_exist_is_named_rather_than_left_to_the_key() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let missing = ChangeId::new();
+
+    let command = specify_command(
+        missing,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(&result, Err(StoreError::ChangeNotFound(id)) if *id == missing),
+        "expected the unknown change to be named, got {result:?}"
     );
 }
