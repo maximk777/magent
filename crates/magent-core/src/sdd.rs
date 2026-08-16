@@ -173,6 +173,17 @@ impl Validate for RequirementDraft {
             return Err(DomainError::MissingRequirementId);
         }
 
+        // Checked after the missing pieces above, so a draft with two faults
+        // is told what it lacks before what it carries in excess. An addition
+        // names nothing yet, so an id here is a leftover from a copied draft:
+        // the store has no row to point it at and would drop it, which is the
+        // one outcome this crate refuses everywhere else. The caller would go
+        // on believing it had patched something while a second requirement
+        // appeared beside the first.
+        if matches!(self.op, DeltaOp::Added) && self.requirement_id.is_some() {
+            return Err(DomainError::UnexpectedRequirementId);
+        }
+
         for scenario in &self.scenarios {
             scenario.validate()?;
         }

@@ -368,6 +368,27 @@ fn modified_removed_and_renamed_requirements_need_a_requirement_id() {
     }
 }
 
+/// The mirror of the rule above, and the reason it is a rule rather than a
+/// shrug: the store has nothing to point an id at for an addition, so it
+/// would drop one silently, and a caller that reused a draft would believe
+/// it had patched a requirement while a second one appeared beside it.
+#[test]
+fn an_added_requirement_must_not_carry_a_requirement_id() {
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            op: DeltaOp::Added,
+            requirement_id: Some("left-over-from-a-copied-draft".into()),
+            ..valid_requirement()
+        }],
+        ..valid_specify()
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "unexpected_requirement_id"
+    );
+}
+
 // --- ScenarioDraft ---------------------------------------------------------
 
 /// `when` and `then` are the scenario's substance; blank ones are not

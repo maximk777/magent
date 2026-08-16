@@ -169,9 +169,11 @@ impl Store {
     ) -> Result<SpecifyReport, StoreError> {
         command.validate()?;
 
-        // Outside the closure for the reason given on `propose` above: taking
-        // the writer lock to discover something already known costs another
-        // writer its turn.
+        // Outside the closure for the same reason `Store::propose` resolves it
+        // outside its own: taking the writer lock to discover something
+        // already known costs another writer its turn. Named rather than
+        // pointed at, because a third verb landing between them would make
+        // "above" quietly wrong and no compiler would say so.
         let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
 
         self.execute_operation("specify", command.operation_id, command, |tx| {
@@ -311,6 +313,9 @@ fn resolve_requirement<'a>(
     command: &SpecifyCommand,
 ) -> Result<Option<&'a str>, StoreError> {
     let requirement_id = match requirement.op {
+        // Nothing to resolve, and nothing dropped on the floor either:
+        // `RequirementDraft::validate` refuses an addition that carries an id
+        // at all, so by the time it reaches here there is none to lose.
         DeltaOp::Added => return Ok(None),
         DeltaOp::Modified | DeltaOp::Removed | DeltaOp::Renamed => {
             requirement.requirement_id.as_deref()
