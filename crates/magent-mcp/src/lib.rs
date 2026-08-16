@@ -9,8 +9,9 @@
 use std::{path::PathBuf, sync::Arc};
 
 use magent_core::{
-    CheckpointCommand, CheckpointOrigin, Fact, FinishAction, FinishRunCommand, HarnessKind,
-    OperationId, RememberCommand, RunId, SessionId, StartRunCommand, WorkflowStage,
+    CheckpointCommand, CheckpointOrigin, Classification, Fact, FinishAction, FinishRunCommand,
+    HarnessKind, OperationId, ProposeCommand, RememberCommand, RunId, SessionId, SpecifyCommand,
+    StartRunCommand, WorkflowStage,
 };
 use magent_store::{
     Dependency, FactContext, FactQuery, GroupingProposal, Store, StoreError, dependency_checkout,
@@ -206,6 +207,50 @@ pub struct FinishToolInput {
     pub session_id: Option<SessionId>,
 }
 
+/// What the client may supply when proposing a change.
+///
+/// Deliberately smaller than [`ProposeCommand`]: `what_changes` and
+/// `capabilities` carry no `#[serde(default)]` on the domain type, so used
+/// directly it would force every call to name an empty list explicitly — and
+/// worse, it would make the empty-capabilities-without-`skip_specs` case
+/// unreachable through this schema. The client's own JSON-Schema validator
+/// would refuse the omission before the call ever reached
+/// [`Store::propose`](magent_store::Store::propose), so the actionable
+/// `missing_capabilities` code the domain layer exists to produce would never
+/// surface. Both lists default to empty here instead, leaving that refusal to
+/// the domain layer, which can explain it. `impact` and `skip_specs` already
+/// default on [`ProposeCommand`] and are carried through unchanged.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct ProposeToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
+    /// The change's address: lowercase letters, digits and single interior
+    /// hyphens, `add-retry-budget`-style.
+    pub slug: String,
+    /// One line, readable on its own in a list of open changes.
+    pub title: String,
+    /// How much this change is expected to cost, and thus how much process
+    /// it owes. `bounded` is the common case.
+    pub classification: Classification,
+    /// Why this change is worth making, for a reviewer judging whether it
+    /// should happen at all.
+    pub why: String,
+    /// The change in outline, one entry per notable edit.
+    #[serde(default)]
+    pub what_changes: Vec<String>,
+    /// Paths of the capabilities this change touches, `worker/retry`-style.
+    /// Leave empty only when `skip_specs` is set.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// What could go wrong, or who else is affected.
+    #[serde(default)]
+    pub impact: Option<String>,
+    /// Set when this change legitimately touches no capability — a pure
+    /// refactor, tooling, docs.
+    #[serde(default)]
+    pub skip_specs: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct SearchResult {
     facts: Vec<Fact>,
@@ -311,20 +356,25 @@ impl MagentMcp {
     /// Both a workspace id and a namespace: the id is the real binding, and the
     /// namespace is what groups new facts with the imported corpus for the same
     /// project.
-    fn fact_context(&self) -> FactContext {
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Store::resolve_workspace_for`] returns, chiefly a
+    /// database error. Resolution creates a workspace on first sight of any
+    /// directory, so a caller reaching `Err` here has a real failure to act
+    /// on, not an unregistered workspace — swallowing it into
+    /// `workspace_id: None` would report the latter and hide the former.
+    fn fact_context(&self) -> Result<FactContext, StoreError> {
         let root = &self.workspace_roots[0];
-        FactContext {
-            workspace_id: self
-                .store
-                .resolve_workspace_for(root)
-                .ok()
-                .map(|resolved| resolved.workspace_id),
+        let workspace_id = self.store.resolve_workspace_for(root)?.workspace_id;
+        Ok(FactContext {
+            workspace_id: Some(workspace_id),
             run_id: None,
             namespace: root
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned()),
             ..FactContext::default()
-        }
+        })
     }
 
     fn query(&self, text: String, limit: Option<usize>) -> FactQuery {
@@ -521,9 +571,10 @@ impl MagentMcp {
         &self,
         Parameters(input): Parameters<RecallToolInput>,
     ) -> Result<String, String> {
+        let context = self.fact_context().map_err(|error| render_error(&error))?;
         let fact = self
             .store
-            .recall(&input.name, &self.fact_context())
+            .recall(&input.name, &context)
             .map_err(|error| render_error(&error))?;
 
         render(&RecallResult { fact })
@@ -536,9 +587,10 @@ impl MagentMcp {
         &self,
         Parameters(command): Parameters<RememberCommand>,
     ) -> Result<String, String> {
+        let context = self.fact_context().map_err(|error| render_error(&error))?;
         let fact_id = self
             .store
-            .remember(&command, &self.fact_context())
+            .remember(&command, &context)
             .map_err(|error| render_error(&error))?;
 
         render(&serde_json::json!({ "fact_id": fact_id }))
@@ -701,6 +753,50 @@ impl MagentMcp {
                 .finish_run(&command)
                 .map_err(|error| render_error(&error))?,
         )
+    }
+
+    #[tool(
+        description = "Open a spec-driven change: a proposal plus its process metadata. Requires slug, title, classification and why; capabilities may be left empty only when skip_specs is true, in which case the change writes no deltas."
+    )]
+    async fn magent_propose(
+        &self,
+        Parameters(input): Parameters<ProposeToolInput>,
+    ) -> Result<String, String> {
+        let command = ProposeCommand {
+            operation_id: input.operation_id,
+            slug: input.slug,
+            title: input.title,
+            classification: input.classification,
+            why: input.why,
+            what_changes: input.what_changes,
+            capabilities: input.capabilities,
+            impact: input.impact,
+            skip_specs: input.skip_specs,
+        };
+
+        let context = self.fact_context().map_err(|error| render_error(&error))?;
+        let change_id = self
+            .store
+            .propose(&command, &context)
+            .map_err(|error| render_error(&error))?;
+
+        render(&serde_json::json!({ "change_id": change_id }))
+    }
+
+    #[tool(
+        description = "Attach one capability's requirement deltas to an open change proposed with magent_propose, moving it to specified. Call again for another capability, or to add more requirements to the same one; nothing already attached is replaced. purpose is required only when the capability is new."
+    )]
+    async fn magent_specify(
+        &self,
+        Parameters(command): Parameters<SpecifyCommand>,
+    ) -> Result<String, String> {
+        let context = self.fact_context().map_err(|error| render_error(&error))?;
+        let report = self
+            .store
+            .specify(&command, &context)
+            .map_err(|error| render_error(&error))?;
+
+        render(&report)
     }
 }
 

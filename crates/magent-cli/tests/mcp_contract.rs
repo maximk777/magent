@@ -26,27 +26,31 @@ const MAGENT: &str = env!("CARGO_BIN_EXE_magent");
 /// first. Exceeding it silently loses the end of the bootstrap contract.
 const INSTRUCTIONS_LIMIT: usize = 2048;
 
-/// Slice 1 exposes exactly these. The old "only four tools" constraint was
-/// about context cost, and tool search removed it — only names and server
-/// instructions load at session start — but the set still grows deliberately.
-const EXPECTED_TOOLS: [&str; 9] = [
+/// The old "only four tools" constraint was about context cost, and tool
+/// search removed it — only names and server instructions load at session
+/// start — but the set still grows deliberately, one slice at a time.
+const EXPECTED_TOOLS: [&str; 11] = [
     "magent_checkpoint",
     "magent_deps",
     "magent_finish",
+    "magent_propose",
     "magent_recall",
     "magent_remember",
     "magent_search",
     "magent_setup",
+    "magent_specify",
     "magent_start",
     "magent_status",
 ];
 
 /// Tools that change state. Each must take an `operation_id` so a retry after a
 /// dropped connection cannot duplicate work.
-const MUTATING_TOOLS: [&str; 4] = [
+const MUTATING_TOOLS: [&str; 6] = [
     "magent_checkpoint",
     "magent_finish",
+    "magent_propose",
     "magent_remember",
+    "magent_specify",
     "magent_start",
 ];
 
@@ -188,7 +192,7 @@ fn first_text(result: &rmcp::model::CallToolResult) -> Option<String> {
 // --- surface ---------------------------------------------------------------
 
 #[tokio::test]
-async fn the_server_exposes_exactly_the_slice_one_tools() {
+async fn the_server_exposes_exactly_the_expected_tools() {
     let fixture = Fixture::new();
     let client = connect(&fixture).await;
 
@@ -1296,5 +1300,156 @@ async fn the_spec_fields_are_all_optional() {
     for field in ["spec_change_id", "spec_paths", "current_task"] {
         assert!(!required.contains(&field), "{field} became required");
     }
+    client.cancel().await.expect("shutdown");
+}
+
+// --- propose and specify ----------------------------------------------------
+
+/// Sorted required-field names for one tool's input schema.
+async fn required_fields<H: ClientHandler>(client: &Connected<H>, tool: &str) -> Vec<String> {
+    let tools = client.list_all_tools().await.expect("tools");
+    let found = tools
+        .iter()
+        .find(|candidate| candidate.name == tool)
+        .unwrap_or_else(|| panic!("{tool} was not found among the server's tools"));
+
+    let mut required: Vec<String> = found
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    required.sort();
+    required
+}
+
+/// Only the fields a proposal is meaningless without. `what_changes` and
+/// `capabilities` are lists a call can reasonably send empty — the latter is
+/// how a change declares `skip_specs` and leaves the domain layer to say so —
+/// so neither belongs in `required`.
+#[tokio::test]
+async fn the_propose_schema_asks_for_only_what_a_proposal_needs() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let required = required_fields(&client, "magent_propose").await;
+
+    assert_eq!(
+        required,
+        ["classification", "operation_id", "slug", "title", "why"],
+        "magent_propose asks for more or less than it needs"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// `change`, `capability_path` and `requirements` are all load-bearing: a
+/// specify call naming none of them has nothing to attach and nowhere to
+/// attach it. `purpose` stays optional — required only for a capability that
+/// is new, which only the store can tell.
+#[tokio::test]
+async fn the_specify_schema_asks_for_only_what_a_delta_needs() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let required = required_fields(&client, "magent_specify").await;
+
+    assert_eq!(
+        required,
+        ["capability_path", "change", "operation_id", "requirements"],
+        "magent_specify asks for more or less than it needs"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Proposing a change and then specifying one of its capabilities, end to
+/// end, through the real server.
+#[tokio::test]
+async fn a_proposed_change_can_be_specified() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let proposed = call(
+        &client,
+        "magent_propose",
+        json!({
+            "operation_id": uuid(),
+            "slug": "add-retry-budget",
+            "title": "Add a retry budget",
+            "classification": "bounded",
+            "why": "retries currently loop forever and starve the queue of capacity",
+            "what_changes": ["add a budget type", "wire it into the client"],
+            "capabilities": ["worker/retry"]
+        }),
+    )
+    .await;
+    let change_id = proposed["change_id"]
+        .as_str()
+        .expect("change_id")
+        .to_owned();
+
+    let specified = call(
+        &client,
+        "magent_specify",
+        json!({
+            "operation_id": uuid(),
+            "change": change_id,
+            "capability_path": "worker/retry",
+            "purpose": "Retries stop after a configured budget instead of continuing forever, so a failing dependency cannot starve the queue of capacity for other work.",
+            "requirements": [{
+                "op": "added",
+                "name": "budget-caps-retries",
+                "text": "A retry budget caps the number of attempts a worker makes before giving up.",
+                "scenarios": [{
+                    "name": "exceeding the budget stops retrying",
+                    "when": "a job has already failed budget times",
+                    "then": "the worker does not retry it again"
+                }]
+            }]
+        }),
+    )
+    .await;
+
+    assert_eq!(specified["capability_path"].as_str(), Some("worker/retry"));
+    assert_eq!(specified["added"].as_u64(), Some(1), "{specified}");
+    assert_eq!(specified["modified"].as_u64(), Some(0));
+    assert_eq!(specified["removed"].as_u64(), Some(0));
+    assert_eq!(specified["renamed"].as_u64(), Some(0));
+    assert_eq!(specified["status"].as_str(), Some("specified"));
+    client.cancel().await.expect("shutdown");
+}
+
+/// A domain failure has to reach the model as something it can act on: a
+/// stable code to branch on, and prose to explain it. Omitting both
+/// `capabilities` and `skip_specs` is refused by `ProposeCommand::validate`,
+/// not by the JSON-Schema layer — which is only true because neither field is
+/// required in the schema.
+#[tokio::test]
+async fn proposing_without_capabilities_or_skip_specs_says_so() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let error = call_expecting_error(
+        &client,
+        "magent_propose",
+        json!({
+            "operation_id": uuid(),
+            "slug": "add-something",
+            "title": "Add something",
+            "classification": "bounded",
+            "why": "needed for reasons a reviewer would accept"
+        }),
+    )
+    .await;
+
+    assert!(
+        error.contains("missing_capabilities"),
+        "expected the stable domain code in: {error}"
+    );
     client.cancel().await.expect("shutdown");
 }
