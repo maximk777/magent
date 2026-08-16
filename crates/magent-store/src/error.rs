@@ -46,8 +46,14 @@ pub enum StoreError {
     /// A change belongs to a workspace, and the caller's context did not name
     /// one. The column is `NOT NULL`, so the database would refuse this
     /// anyway — with a message about a constraint rather than about the
-    /// working directory, which is where the answer actually is.
-    #[error("this directory does not resolve to a workspace; call magent_setup")]
+    /// context, which is where the answer actually is.
+    ///
+    /// The message names the fact and stops there. `resolve_workspace_for`
+    /// creates a workspace on first sight of any directory, so the only way
+    /// to arrive here is a resolution that failed and was discarded upstream;
+    /// no tool the caller could run would change that, and telling it to run
+    /// one would send it somewhere the fix is not.
+    #[error("this context names no workspace to file the change under")]
     NoWorkspace,
 }
 
