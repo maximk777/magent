@@ -32,6 +32,9 @@ tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+# Closing a task is not a verb the server has yet, so the archive contract test
+# sets those rows itself.
+rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util"] }

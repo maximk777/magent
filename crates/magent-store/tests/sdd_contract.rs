@@ -225,7 +225,7 @@ fn propose_writes_a_drafting_change_and_a_proposal_artifact() {
     let ctx = context(&store, dir.path());
     let command = propose_command("add-retry-budget");
 
-    let change_id = store.propose(&command, &ctx).expect("propose");
+    let change_id = store.propose(&command, &ctx).expect("propose").id;
 
     let raw = Connection::open(&path).expect("raw connection");
     let (slug, title, status) = change_row(&raw, &change_id.to_string());
@@ -260,8 +260,8 @@ fn a_repeated_operation_id_with_the_same_body_returns_the_same_change_and_writes
     let ctx = context(&store, dir.path());
     let command = propose_command("add-retry-budget");
 
-    let first = store.propose(&command, &ctx).expect("first propose");
-    let second = store.propose(&command, &ctx).expect("replayed propose");
+    let first = store.propose(&command, &ctx).expect("first propose").id;
+    let second = store.propose(&command, &ctx).expect("replayed propose").id;
 
     assert_eq!(first, second);
 
@@ -308,14 +308,15 @@ fn a_second_propose_on_a_drafting_change_rewrites_its_proposal() {
 
     let first = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("first propose");
+        .expect("first propose")
+        .id;
 
     let mut rewrite = propose_command("add-retry-budget");
     rewrite.title = "Cap the retry loop and drain the queue".into();
     rewrite.classification = Classification::Architectural;
     rewrite.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
 
-    let second = store.propose(&rewrite, &ctx).expect("rewritten propose");
+    let second = store.propose(&rewrite, &ctx).expect("rewritten propose").id;
 
     assert_eq!(
         first, second,
@@ -361,7 +362,8 @@ fn a_slug_held_by_a_change_already_planned_is_refused() {
 
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("first propose");
+        .expect("first propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     raw.execute(
@@ -388,7 +390,7 @@ fn a_rewrite_dropping_a_capability_that_already_has_deltas_is_refused() {
 
     let mut proposal = propose_command("add-retry-budget");
     proposal.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
-    let change = store.propose(&proposal, &ctx).expect("propose");
+    let change = store.propose(&proposal, &ctx).expect("propose").id;
 
     store
         .specify(
@@ -438,7 +440,8 @@ fn a_slug_is_free_again_once_the_change_holding_it_is_archived() {
 
     let first = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("first propose");
+        .expect("first propose")
+        .id;
 
     // Archiving is task 4's Store::specify-adjacent surface, not built yet.
     // Set it directly through a raw connection, the way migration_e2e.rs
@@ -453,7 +456,8 @@ fn a_slug_is_free_again_once_the_change_holding_it_is_archived() {
 
     let second = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("second propose, after archiving");
+        .expect("second propose, after archiving")
+        .id;
 
     assert_ne!(first, second);
 }
@@ -557,7 +561,8 @@ fn specify_writes_a_delta_with_its_scenarios_and_moves_the_change_to_specified()
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let command = specify_command(
         change,
@@ -621,7 +626,8 @@ fn a_rejected_requirement_takes_the_whole_specify_with_it() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
@@ -672,7 +678,8 @@ fn a_repeated_specify_returns_the_same_report_and_writes_nothing_twice() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let command = specify_command(
         change,
@@ -706,7 +713,8 @@ fn a_modified_delta_naming_a_requirement_of_this_capability_is_accepted() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
@@ -750,7 +758,8 @@ fn a_modified_delta_naming_another_capabilitys_requirement_is_rejected() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     let workspace = workspace_id(&ctx);
@@ -788,7 +797,8 @@ fn a_new_capability_without_a_purpose_is_rejected() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let command = specify_command(
         change,
@@ -813,7 +823,8 @@ fn an_existing_capability_carrying_a_purpose_is_rejected_rather_than_ignored() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
@@ -842,7 +853,8 @@ fn specify_on_an_archived_change_is_rejected() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     raw.execute(
@@ -897,7 +909,8 @@ fn specify_pulls_a_planned_change_back_to_specified() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     // Planning is slice 2's verb, so the status is set the way archiving is
     // in the test above.
@@ -930,7 +943,8 @@ fn a_modified_delta_naming_a_removed_requirement_is_rejected() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
@@ -970,7 +984,8 @@ fn a_requirement_name_this_change_already_proposed_is_named_rather_than_left_to_
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let first = specify_command(
         change,
@@ -1015,7 +1030,8 @@ fn a_second_specify_adds_to_the_deltas_already_proposed() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let first = specify_command(
         change,
@@ -1057,7 +1073,8 @@ fn specify_naming_a_capability_the_proposal_never_declared_is_refused() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let command = specify_command(
         change,
@@ -1102,7 +1119,8 @@ fn specify_naming_a_declared_capability_is_accepted() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let command = specify_command(
         change,
@@ -1125,7 +1143,8 @@ fn a_capability_added_by_a_rewritten_proposal_can_then_be_specified() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let mut rewrite = propose_command("add-retry-budget");
     rewrite.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
@@ -1184,7 +1203,7 @@ fn a_rewrite_that_only_reorders_the_capabilities_leaves_the_status_alone() {
 
     let mut opening = propose_command("add-retry-budget");
     opening.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
-    let change = store.propose(&opening, &ctx).expect("propose");
+    let change = store.propose(&opening, &ctx).expect("propose").id;
     store
         .specify(
             &specify_command(
@@ -1228,6 +1247,38 @@ fn a_rewrite_that_only_fixes_the_wording_leaves_the_status_alone() {
     );
 }
 
+/// The identifier alone cannot tell an author what just happened, and by the
+/// time a proposal is rewritten there is something to tell: whether this
+/// opened a change or corrected one, and whether the correction cost the
+/// specs already written against it.
+#[test]
+fn a_propose_reports_whether_it_opened_a_change_or_rewrote_one() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    let opened = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+    assert_eq!(opened.slug, "add-retry-budget");
+    assert_eq!(opened.status, ChangeStatus::Drafting);
+    assert!(!opened.rewritten, "nothing stood under this slug");
+
+    let mut widened = propose_command("add-retry-budget");
+    widened.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
+    let rewritten = store.propose(&widened, &ctx).expect("rewrite");
+
+    assert_eq!(
+        rewritten.id, opened.id,
+        "a rewrite corrects the change that is there"
+    );
+    assert!(rewritten.rewritten);
+    assert_eq!(
+        rewritten.status,
+        ChangeStatus::Drafting,
+        "the status the caller has to act on is the one the rewrite left behind"
+    );
+}
+
 // --- planning ------------------------------------------------------------
 
 /// One task of a plan, covering the requirement names it is given.
@@ -1256,7 +1307,10 @@ fn plan_command(change: ChangeId, tasks: Vec<TaskDraft>) -> PlanCommand {
 /// A change carrying one `Added` requirement and sitting at `specified` —
 /// the state a plan is normally written from.
 fn specified_change(store: &Store, ctx: &FactContext, slug: &str, requirement: &str) -> ChangeId {
-    let change = store.propose(&propose_command(slug), ctx).expect("propose");
+    let change = store
+        .propose(&propose_command(slug), ctx)
+        .expect("propose")
+        .id;
     store
         .specify(
             &specify_command(
@@ -1454,7 +1508,8 @@ fn planning_a_change_that_was_never_specified_is_refused() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     let command = plan_command(change, vec![task("1", &[])]);
     let result = store.plan(&command, &ctx);
@@ -1482,7 +1537,7 @@ fn a_change_that_skips_specs_is_planned_straight_from_drafting() {
     let mut proposal = propose_command("retire-the-old-runner");
     proposal.capabilities = Vec::new();
     proposal.skip_specs = true;
-    let change = store.propose(&proposal, &ctx).expect("propose");
+    let change = store.propose(&proposal, &ctx).expect("propose").id;
 
     let report = store
         .plan(&plan_command(change, vec![task("1", &[])]), &ctx)
@@ -1636,7 +1691,10 @@ fn archivable_change(
     purpose: Option<&str>,
     requirements: Vec<RequirementDraft>,
 ) -> ChangeId {
-    let change = store.propose(&propose_command(slug), ctx).expect("propose");
+    let change = store
+        .propose(&propose_command(slug), ctx)
+        .expect("propose")
+        .id;
     let covers: Vec<String> = requirements
         .iter()
         .map(|requirement| requirement.name.clone())
@@ -1857,7 +1915,8 @@ fn two_deltas_giving_one_new_capability_different_purposes_are_refused() {
 
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     store
         .specify(
@@ -2117,7 +2176,8 @@ fn archiving_a_change_that_proposes_no_deltas_is_refused() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     // Planned and done, so the task check is not what refuses this.
     let raw = Connection::open(&path).expect("raw connection");
@@ -2155,7 +2215,7 @@ fn a_change_that_skips_specs_archives_with_nothing_to_fold_in() {
     let mut proposal = propose_command("retire-the-old-runner");
     proposal.capabilities = Vec::new();
     proposal.skip_specs = true;
-    let change = store.propose(&proposal, &ctx).expect("propose");
+    let change = store.propose(&proposal, &ctx).expect("propose").id;
 
     let report = store
         .archive(&archive_command(change), &ctx)
@@ -2297,13 +2357,16 @@ fn open_changes_returns_open_changes_freshest_first_and_excludes_archived() {
 
     let older = store
         .propose(&propose_command("older-change"), &ctx)
-        .expect("propose older");
+        .expect("propose older")
+        .id;
     let newer = store
         .propose(&propose_command("newer-change"), &ctx)
-        .expect("propose newer");
+        .expect("propose newer")
+        .id;
     let archived = store
         .propose(&propose_command("archived-change"), &ctx)
-        .expect("propose archived");
+        .expect("propose archived")
+        .id;
 
     let raw = Connection::open(&path).expect("raw connection");
     raw.execute(
@@ -2338,7 +2401,8 @@ fn open_changes_counts_deltas_and_tasks_correctly() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     store
         .specify(
@@ -2404,7 +2468,8 @@ fn change_detail_reads_the_proposal_deltas_and_tasks() {
     let ctx = context(&store, dir.path());
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose");
+        .expect("propose")
+        .id;
 
     store
         .specify(
@@ -2477,7 +2542,8 @@ fn a_change_from_another_workspace_is_invisible_to_open_changes_and_change_detai
 
     let change = store
         .propose(&propose_command("add-retry-budget"), &ctx)
-        .expect("propose in the first workspace");
+        .expect("propose in the first workspace")
+        .id;
 
     let changes = store
         .open_changes(&other_ctx)

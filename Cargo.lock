@@ -855,6 +855,7 @@ dependencies = [
  "magent-store",
  "magent-web",
  "rmcp",
+ "rusqlite",
  "serde_json",
  "tempfile",
  "tokio",

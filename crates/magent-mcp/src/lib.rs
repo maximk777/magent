@@ -9,12 +9,14 @@
 use std::{path::PathBuf, sync::Arc};
 
 use magent_core::{
-    CheckpointCommand, CheckpointOrigin, Classification, Fact, FinishAction, FinishRunCommand,
-    HarnessKind, OperationId, ProposeCommand, RememberCommand, RunId, SessionId, SpecifyCommand,
-    StartRunCommand, WorkflowStage,
+    ArchiveCommand, ChangeId, CheckpointCommand, CheckpointOrigin, Classification, Fact,
+    FinishAction, FinishRunCommand, HarnessKind, OperationId, PlanCommand, ProposeCommand,
+    RememberCommand, RequirementDraft, RunId, SessionId, SpecifyCommand, StartRunCommand,
+    TaskDraft, WorkflowStage,
 };
 use magent_store::{
-    Dependency, FactContext, FactQuery, GroupingProposal, Store, StoreError, dependency_checkout,
+    ChangeDetail, ChangeSummary, Dependency, FactContext, FactQuery, GroupingProposal, Store,
+    StoreError, dependency_checkout,
 };
 use rmcp::{
     ServerHandler,
@@ -251,6 +253,92 @@ pub struct ProposeToolInput {
     pub skip_specs: bool,
 }
 
+/// What the client may supply when specifying a capability.
+///
+/// A wrapper where [`SpecifyCommand`] used to be passed through directly, for
+/// one reason: `change` is a slug or an identifier here, and the domain type's
+/// `ChangeId` can only be the latter. The rule [`ProposeToolInput`] states —
+/// wrap only where the schema would otherwise refuse, before any code runs,
+/// something this layer can answer — is what admits it, and it is the reason
+/// [`ArchiveToolInput`] exists at all for a command of two fields. Dogfooding
+/// found the identifier to be the wrong end to hold a change by: it is the
+/// first thing a context compaction takes, while the slug is one the model
+/// invented itself and can still name a minute later.
+///
+/// The store stays typed either way — [`MagentMcp::resolve_change`] translates
+/// at the edge rather than loosening what `Store` accepts.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct SpecifyToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
+    /// The change: its slug, as `magent_propose` was given it, or the
+    /// identifier `magent_propose` returned.
+    pub change: String,
+    /// The capability these requirements belong to, `worker/retry`-style.
+    /// Must be one the change's proposal named.
+    pub capability_path: String,
+    /// What the capability is for, in prose, at least 50 characters. Needed
+    /// only when the capability is new.
+    #[serde(default)]
+    pub purpose: Option<String>,
+    /// The requirements this capability gains, loses or changes, each with at
+    /// least one scenario.
+    pub requirements: Vec<RequirementDraft>,
+}
+
+/// What the client may supply when planning a change.
+///
+/// Wrapped for the same single reason as [`SpecifyToolInput`]: `change` is an
+/// address the caller chose, not an identifier the server issued.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct PlanToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
+    /// The change: its slug, as `magent_propose` was given it, or the
+    /// identifier `magent_propose` returned.
+    pub change: String,
+    /// The whole plan in one call: a second call replaces these tasks rather
+    /// than adding to them.
+    pub tasks: Vec<TaskDraft>,
+}
+
+/// What the client may supply when archiving a change.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct ArchiveToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
+    /// The change: its slug, as `magent_propose` was given it, or the
+    /// identifier `magent_propose` returned.
+    pub change: String,
+}
+
+/// What the client may supply when reading the process back.
+///
+/// The one field is optional, because the question this tool most often
+/// answers — "what was I working on" — is asked by a caller that has nothing
+/// left to name.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+pub struct ChangesToolInput {
+    /// Omit to list what is open here. Naming a change — by the slug
+    /// `magent_propose` was given, or by the identifier it returned — adds
+    /// that change's proposal, deltas and tasks to the answer.
+    #[serde(default)]
+    pub change: Option<String>,
+}
+
+/// What is open here, and — when one was asked about — the whole of it.
+///
+/// Both fields on every answer rather than one shape per call: a caller that
+/// named a change it can no longer find still gets the list that tells it what
+/// it should have named.
+#[derive(Debug, Serialize)]
+struct ChangesReport {
+    open: Vec<ChangeSummary>,
+    /// Null unless a change was named, and null too when the identifier given
+    /// belongs to no change of this workspace — `open` is then the answer.
+    change: Option<ChangeDetail>,
+}
+
 #[derive(Debug, Serialize)]
 struct SearchResult {
     facts: Vec<Fact>,
@@ -446,6 +534,47 @@ impl MagentMcp {
         };
 
         Ok((run_id, session_id))
+    }
+
+    /// Turns what a caller called a change into the id the store works in.
+    ///
+    /// Anything that parses as a UUID is taken as an identifier and passed
+    /// through: the store is the one that knows whether it names a change of
+    /// this workspace, and it says so in its own terms. Anything else is a
+    /// slug, looked up among the open changes here — an archived change's slug
+    /// is free to be reused, so resolving one would hand back whichever change
+    /// happened to hold it.
+    ///
+    /// A slug that matches nothing is refused with the open slugs in the
+    /// message. The alternative — "no such change" and nothing else — sends the
+    /// caller off to run a second tool to find out what it should have typed,
+    /// which is the round trip this whole translation exists to remove.
+    fn resolve_change(&self, reference: &str, context: &FactContext) -> Result<ChangeId, String> {
+        if let Ok(change) = reference.parse::<ChangeId>() {
+            return Ok(change);
+        }
+
+        let open = self
+            .store
+            .open_changes(context)
+            .map_err(|error| render_error(&error))?;
+
+        if let Some(found) = open.iter().find(|change| change.slug == reference) {
+            return Ok(found.id);
+        }
+
+        let slugs: Vec<&str> = open.iter().map(|change| change.slug.as_str()).collect();
+        Err(fail(
+            "change_not_found",
+            &if slugs.is_empty() {
+                format!("no change here is called {reference}, and nothing is open here at all")
+            } else {
+                format!(
+                    "no open change here is called {reference}. Open changes: {}",
+                    slugs.join(", ")
+                )
+            },
+        ))
     }
 
     /// Builds a server over `store`, working in `workspace_root`, with
@@ -764,7 +893,7 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Open a spec-driven change: a proposal plus its process metadata. Requires slug, title, classification and why; capabilities may be left empty only when skip_specs is true, in which case the change writes no deltas."
+        description = "Open a spec-driven change: a proposal plus its process metadata. Call before writing any code, and call again with the same slug to rewrite a proposal that has not been archived — that is how a change widens its scope, and the only way to declare a capability the first call missed. Requires slug, title, classification and why; capabilities may be left empty only when skip_specs is true, in which case the change writes no deltas."
     )]
     async fn magent_propose(
         &self,
@@ -783,35 +912,107 @@ impl MagentMcp {
         };
 
         let context = self.fact_context()?;
-        let change_id = self
-            .store
-            .propose(&command, &context)
-            .map_err(|error| render_error(&error))?;
-
-        render(&serde_json::json!({ "change_id": change_id }))
+        render(
+            &self
+                .store
+                .propose(&command, &context)
+                .map_err(|error| render_error(&error))?,
+        )
     }
 
-    /// Takes the domain command directly, where `magent_propose` needed a
-    /// wrapper. The rule behind both, for whoever adds the next tool: wrap
-    /// only when a field the domain layer wants to refuse would otherwise be
-    /// refused earlier, by the schema, in words the caller cannot act on.
-    /// Here nothing qualifies — `purpose` already carries `#[serde(default)]`
-    /// and every other field is genuinely required — so a wrapper would add a
-    /// second place to forget a field and buy nothing.
     #[tool(
-        description = "Attach one capability's requirement deltas to an open change proposed with magent_propose, moving it to specified. Call again for another capability, or to add more requirements to the same one; nothing already attached is replaced. purpose is required only when the capability is new."
+        description = "Attach one capability's requirement deltas to a change proposed with magent_propose, moving it to specified. Call once per capability, after the proposal and before magent_plan; call again for another capability, or to add more requirements to the same one, and nothing already attached is replaced. The capability must be one the proposal named — magent_propose rewrites the proposal if it did not. purpose is required only when the capability is new."
     )]
     async fn magent_specify(
         &self,
-        Parameters(command): Parameters<SpecifyCommand>,
+        Parameters(input): Parameters<SpecifyToolInput>,
     ) -> Result<String, String> {
         let context = self.fact_context()?;
-        let report = self
-            .store
-            .specify(&command, &context)
-            .map_err(|error| render_error(&error))?;
+        let command = SpecifyCommand {
+            operation_id: input.operation_id,
+            change: self.resolve_change(&input.change, &context)?,
+            capability_path: input.capability_path,
+            purpose: input.purpose,
+            requirements: input.requirements,
+        };
 
-        render(&report)
+        render(
+            &self
+                .store
+                .specify(&command, &context)
+                .map_err(|error| render_error(&error))?,
+        )
+    }
+
+    #[tool(
+        description = "Break a specified change into the tasks that implement it, moving it to planned. Call after magent_specify and before writing any code. The whole plan goes in one call: a second call replaces the tasks rather than adding to them. Every requirement the change proposes must be named in some task's covers, and every task needs a verify_command and the output that command prints when the task is genuinely done."
+    )]
+    async fn magent_plan(
+        &self,
+        Parameters(input): Parameters<PlanToolInput>,
+    ) -> Result<String, String> {
+        let context = self.fact_context()?;
+        let command = PlanCommand {
+            operation_id: input.operation_id,
+            change: self.resolve_change(&input.change, &context)?,
+            tasks: input.tasks,
+        };
+
+        render(
+            &self
+                .store
+                .plan(&command, &context)
+                .map_err(|error| render_error(&error))?,
+        )
+    }
+
+    #[tool(
+        description = "Close out a change once every task of its plan is done: its deltas are folded into the live specifications and the change becomes archived. Call last, and only after the work is verified — an archive cannot be undone, and the change's slug is free for reuse afterwards."
+    )]
+    async fn magent_archive(
+        &self,
+        Parameters(input): Parameters<ArchiveToolInput>,
+    ) -> Result<String, String> {
+        let context = self.fact_context()?;
+        let command = ArchiveCommand {
+            operation_id: input.operation_id,
+            change: self.resolve_change(&input.change, &context)?,
+        };
+
+        render(
+            &self
+                .store
+                .archive(&command, &context)
+                .map_err(|error| render_error(&error))?,
+        )
+    }
+
+    #[tool(
+        description = "Show the spec-driven changes open in this workspace, or the whole of one — its proposal, its deltas and its tasks. Call when resuming work, or whenever the change being worked on is no longer in context: this is how to find a change again after a compaction, and what to read before proposing something that may already be open. Read-only."
+    )]
+    async fn magent_changes(
+        &self,
+        Parameters(input): Parameters<ChangesToolInput>,
+    ) -> Result<String, String> {
+        let context = self.fact_context()?;
+
+        let change = match input.change {
+            Some(reference) => {
+                let change = self.resolve_change(&reference, &context)?;
+                self.store
+                    .change_detail(change, &context)
+                    .map_err(|error| render_error(&error))?
+            }
+            None => None,
+        };
+
+        render(&ChangesReport {
+            open: self
+                .store
+                .open_changes(&context)
+                .map_err(|error| render_error(&error))?,
+            change,
+        })
     }
 }
 

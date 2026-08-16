@@ -28,8 +28,8 @@ pub use git::{
 pub use grouping::WorkspaceGrouping;
 pub use migrations::CURRENT_VERSION;
 pub use sdd::{
-    ArchiveReport, ChangeDetail, ChangeSummary, DeltaSummary, PlanReport, SpecifyReport,
-    TaskSummary,
+    ArchiveReport, ChangeDetail, ChangeSummary, DeltaSummary, PlanReport, ProposeReport,
+    SpecifyReport, TaskSummary,
 };
 pub use sessions::SessionBinding;
 pub use setup::{GroupingProposal, Sibling};

@@ -48,6 +48,28 @@ struct DeclaredCapabilities {
     capabilities: Vec<String>,
 }
 
+/// What a `propose` did, in terms the caller can check against what it sent.
+///
+/// The identifier alone — what this used to return — cannot tell a change that
+/// was opened from one that was rewritten, and rewriting is the ordinary way to
+/// widen a change's scope (see [`Store::propose`]). `status` matters for the
+/// same reason: a rewrite that moves the capability list sends the change back
+/// to `drafting`, and a caller that believed it was still `specified` would
+/// plan against a spec the store no longer accepts.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProposeReport {
+    pub id: ChangeId,
+    /// Echoed back so a caller addressing changes by slug — which is what the
+    /// MCP layer lets it do — can see the one it now holds.
+    pub slug: String,
+    /// Where the change sits after this call: `drafting` for a new one, and
+    /// for a rewrite whatever it kept or was sent back to.
+    pub status: ChangeStatus,
+    /// Set when this call rewrote a proposal that already stood under this
+    /// slug rather than opening a new change.
+    pub rewritten: bool,
+}
+
 /// What a `specify` wrote, in terms the caller can check against what it sent.
 ///
 /// This is read by a model through MCP, so it names the capability it filed
@@ -208,6 +230,8 @@ impl Store {
     /// that author has no way forward at all. `UNIQUE(change_id, kind)` on
     /// `sdd_artifacts` is what makes the proposal a single row that a rewrite
     /// overwrites; `0007_sdd.sql` explains why no revision history is kept.
+    /// Which of the two happened is on the [`ProposeReport`] this returns —
+    /// the caller cannot see it from the id, which is the same either way.
     ///
     /// # Errors
     ///
@@ -221,7 +245,7 @@ impl Store {
         &self,
         command: &ProposeCommand,
         context: &FactContext,
-    ) -> Result<ChangeId, StoreError> {
+    ) -> Result<ProposeReport, StoreError> {
         command.validate()?;
 
         // Resolved before the writer lock, for the same reason validation is:
@@ -278,7 +302,12 @@ impl Store {
             )?;
             write_proposal(tx, &change_id.to_string(), command, &now)?;
 
-            Ok(change_id)
+            Ok(ProposeReport {
+                id: change_id,
+                slug: command.slug.clone(),
+                status: ChangeStatus::Drafting,
+                rewritten: false,
+            })
         })
     }
 
@@ -686,7 +715,7 @@ fn rewrite_proposal(
     status: ChangeStatus,
     command: &ProposeCommand,
     now: &str,
-) -> Result<ChangeId, StoreError> {
+) -> Result<ProposeReport, StoreError> {
     if !matches!(status, ChangeStatus::Drafting | ChangeStatus::Specified) {
         return Err(StoreError::SlugTaken(command.slug.clone()));
     }
@@ -729,7 +758,12 @@ fn rewrite_proposal(
     )?;
     write_proposal(tx, change_id, command, now)?;
 
-    parse_id(change_id)
+    Ok(ProposeReport {
+        id: parse_id(change_id)?,
+        slug: command.slug.clone(),
+        status,
+        rewritten: true,
+    })
 }
 
 /// The capability paths the change's proposal currently names.

@@ -29,10 +29,13 @@ const INSTRUCTIONS_LIMIT: usize = 2048;
 /// The old "only four tools" constraint was about context cost, and tool
 /// search removed it — only names and server instructions load at session
 /// start — but the set still grows deliberately, one slice at a time.
-const EXPECTED_TOOLS: [&str; 11] = [
+const EXPECTED_TOOLS: [&str; 14] = [
+    "magent_archive",
+    "magent_changes",
     "magent_checkpoint",
     "magent_deps",
     "magent_finish",
+    "magent_plan",
     "magent_propose",
     "magent_recall",
     "magent_remember",
@@ -45,9 +48,11 @@ const EXPECTED_TOOLS: [&str; 11] = [
 
 /// Tools that change state. Each must take an `operation_id` so a retry after a
 /// dropped connection cannot duplicate work.
-const MUTATING_TOOLS: [&str; 6] = [
+const MUTATING_TOOLS: [&str; 8] = [
+    "magent_archive",
     "magent_checkpoint",
     "magent_finish",
+    "magent_plan",
     "magent_propose",
     "magent_remember",
     "magent_specify",
@@ -1388,10 +1393,7 @@ async fn a_proposed_change_can_be_specified() {
         }),
     )
     .await;
-    let change_id = proposed["change_id"]
-        .as_str()
-        .expect("change_id")
-        .to_owned();
+    let change_id = proposed["id"].as_str().expect("id").to_owned();
 
     let specified = call(
         &client,
@@ -1450,6 +1452,267 @@ async fn proposing_without_capabilities_or_skip_specs_says_so() {
     assert!(
         error.contains("missing_capabilities"),
         "expected the stable domain code in: {error}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+// --- plan, archive and reading back ------------------------------------------
+
+/// One proposal, ready to be carried through the rest of the process.
+fn proposal(slug: &str) -> Value {
+    json!({
+        "operation_id": uuid(),
+        "slug": slug,
+        "title": "Add a retry budget",
+        "classification": "bounded",
+        "why": "retries currently loop forever and starve the queue of capacity",
+        "what_changes": ["add a budget type", "wire it into the client"],
+        "capabilities": ["worker/retry"]
+    })
+}
+
+/// One capability's deltas for the change addressed by `change`.
+fn deltas(change: &str) -> Value {
+    json!({
+        "operation_id": uuid(),
+        "change": change,
+        "capability_path": "worker/retry",
+        "purpose": "Retries stop after a configured budget instead of continuing forever, so a failing dependency cannot starve the queue of capacity for other work.",
+        "requirements": [{
+            "op": "added",
+            "name": "budget-caps-retries",
+            "text": "A retry budget caps the number of attempts a worker makes before giving up.",
+            "scenarios": [{
+                "name": "exceeding the budget stops retrying",
+                "when": "a job has already failed budget times",
+                "then": "the worker does not retry it again"
+            }]
+        }]
+    })
+}
+
+/// A plan covering the requirement those deltas propose.
+fn tasks(change: &str) -> Value {
+    json!({
+        "operation_id": uuid(),
+        "change": change,
+        "tasks": [{
+            "number": "1",
+            "title": "cap the attempts in the worker",
+            "verify_command": "cargo test -p worker budget",
+            "expected_output": "test budget_caps_retries ... ok",
+            "covers": ["budget-caps-retries"]
+        }]
+    })
+}
+
+/// Closes every task of the fixture's database, the way executing a plan would
+/// leave them.
+///
+/// Marking a task done is not a verb the server has yet, so the rows are set
+/// directly — the same thing `magent-store`'s own archive tests do, and the
+/// only way to reach `magent_archive` from here at all.
+fn finish_tasks(fixture: &Fixture) {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open the store");
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .expect("busy timeout");
+    connection
+        .execute("UPDATE tasks SET status = 'done'", [])
+        .expect("finish the tasks");
+}
+
+/// Only the fields a plan and an archive are meaningless without. Everything
+/// else about a change — which capabilities it touches, what its tasks cover —
+/// the server reads from the change itself.
+#[tokio::test]
+async fn the_plan_and_archive_schemas_ask_for_only_what_they_need() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    assert_eq!(
+        required_fields(&client, "magent_plan").await,
+        ["change", "operation_id", "tasks"],
+        "magent_plan asks for more or less than it needs"
+    );
+    assert_eq!(
+        required_fields(&client, "magent_archive").await,
+        ["change", "operation_id"],
+        "magent_archive asks for more or less than it needs"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Reading never mutates, so there is nothing for an `operation_id` to make
+/// idempotent — and asking for one would imply the call changes something.
+#[tokio::test]
+async fn reading_changes_takes_no_operation_id() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    assert!(
+        required_fields(&client, "magent_changes").await.is_empty(),
+        "a read takes no required arguments"
+    );
+
+    let tools = client.list_all_tools().await.expect("tools");
+    let changes = tools
+        .iter()
+        .find(|tool| tool.name == "magent_changes")
+        .expect("magent_changes");
+    let properties = changes
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("properties");
+
+    assert!(
+        !properties.contains_key("operation_id"),
+        "magent_changes offers an operation_id, so it looks like it mutates: {:?}",
+        properties.keys().collect::<Vec<_>>()
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// The whole process end to end, addressing the change by the slug its author
+/// chose rather than by an identifier the server issued. A model that has lost
+/// the identifier to a compaction still knows the slug it invented itself.
+#[tokio::test]
+async fn a_change_goes_from_proposal_to_archive_addressed_by_slug() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let proposed = call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    assert_eq!(proposed["slug"].as_str(), Some("add-retry-budget"));
+
+    let specified = call(&client, "magent_specify", deltas("add-retry-budget")).await;
+    assert_eq!(
+        specified["status"].as_str(),
+        Some("specified"),
+        "{specified}"
+    );
+
+    let planned = call(&client, "magent_plan", tasks("add-retry-budget")).await;
+    assert_eq!(planned["tasks"].as_u64(), Some(1), "{planned}");
+    assert_eq!(planned["status"].as_str(), Some("planned"));
+
+    finish_tasks(&fixture);
+
+    let archived = call(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "add-retry-budget" }),
+    )
+    .await;
+    assert_eq!(archived["status"].as_str(), Some("archived"), "{archived}");
+    assert_eq!(archived["added"].as_u64(), Some(1));
+    assert_eq!(
+        archived["capabilities_created"][0].as_str(),
+        Some("worker/retry"),
+        "the archive folded the delta into a capability that did not exist: {archived}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// The gap the dogfooding run found: the process wrote but could not be read
+/// back. Without an argument it says what is open; with one it hands back the
+/// deltas and the tasks filed under that change.
+#[tokio::test]
+async fn changes_lists_what_is_open_and_opens_one_by_slug() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    call(&client, "magent_specify", deltas("add-retry-budget")).await;
+    call(&client, "magent_plan", tasks("add-retry-budget")).await;
+
+    let listed = call(&client, "magent_changes", json!({})).await;
+    let open = listed["open"].as_array().expect("open changes");
+    assert_eq!(open.len(), 1, "{listed}");
+    assert_eq!(open[0]["slug"].as_str(), Some("add-retry-budget"));
+    assert_eq!(open[0]["status"].as_str(), Some("planned"));
+    assert_eq!(
+        listed["change"],
+        Value::Null,
+        "nothing was asked about in particular: {listed}"
+    );
+
+    let opened = call(
+        &client,
+        "magent_changes",
+        json!({ "change": "add-retry-budget" }),
+    )
+    .await;
+    let change = &opened["change"];
+    assert_eq!(change["slug"].as_str(), Some("add-retry-budget"));
+    assert_eq!(
+        change["deltas"][0]["name"].as_str(),
+        Some("budget-caps-retries"),
+        "{opened}"
+    );
+    assert_eq!(
+        change["tasks"][0]["verify_command"].as_str(),
+        Some("cargo test -p worker budget"),
+        "{opened}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// A slug nobody has is a mistake the caller can fix, but only if it is told
+/// what does exist. Sending it away to look for itself is what made the
+/// identifier-only addressing painful in the first place.
+#[tokio::test]
+async fn an_unknown_slug_names_the_open_ones() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(&client, "magent_propose", proposal("add-retry-budget")).await;
+
+    let error = call_expecting_error(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "add-retyr-budget" }),
+    )
+    .await;
+
+    assert!(
+        error.contains("change_not_found"),
+        "expected a stable code in: {error}"
+    );
+    assert!(
+        error.contains("add-retry-budget"),
+        "the refusal has to name what is open: {error}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Proposing the same slug twice rewrites the proposal, and that is the
+/// ordinary way to widen a change's scope. A bare identifier back would leave
+/// the caller unable to tell that from having opened something new.
+#[tokio::test]
+async fn proposing_the_same_slug_again_reports_a_rewrite() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let first = call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    assert_eq!(first["status"].as_str(), Some("drafting"), "{first}");
+    assert_eq!(
+        first["rewritten"].as_bool(),
+        Some(false),
+        "nothing stood under this slug: {first}"
+    );
+
+    let again = call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    assert_eq!(
+        again["rewritten"].as_bool(),
+        Some(true),
+        "a rewrite has to say it rewrote: {again}"
+    );
+    assert_eq!(
+        again["id"].as_str(),
+        first["id"].as_str(),
+        "a rewrite keeps the change it rewrote: {again}"
     );
     client.cancel().await.expect("shutdown");
 }
