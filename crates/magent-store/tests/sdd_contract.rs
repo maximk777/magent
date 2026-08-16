@@ -1172,6 +1172,42 @@ fn a_rewrite_that_changes_the_capabilities_returns_the_change_to_drafting() {
     );
 }
 
+/// The same capabilities in another order are the same contract.
+///
+/// Compared positionally, a proposal restating its own list would read as a
+/// change of scope and cost a re-specification nobody asked for.
+#[test]
+fn a_rewrite_that_only_reorders_the_capabilities_leaves_the_status_alone() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+
+    let mut opening = propose_command("add-retry-budget");
+    opening.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
+    let change = store.propose(&opening, &ctx).expect("propose");
+    store
+        .specify(
+            &specify_command(
+                change,
+                "worker/retry",
+                Some(PURPOSE),
+                vec![added(REQUIREMENT)],
+            ),
+            &ctx,
+        )
+        .expect("specify");
+
+    let mut reordered = propose_command("add-retry-budget");
+    reordered.capabilities = vec!["worker/queue".into(), "worker/retry".into()];
+    store.propose(&reordered, &ctx).expect("rewrite");
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        status, "specified",
+        "the same set in another order is the same contract"
+    );
+}
+
 /// Correcting the prose invalidates nothing.
 #[test]
 fn a_rewrite_that_only_fixes_the_wording_leaves_the_status_alone() {
@@ -2235,5 +2271,229 @@ fn a_delta_that_cannot_be_applied_leaves_no_trace_of_the_ones_before_it() {
     assert_eq!(
         status, "planned",
         "a failed archive does not close the change"
+    );
+}
+
+// --- reading ---------------------------------------------------------------
+
+/// A second workspace, resolved from a different directory the way `context`
+/// resolves the first — so a change filed under one is genuinely invisible to
+/// the other rather than merely asked about with a different label.
+fn other_workspace_context(store: &Store, dir: &std::path::Path) -> FactContext {
+    let project = dir.join("other-project");
+    std::fs::create_dir_all(&project).expect("mkdir");
+    let resolved = store.resolve_workspace_for(&project).expect("resolve");
+    FactContext {
+        workspace_id: Some(resolved.workspace_id),
+        namespace: None,
+        ..FactContext::default()
+    }
+}
+
+#[test]
+fn open_changes_returns_open_changes_freshest_first_and_excludes_archived() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    let older = store
+        .propose(&propose_command("older-change"), &ctx)
+        .expect("propose older");
+    let newer = store
+        .propose(&propose_command("newer-change"), &ctx)
+        .expect("propose newer");
+    let archived = store
+        .propose(&propose_command("archived-change"), &ctx)
+        .expect("propose archived");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET updated_at = ?1 WHERE id = ?2",
+        rusqlite::params!["2026-01-01T00:00:00Z", older.to_string()],
+    )
+    .expect("set older's timestamp");
+    raw.execute(
+        "UPDATE sdd_changes SET updated_at = ?1 WHERE id = ?2",
+        rusqlite::params!["2026-01-02T00:00:00Z", newer.to_string()],
+    )
+    .expect("set newer's timestamp");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'archived', updated_at = ?1 WHERE id = ?2",
+        rusqlite::params!["2026-01-03T00:00:00Z", archived.to_string()],
+    )
+    .expect("archive it, later than either open change");
+
+    let changes = store.open_changes(&ctx).expect("open_changes");
+    let ids: Vec<ChangeId> = changes.iter().map(|change| change.id).collect();
+
+    assert_eq!(
+        ids,
+        vec![newer, older],
+        "freshest first, and the archived change does not appear at all"
+    );
+}
+
+#[test]
+fn open_changes_counts_deltas_and_tasks_correctly() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    store
+        .specify(
+            &specify_command(
+                change,
+                "worker/retry",
+                Some(PURPOSE),
+                vec![added("a spent budget parks the job")],
+            ),
+            &ctx,
+        )
+        .expect("specify one delta");
+    store
+        .specify(
+            &specify_command(
+                change,
+                "worker/retry",
+                Some(PURPOSE),
+                vec![added("the budget is configurable")],
+            ),
+            &ctx,
+        )
+        .expect("specify a second delta");
+
+    store
+        .plan(
+            &plan_command(
+                change,
+                vec![
+                    task("1", &["a spent budget parks the job"]),
+                    task("2", &["the budget is configurable"]),
+                    task("3", &[]),
+                ],
+            ),
+            &ctx,
+        )
+        .expect("plan");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE tasks SET status = 'done' WHERE change_id = ?1 AND number = '1'",
+        [change.to_string()],
+    )
+    .expect("finish one task");
+
+    let changes = store.open_changes(&ctx).expect("open_changes");
+    let summary = changes
+        .into_iter()
+        .find(|change_summary| change_summary.id == change)
+        .expect("the change is in its own workspace's list");
+
+    assert_eq!(summary.delta_count, 2, "two specify calls, two deltas");
+    assert_eq!(summary.task_count, 3, "the plan has three tasks");
+    assert_eq!(
+        summary.tasks_closed, 1,
+        "exactly one of the three tasks is done"
+    );
+}
+
+#[test]
+fn change_detail_reads_the_proposal_deltas_and_tasks() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    store
+        .specify(
+            &specify_command(
+                change,
+                "worker/retry",
+                Some(PURPOSE),
+                vec![added(REQUIREMENT)],
+            ),
+            &ctx,
+        )
+        .expect("specify");
+
+    store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("plan");
+
+    let detail = store
+        .change_detail(change, &ctx)
+        .expect("change_detail")
+        .expect("the change exists in this workspace");
+
+    assert_eq!(detail.id, change);
+    assert_eq!(detail.slug, "add-retry-budget");
+    assert_eq!(
+        detail.why, "Retries currently have no ceiling and can loop forever.",
+        "the proposal body must actually be read back, not left empty"
+    );
+    assert_eq!(
+        detail.capabilities,
+        vec!["worker/retry".to_string()],
+        "the capabilities the proposal declared must be read back too"
+    );
+
+    assert_eq!(detail.deltas.len(), 1);
+    assert_eq!(detail.deltas[0].op, DeltaOp::Added);
+    assert_eq!(detail.deltas[0].name, REQUIREMENT);
+    assert_eq!(detail.deltas[0].capability_path, "worker/retry");
+
+    assert_eq!(detail.tasks.len(), 1);
+    assert_eq!(detail.tasks[0].number, "1");
+    assert_eq!(detail.tasks[0].status, "pending");
+    assert_eq!(detail.tasks[0].verify_command, "cargo test -p worker retry");
+}
+
+#[test]
+fn change_detail_for_an_unknown_change_is_ok_none_not_an_error() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let missing = ChangeId::new();
+
+    let result = store
+        .change_detail(missing, &ctx)
+        .expect("an unknown change must not be an error");
+
+    assert!(
+        result.is_none(),
+        "asking about a change that does not exist is a legitimate question"
+    );
+}
+
+/// A change from another workspace is not "someone else's change" to either
+/// method — it does not exist as far as this workspace is concerned, the same
+/// way `require_open_change` treats it for the write side.
+#[test]
+fn a_change_from_another_workspace_is_invisible_to_open_changes_and_change_detail() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let other_ctx = other_workspace_context(&store, dir.path());
+
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose in the first workspace");
+
+    let changes = store
+        .open_changes(&other_ctx)
+        .expect("open_changes in the other workspace");
+    assert!(
+        changes
+            .iter()
+            .all(|change_summary| change_summary.id != change),
+        "a change from another workspace must not appear in this one's list"
+    );
+
+    let detail = store
+        .change_detail(change, &other_ctx)
+        .expect("change_detail in the other workspace");
+    assert!(
+        detail.is_none(),
+        "a change from another workspace must not be readable through this one"
     );
 }

@@ -6,10 +6,10 @@
 
 use std::collections::HashSet;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use magent_core::{
-    ArchiveCommand, ChangeId, ChangeStatus, DeltaOp, PlanCommand, ProposeCommand, RequirementDraft,
-    SpecifyCommand, Validate,
+    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, ProposeCommand,
+    RequirementDraft, SpecifyCommand, Validate,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::StoreError,
     facts::FactContext,
-    store::{Store, enum_from_sql, enum_to_sql, parse_id},
+    store::{Store, enum_from_sql, enum_to_sql, parse_id, parse_timestamp},
 };
 
 /// What `sdd_artifacts.body_json` holds for a `kind = 'proposal'` row.
@@ -105,6 +105,93 @@ pub struct ArchiveReport {
     /// Where the change now sits — `archived`, since that is what this call
     /// moves it to.
     pub status: ChangeStatus,
+}
+
+/// One change as [`Store::open_changes`] lists it: enough to answer "where
+/// did I leave off" without a query per row.
+///
+/// The counts are read here rather than left for a second call, because that
+/// is exactly the query a caller who only has a list of ids would otherwise
+/// have to run once per change — the loop this module refuses to write
+/// (see `load_deltas`, `require_full_coverage`).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeSummary {
+    pub id: ChangeId,
+    pub slug: String,
+    pub title: String,
+    pub classification: Classification,
+    pub status: ChangeStatus,
+    /// When the change, or anything filed under it, was last touched. What
+    /// [`Store::open_changes`] orders by, freshest first.
+    pub updated_at: DateTime<Utc>,
+    /// How many deltas this change's `specify` calls have written so far.
+    pub delta_count: usize,
+    /// How many tasks its current plan carries — zero before it has one.
+    pub task_count: usize,
+    /// How many of those tasks are `done` or `skipped`. Read against
+    /// `task_count`, this is what says whether execution has finished.
+    pub tasks_closed: usize,
+}
+
+/// One delta as [`Store::change_detail`] shows it.
+///
+/// Only what a caller re-reading its own change needs to see where things
+/// stand: `requirement_id`, `text`, `reason`, `migration` and the scenarios
+/// stay in the database, because a caller asking this question already wrote
+/// them and is not asking for them back.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeltaSummary {
+    pub op: DeltaOp,
+    pub name: String,
+    pub capability_path: String,
+}
+
+/// One task as [`Store::change_detail`] shows it.
+///
+/// `body`, `consumes`/`produces` and the evidence a finished task carries stay
+/// in the database: those are what an agent executing *that* task reads from
+/// its own row, not what a caller asking "where did this change get to" needs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskSummary {
+    pub number: String,
+    pub title: String,
+    /// `pending`, `running`, `done` or `skipped` — `tasks.status`'s own
+    /// values (`0009_tasks.sql`), passed through rather than re-typed as an
+    /// enum `magent-core` does not define for tasks.
+    pub status: String,
+    pub verify_command: String,
+}
+
+/// The full content of one change: [`ChangeSummary`]'s fields, the proposal's
+/// own words, and the deltas and tasks filed under it.
+///
+/// This is what closes the gap `open_changes` cannot: a caller that has lost
+/// everything but a `change_id` — the ordinary state after a context
+/// compaction — reads this once and has the proposal, the specs and the plan
+/// back, in the terms it would have written them in.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ChangeDetail {
+    pub id: ChangeId,
+    pub slug: String,
+    pub title: String,
+    pub classification: Classification,
+    pub status: ChangeStatus,
+    pub updated_at: DateTime<Utc>,
+    pub delta_count: usize,
+    pub task_count: usize,
+    pub tasks_closed: usize,
+    /// Why this change is being made, in the proposal's own words.
+    pub why: String,
+    pub what_changes: Vec<String>,
+    /// The capabilities the proposal declared — the contract every `specify`
+    /// call on this change was checked against.
+    pub capabilities: Vec<String>,
+    pub impact: Option<String>,
+    /// Every delta this change has specified, in the order [`Store::archive`]
+    /// would apply them.
+    pub deltas: Vec<DeltaSummary>,
+    /// Every task of its current plan, in task-number order.
+    pub tasks: Vec<TaskSummary>,
 }
 
 impl Store {
@@ -459,6 +546,128 @@ impl Store {
     }
 }
 
+/// The `sdd_changes` columns behind [`ChangeSummary`], plus its counts —
+/// shared by [`Store::open_changes`] and [`Store::change_detail`] so the two
+/// cannot drift into showing a different shape of the same row.
+///
+/// The counts are correlated subqueries rather than a join: a join fanning
+/// out over a change's deltas and its tasks at once would multiply the two
+/// counts together, so getting the right numbers back out would mean
+/// `COUNT(DISTINCT ...)` on both — no cheaper to read than two subqueries,
+/// and easier to get wrong.
+const CHANGE_SUMMARY_COLUMNS: &str = "
+    id, slug, title, classification, status, updated_at,
+    (SELECT COUNT(*) FROM spec_deltas WHERE spec_deltas.change_id = sdd_changes.id),
+    (SELECT COUNT(*) FROM tasks WHERE tasks.change_id = sdd_changes.id),
+    (SELECT COUNT(*) FROM tasks
+      WHERE tasks.change_id = sdd_changes.id AND tasks.status IN ('done', 'skipped'))";
+
+impl Store {
+    // --- reading -------------------------------------------------------
+
+    /// Open changes of this workspace and namespace, most recently touched
+    /// first.
+    ///
+    /// "Open" excludes `archived` and `abandoned`: those are done, and the
+    /// question this answers — "where did I leave off" — is about work still
+    /// in flight. Read-only and does not go through `execute_operation`:
+    /// nothing here mutates, so there is nothing for an `operation_id` to
+    /// make idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoWorkspace`] when the context names no
+    /// workspace, or a database error.
+    pub fn open_changes(&self, context: &FactContext) -> Result<Vec<ChangeSummary>, StoreError> {
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        let connection = self.lock()?;
+        let sql = format!(
+            "SELECT {CHANGE_SUMMARY_COLUMNS} FROM sdd_changes
+             WHERE workspace_id = ?1 AND namespace IS ?2
+               AND status NOT IN ('archived', 'abandoned')
+             ORDER BY updated_at DESC"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![workspace_id.to_string(), context.namespace.as_deref()],
+                row_to_change_summary_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(ChangeSummaryRow::into_summary)
+            .collect()
+    }
+
+    /// The full content of one change, or `None` if this workspace has none
+    /// by that id.
+    ///
+    /// `None` rather than an error: a caller that has lost every other detail
+    /// of a change and is asking about the id it still has is asking a
+    /// legitimate question, and answering it with a refusal would read as a
+    /// fault in the store rather than as "not this one." An id from another
+    /// workspace is answered the same way `require_open_change` answers it
+    /// for the write side: it does not exist as far as this workspace is
+    /// concerned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoWorkspace`] when the context names no
+    /// workspace, or a database error.
+    pub fn change_detail(
+        &self,
+        change: ChangeId,
+        context: &FactContext,
+    ) -> Result<Option<ChangeDetail>, StoreError> {
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+
+        let sql = format!(
+            "SELECT {CHANGE_SUMMARY_COLUMNS} FROM sdd_changes WHERE id = ?1 AND workspace_id = ?2"
+        );
+        let row = tx
+            .query_row(
+                &sql,
+                rusqlite::params![change.to_string(), workspace_id.to_string()],
+                row_to_change_summary_row,
+            )
+            .optional()?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let summary = row.into_summary()?;
+
+        let change_id = change.to_string();
+        let proposal = load_proposal_document(&tx, &change_id)?;
+        let deltas = load_delta_summaries(&tx, &change_id)?;
+        let tasks = load_task_summaries(&tx, &change_id)?;
+        drop(tx);
+
+        Ok(Some(ChangeDetail {
+            id: summary.id,
+            slug: summary.slug,
+            title: summary.title,
+            classification: summary.classification,
+            status: summary.status,
+            updated_at: summary.updated_at,
+            delta_count: summary.delta_count,
+            task_count: summary.task_count,
+            tasks_closed: summary.tasks_closed,
+            why: proposal.why,
+            what_changes: proposal.what_changes,
+            capabilities: proposal.capabilities,
+            impact: proposal.impact,
+            deltas,
+            tasks,
+        }))
+    }
+}
+
 /// Rewrites the proposal of the change the slug already names, and hands back
 /// its id so a rewrite is indistinguishable from the first call to the caller.
 ///
@@ -483,12 +692,23 @@ fn rewrite_proposal(
     }
     require_no_stranded_deltas(tx, change_id, command)?;
 
+    let declared_capabilities_owned = declared_capabilities(tx, change_id)?;
+
     // A rewrite that moves the capability list moves the contract the specs
     // were written against, so the change goes back to `drafting` and has to
     // be specified again — the same reasoning that pulls a `planned` change
     // back to `specified` when its spec changes. Correcting a title or a
     // rationale invalidates nothing and leaves the status alone.
-    let status = if declared_capabilities(tx, change_id)? == command.capabilities {
+    // Compared as sets: a proposal that lists the same capabilities in another
+    // order restates the contract rather than moving it, and sending the
+    // change back to `drafting` for that would cost a re-specification nobody
+    // asked for. `require_no_stranded_deltas` below compares the same way.
+    let declared: HashSet<&str> = declared_capabilities_owned
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let offered: HashSet<&str> = command.capabilities.iter().map(String::as_str).collect();
+    let status = if declared == offered {
         status
     } else {
         ChangeStatus::Drafting
@@ -1326,4 +1546,173 @@ fn write_delta(
     }
 
     Ok(())
+}
+
+// --- reading -----------------------------------------------------------
+
+/// One row of [`CHANGE_SUMMARY_COLUMNS`], read with named fields the way
+/// `facts.rs`'s `row_to_parts` reads a fact: `classification` and `status`
+/// are adjacent columns of the same type, and `task_count` and
+/// `tasks_closed` are adjacent columns of another — exactly the kind of pair
+/// a reordered `SELECT` could swap silently if this were a positional tuple.
+struct ChangeSummaryRow {
+    id: String,
+    slug: String,
+    title: String,
+    classification: String,
+    status: String,
+    updated_at: String,
+    delta_count: i64,
+    task_count: i64,
+    tasks_closed: i64,
+}
+
+impl ChangeSummaryRow {
+    fn into_summary(self) -> Result<ChangeSummary, StoreError> {
+        Ok(ChangeSummary {
+            id: parse_id(&self.id)?,
+            slug: self.slug,
+            title: self.title,
+            classification: enum_from_sql(&self.classification)?,
+            status: enum_from_sql(&self.status)?,
+            updated_at: parse_timestamp(&self.updated_at)?,
+            delta_count: count_to_usize(self.delta_count),
+            task_count: count_to_usize(self.task_count),
+            tasks_closed: count_to_usize(self.tasks_closed),
+        })
+    }
+}
+
+fn row_to_change_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChangeSummaryRow> {
+    Ok(ChangeSummaryRow {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        title: row.get(2)?,
+        classification: row.get(3)?,
+        status: row.get(4)?,
+        updated_at: row.get(5)?,
+        delta_count: row.get(6)?,
+        task_count: row.get(7)?,
+        tasks_closed: row.get(8)?,
+    })
+}
+
+/// `COUNT(*)` never returns a negative number, so the only way this loses
+/// information is on a database holding more rows than fit in a `usize` —
+/// not a change this store will ever see.
+fn count_to_usize(count: i64) -> usize {
+    usize::try_from(count).unwrap_or(0)
+}
+
+/// What `sdd_artifacts.body_json` holds for a `kind = 'proposal'` row, read
+/// back rather than written — the owned counterpart to [`ProposalBody`],
+/// which borrows and so cannot outlive the query that built it.
+#[derive(Deserialize)]
+struct ProposalDocument {
+    why: String,
+    #[serde(default)]
+    what_changes: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    impact: Option<String>,
+}
+
+/// The change's proposal document, parsed.
+///
+/// Unlike [`declared_capabilities`], which treats a missing row as
+/// legitimate for a rewrite in progress, this is only ever called after
+/// [`Store::change_detail`] has already confirmed the change exists — and
+/// `Store::propose` writes a change and its proposal in one transaction, so a
+/// change with no proposal row is not reachable here.
+fn load_proposal_document(
+    tx: &Transaction<'_>,
+    change_id: &str,
+) -> Result<ProposalDocument, StoreError> {
+    let body_json: String = tx.query_row(
+        "SELECT body_json FROM sdd_artifacts WHERE change_id = ?1 AND kind = 'proposal'",
+        [change_id],
+        |row| row.get(0),
+    )?;
+
+    Ok(serde_json::from_str(&body_json)?)
+}
+
+/// One row of `spec_deltas`, as [`Store::change_detail`] shows it.
+struct DeltaSummaryRow {
+    op: String,
+    name: String,
+    capability_path: String,
+}
+
+/// The change's deltas, oldest first — the same ordering [`load_deltas`]
+/// uses for archiving, so a caller reading a change mid-flight sees them in
+/// the order they will eventually be applied.
+fn load_delta_summaries(
+    tx: &Transaction<'_>,
+    change_id: &str,
+) -> Result<Vec<DeltaSummary>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT op, name, capability_path FROM spec_deltas
+         WHERE change_id = ?1 ORDER BY created_at, name",
+    )?;
+    let rows = statement
+        .query_map([change_id], |row| {
+            Ok(DeltaSummaryRow {
+                op: row.get(0)?,
+                name: row.get(1)?,
+                capability_path: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(DeltaSummary {
+                op: enum_from_sql(&row.op)?,
+                name: row.name,
+                capability_path: row.capability_path,
+            })
+        })
+        .collect()
+}
+
+/// One row of `tasks`, as [`Store::change_detail`] shows it.
+struct TaskSummaryRow {
+    number: String,
+    title: String,
+    status: String,
+    verify_command: String,
+}
+
+/// The change's tasks, in task-number order — the same ordering
+/// `require_tasks_closed` reads them in.
+fn load_task_summaries(
+    tx: &Transaction<'_>,
+    change_id: &str,
+) -> Result<Vec<TaskSummary>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT number, title, status, verify_command FROM tasks
+         WHERE change_id = ?1 ORDER BY number",
+    )?;
+    let rows = statement
+        .query_map([change_id], |row| {
+            Ok(TaskSummaryRow {
+                number: row.get(0)?,
+                title: row.get(1)?,
+                status: row.get(2)?,
+                verify_command: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| TaskSummary {
+            number: row.number,
+            title: row.title,
+            status: row.status,
+            verify_command: row.verify_command,
+        })
+        .collect())
 }
