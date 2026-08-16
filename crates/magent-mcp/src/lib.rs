@@ -364,9 +364,17 @@ impl MagentMcp {
     /// directory, so a caller reaching `Err` here has a real failure to act
     /// on, not an unregistered workspace — swallowing it into
     /// `workspace_id: None` would report the latter and hide the former.
-    fn fact_context(&self) -> Result<FactContext, StoreError> {
+    /// The error comes back already rendered. Every caller is a tool body
+    /// that would render it the same way, and there is only one failure to
+    /// render; four copies of that decision is four places for the fifth to
+    /// diverge.
+    fn fact_context(&self) -> Result<FactContext, String> {
         let root = &self.workspace_roots[0];
-        let workspace_id = self.store.resolve_workspace_for(root)?.workspace_id;
+        let workspace_id = self
+            .store
+            .resolve_workspace_for(root)
+            .map_err(|error| render_error(&error))?
+            .workspace_id;
         Ok(FactContext {
             workspace_id: Some(workspace_id),
             run_id: None,
@@ -571,7 +579,7 @@ impl MagentMcp {
         &self,
         Parameters(input): Parameters<RecallToolInput>,
     ) -> Result<String, String> {
-        let context = self.fact_context().map_err(|error| render_error(&error))?;
+        let context = self.fact_context()?;
         let fact = self
             .store
             .recall(&input.name, &context)
@@ -587,7 +595,7 @@ impl MagentMcp {
         &self,
         Parameters(command): Parameters<RememberCommand>,
     ) -> Result<String, String> {
-        let context = self.fact_context().map_err(|error| render_error(&error))?;
+        let context = self.fact_context()?;
         let fact_id = self
             .store
             .remember(&command, &context)
@@ -774,7 +782,7 @@ impl MagentMcp {
             skip_specs: input.skip_specs,
         };
 
-        let context = self.fact_context().map_err(|error| render_error(&error))?;
+        let context = self.fact_context()?;
         let change_id = self
             .store
             .propose(&command, &context)
@@ -783,6 +791,13 @@ impl MagentMcp {
         render(&serde_json::json!({ "change_id": change_id }))
     }
 
+    /// Takes the domain command directly, where `magent_propose` needed a
+    /// wrapper. The rule behind both, for whoever adds the next tool: wrap
+    /// only when a field the domain layer wants to refuse would otherwise be
+    /// refused earlier, by the schema, in words the caller cannot act on.
+    /// Here nothing qualifies — `purpose` already carries `#[serde(default)]`
+    /// and every other field is genuinely required — so a wrapper would add a
+    /// second place to forget a field and buy nothing.
     #[tool(
         description = "Attach one capability's requirement deltas to an open change proposed with magent_propose, moving it to specified. Call again for another capability, or to add more requirements to the same one; nothing already attached is replaced. purpose is required only when the capability is new."
     )]
@@ -790,7 +805,7 @@ impl MagentMcp {
         &self,
         Parameters(command): Parameters<SpecifyCommand>,
     ) -> Result<String, String> {
-        let context = self.fact_context().map_err(|error| render_error(&error))?;
+        let context = self.fact_context()?;
         let report = self
             .store
             .specify(&command, &context)
