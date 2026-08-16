@@ -64,29 +64,43 @@ personal memory, and it is not the daemon this design deliberately does
 without: it opens the same file every hook opens, holds nothing, and can be
 closed at any moment.
 
-Spec-driven work, with the run pointing at the step.
+Spec-driven work: superpowers' process, OpenSpec's artifacts, Magent's thread.
 
-Three skills: `sdd-brainstorm` turns a want into
-`openspec/changes/<id>/proposal.md` and refuses to propose before the problem is
-stated; `sdd-plan` turns an agreed proposal into `tasks.md` where every task
-carries its own verification; `sdd-execute` works the list one task at a time
-and will not tick a box whose check has not run.
+The three parts are deliberately borrowed rather than invented, because both
+sources encode practice that is expensive to rediscover.
 
-The files are the source of truth and Magent never copies them. What it holds
-is a reference — which change, which task, right now — because that is the one
-thing a plan on disk cannot say about the session executing it. After a
-compaction the restored context reads:
+**OpenSpec owns the artifacts.** `openspec new change`, `openspec instructions`,
+`openspec validate`, `openspec archive` — the skills call the CLI rather than
+hand-rolling directories that then drift from what it expects. The archive step
+is the reason it is worth using at all: a completed change's ADDED, MODIFIED
+and REMOVED requirements merge into `openspec/specs/`, which becomes what is
+currently true for the next change.
+
+**superpowers owns the process.** The hard gate before any code. One question
+per message rather than a form. "Too simple to need a design" named as the
+anti-pattern it is. Steps sized at two to five minutes — write the failing
+test, watch it fail for the right reason, make it pass, commit. An explicit
+list of plan failures: no "TBD", no "add error handling", no "similar to task
+N". A fresh subagent per task with two-stage review, spec compliance before
+code quality, and a status protocol that lets an implementer say it is stuck.
+
+**Magent owns the thread between sessions.** Memory is searched before the user
+is asked, because much of what would be asked has been settled already. And the
+run points at the task, which is the one thing neither files nor subagents can
+supply:
 
 ```
 Task: make retries bounded
 Change: add-retry-budget
-On task: 3: bound the retries
+On task: 1.2 Implement RetryBudget
 Spec: openspec/changes/add-retry-budget/tasks.md
 ```
 
-rather than only the prompt that opened the run. The binding rides on
-`magent_checkpoint`, which already happens at task boundaries; set the change
-once and later checkpoints need only `current_task`.
+Three skills — `sdd-brainstorm`, `sdd-plan`, `sdd-execute` — and three
+subagents the last one dispatches: `sdd-implementer`, `sdd-spec-reviewer`,
+`sdd-code-reviewer`. The spec reviewer is told not to trust the implementer's
+report and to read the code itself, which is where optimistic reports get
+caught.
 
 Languages, as a second plugin.
 

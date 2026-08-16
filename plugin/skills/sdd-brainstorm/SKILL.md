@@ -1,79 +1,106 @@
 ---
 name: sdd-brainstorm
-description: Use at the start of any non-trivial change, before writing code — when the user describes something they want built, changed or fixed and the shape of the answer is not yet obvious. Turns a want into a written proposal, and refuses to propose a solution before the problem is stated.
+description: "You MUST use this before any implementation work — building a feature, changing behaviour, adding functionality — including work that looks too simple to need it. Turns an idea into an agreed OpenSpec proposal through one-question-at-a-time dialogue, and refuses to write code until the design is approved."
 ---
 
 # Brainstorm a change
 
-The output is `openspec/changes/<change-id>/proposal.md`. The point is not the
-file — it is that the thinking happens before the typing, and survives the
-session that did it.
+Turn an idea into a design, in dialogue, and land it as an OpenSpec change.
 
-## Before asking anything, look
+This is the process from `superpowers:brainstorming` with two things added: the
+artifacts are OpenSpec's rather than hand-rolled, and Magent's memory is
+consulted before the user is.
 
+<HARD-GATE>
+Do NOT write code, scaffold anything, or invoke an implementation skill until
+you have presented a design and the user has approved it. This applies to every
+change regardless of how simple it looks.
+</HARD-GATE>
+
+## Anti-pattern: "this is too simple to need a design"
+
+Every change goes through this. A config flag, a one-function utility, a copy
+fix. Simple changes are where unexamined assumptions cost the most, because
+nobody looks twice. The design may be three sentences — but it is presented and
+approved.
+
+## The order
+
+1. **Ask memory before asking the user.**
+
+   ```
+   magent_search "<the subject, in the user's words>"
+   ```
+
+   Much of what you are about to ask has been settled already: which service
+   owns this, why the obvious approach was rejected last time, what the deploy
+   constraint is. Asking again is worse than not asking — it spends the
+   person's patience on something they already told you.
+
+   Then read the project's own constraints: `openspec/project.md` if it exists,
+   and `openspec/specs/` for what is currently true. Run `openspec list --specs`
+   to see the domains.
+
+2. **Explore the code.** Files, recent commits, the shape of what is there.
+
+3. **Scope check.** If the request is several independent subsystems, say so
+   now. Do not refine the details of something that needs decomposing first;
+   help split it, then brainstorm the first piece.
+
+4. **Ask clarifying questions — one at a time.**
+
+   One question per message. Not a form, not a batch. Prefer multiple choice
+   where it fits. You are after purpose, constraints, and what counts as done.
+
+5. **Propose 2-3 approaches.** With trade-offs, leading with your
+   recommendation and why. One real option plus two strawmen is a decision
+   already made wearing a costume.
+
+6. **Present the design in sections,** each scaled to its complexity, asking
+   after each whether it holds so far. Cover architecture, the units and their
+   boundaries, data flow, failure handling, and how it will be tested.
+
+## Then write the change
+
+Let OpenSpec own the layout — it has a CLI, and hand-rolled directories drift
+from what `openspec validate` and `openspec archive` expect:
+
+```bash
+openspec new change <change-id>          # verb-first kebab-case: add-retry-budget
+openspec instructions proposal --change <change-id>
 ```
-magent_search "<the subject, in the user's words>"
+
+Follow those instructions rather than a template remembered from somewhere.
+Fill in `proposal.md` (intent, scope in and out, approach), the delta specs
+under `changes/<change-id>/specs/<domain>/spec.md` as ADDED / MODIFIED /
+REMOVED requirements with GIVEN/WHEN/THEN scenarios, and `design.md` when the
+technical approach needs argument rather than statement.
+
+```bash
+openspec validate <change-id>
 ```
 
-Much of what you are about to ask has been established already: which service
-owns this, why the obvious approach was rejected last time, what the deploy
-constraint is. Asking again is worse than not asking, because it spends the
-person's patience on something you were told.
+## Self-review, then hand it to the user
 
-## Then ask, and do not skip this
+Read what you wrote with fresh eyes:
 
-Do not propose yet. State the problem first, in the user's terms:
+1. **Placeholders** — any TBD, TODO, or vague requirement? Fix them.
+2. **Consistency** — do sections contradict each other?
+3. **Scope** — is this one change, or several wearing one name?
+4. **Ambiguity** — could a requirement be read two ways? Pick one, say it.
 
-- Who has this problem, and what do they do today instead?
-- What would count as solved? What observable thing changes?
-- What has been tried? Why did it not stick?
-- What must not break? Which constraint is real and which is habit?
+Fix inline. Then stop and ask:
 
-Ask the two or three of these that you cannot answer from the code and memory.
-Not all of them, and not as a form.
+> Proposal written to `openspec/changes/<id>/`. Please review it before we plan
+> the implementation.
 
-## Explore, honestly
+Wait. If they want changes, make them and re-review.
 
-Write down at least two approaches that a competent person could actually
-choose between. One real option and two strawmen is not exploration — it is a
-decision already made, dressed up.
+## The terminal state
 
-For each: what it costs, what it forecloses, and what would make you pick it.
-If after that one is clearly right, say so and say why; a proposal that refuses
-to recommend is work handed back.
+The only skill you invoke next is `sdd-plan`. Not an implementation skill, not
+a language skill, not "just this one small thing first".
 
-## Write the proposal
-
-`openspec/changes/<change-id>/proposal.md`, where the id is kebab-case and
-verb-first: `add-retry-budget`, `split-ledger-writes`. Not `retry`, which names
-a topic rather than a change.
-
-```markdown
-# <change-id>
-
-## Why
-The problem, in the terms the person used. Not the solution restated as a
-problem.
-
-## What changes
-The approach chosen, in enough detail to disagree with.
-
-## Alternatives
-What else was considered and why it lost. This is the part that stops the
-question being reopened in three weeks.
-
-## Not doing
-The neighbouring things this deliberately leaves alone.
-
-## How we will know
-What is observably different when this is done.
-```
-
-## Then stop
-
-Do not start planning tasks in the same breath. The proposal is a thing to
-agree on first; `sdd-plan` turns an agreed one into work.
-
-Record what you established with `magent_remember` — a constraint discovered, a
-rejected approach and why. The next change in this area should not rediscover
-it.
+Before moving on, record what you established with `magent_remember`, citing
+the file or conversation that settled it: a constraint discovered, an approach
+rejected and why. The next change in this area should not rediscover it.

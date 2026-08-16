@@ -92,6 +92,23 @@ for skill in sdd-brainstorm sdd-plan sdd-execute; do
   fi
 done
 
+# The subagents sdd-execute dispatches have to exist, and to name themselves:
+# without a name in the frontmatter the directory name is used, and dispatching
+# by a name nothing answers to fails at the moment it is needed.
+for agent in sdd-implementer sdd-spec-reviewer sdd-code-reviewer; do
+  path="plugin/agents/$agent.md"
+  if [ ! -f "$path" ]; then
+    fail "$path is missing"
+  elif ! "$git" ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+    fail "$path exists but is not tracked; a clone would not get it"
+  elif ! head -5 "$path" | grep -q "^name: $agent\$"; then
+    fail "$path does not name itself $agent"
+  fi
+  if ! grep -q "$agent" plugin/skills/sdd-execute/SKILL.md; then
+    fail "sdd-execute never dispatches $agent, so it ships unused"
+  fi
+done
+
 # sdd-execute is the only place that tells the model how to bind a run to a
 # task. If the field names drift, the skill teaches a call that fails.
 if [ -f plugin/skills/sdd-execute/SKILL.md ]; then
