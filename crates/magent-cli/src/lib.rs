@@ -11,3 +11,4 @@ pub mod hook;
 pub mod import;
 pub mod packet;
 pub mod paths;
+pub mod update;

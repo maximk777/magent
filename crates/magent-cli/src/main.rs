@@ -150,6 +150,18 @@ enum Command {
         state_dir: Option<std::path::PathBuf>,
     },
 
+    /// Pull a newer Magent into the checkout this one was built from.
+    Update {
+        /// The checkout to update. Defaults to where this binary was built.
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+
+        /// Update the sources without rebuilding. Enough when only skills,
+        /// hooks or manifests changed, since those are read as files.
+        #[arg(long, default_value_t = false)]
+        no_build: bool,
+    },
+
     /// Report what is wrong, and what to do about it.
     Doctor {
         /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
@@ -185,6 +197,7 @@ fn main() {
             state_dir,
         } => run_import(memory_dir, codex_rollouts, state_dir),
         Command::Deps { action, state_dir } => run_deps(action, state_dir),
+        Command::Update { from, no_build } => run_update(from, !no_build),
         Command::Doctor { state_dir } => run_doctor(state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
     }
@@ -728,6 +741,22 @@ fn deps_remove(
 /// Commits are cited by their first seven characters everywhere else.
 fn short(revision: &str) -> String {
     revision.chars().take(7).collect()
+}
+
+/// Pulls and reinstalls, exiting non-zero when nothing was done and the reason
+/// is a problem rather than "already current".
+fn run_update(from: Option<std::path::PathBuf>, build: bool) {
+    let mut out = String::new();
+    let updated = magent_cli::update::run(from, build, &mut out);
+
+    if updated {
+        print!("{out}");
+    } else {
+        // To stderr: a failure someone piped into a log should not read as a
+        // successful report.
+        let _ = write!(std::io::stderr(), "{out}");
+        std::process::exit(1);
+    }
 }
 
 /// Prints the diagnostic, exiting non-zero only when something is genuinely

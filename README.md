@@ -122,8 +122,19 @@ one crate and still says ok, that `npm install` in a pnpm repository rewrites
 declares first, and records what it establishes through `magent_remember`.
 
 ```bash
+magent update      # pull, rebuild, reinstall
 magent doctor
 ```
+
+`magent update` brings the checkout the plugin is served from up to date and
+reinstalls the binary. It refuses on anything uncommitted and refuses to merge
+a diverged branch: it runs `git pull` in a directory someone may have edited,
+and a fast-forward that silently discarded a change would be far worse than
+never updating. `--no-build` pulls the sources only, which is enough when a
+skill, a hook or a manifest changed, since those are read as files.
+
+Restart Claude Code afterwards — the binary and the skills are read at session
+start.
 
 Reports which language servers this repository's toolchain wants and whether
 they are installed, along with the profile it opened, its schema version, and
