@@ -1,9 +1,20 @@
 ---
 name: sdd-plan
 description: Use when a proposal is agreed and before touching code, to turn it into an OpenSpec task list. Write it for an engineer who is skilled but knows nothing about this codebase — every step names its files, its command, and its expected output.
+argument-hint: "[change-id]"
+allowed-tools: Bash(openspec list:*)
 ---
 
 # Plan the work
+
+**Change:** $ARGUMENTS
+
+Changes available:
+
+!`command -v openspec >/dev/null 2>&1 || { echo "openspec is not installed: npm install -g @fission-ai/openspec"; exit 0; }; [ -d openspec ] || { echo "this repository has no openspec/ yet: openspec init --tools claude"; exit 0; }; openspec list 2>&1`
+
+If no change was named and exactly one is open, that is the one. If several
+are, ask which — planning the wrong one is an hour nobody gets back.
 
 The output is `openspec/changes/<change-id>/tasks.md`.
 

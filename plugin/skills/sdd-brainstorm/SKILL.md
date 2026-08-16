@@ -1,9 +1,24 @@
 ---
 name: sdd-brainstorm
 description: "You MUST use this before any implementation work — building a feature, changing behaviour, adding functionality — including work that looks too simple to need it. Turns an idea into an agreed OpenSpec proposal through one-question-at-a-time dialogue, and refuses to write code until the design is approved."
+argument-hint: "[what you want to build or change]"
+allowed-tools: Bash(openspec list:*)
 ---
 
 # Brainstorm a change
+
+**Subject:** $ARGUMENTS
+
+If that is empty, ask what they want to build before anything else — but ask it
+as the first of the one-at-a-time questions below, not as a form.
+
+Already in flight here:
+
+!`command -v openspec >/dev/null 2>&1 || { echo "openspec is not installed: npm install -g @fission-ai/openspec"; exit 0; }; [ -d openspec ] || { echo "this repository has no openspec/ yet: openspec init --tools claude"; exit 0; }; openspec list 2>&1`
+
+Read that before proposing anything. A change already open for this area is
+either the thing being asked for, or a conflict worth naming now rather than at
+merge time.
 
 Turn an idea into a design, in dialogue, and land it as an OpenSpec change.
 

@@ -103,7 +103,49 @@ pub fn report(state_dir: &Path, here: &Path, out: &mut String) -> bool {
     }
 
     report_toolchain(here, out);
+    report_workflow(here, out);
     healthy
+}
+
+/// The `openspec` CLI, and whether this repository uses it.
+///
+/// The SDD skills this plugin ships call it for every artifact they produce.
+/// Shipping skills that depend on a binary and never mentioning it leaves the
+/// person to discover the dependency from a command that failed halfway
+/// through a proposal.
+///
+/// Two separate states, because they fail differently: not having the tool is
+/// "install something", and having it in a repository that has never run
+/// `openspec init` is "start one here".
+fn report_workflow(here: &Path, out: &mut String) {
+    let installed = on_path("openspec");
+    let root = magent_store::repository_root(here).unwrap_or_else(|| here.to_path_buf());
+    let initialised = root.join("openspec").is_dir();
+
+    if installed && initialised {
+        return;
+    }
+
+    let _ = writeln!(out, "\nspec-driven work");
+
+    if installed {
+        let _ = writeln!(out, "  openspec                 installed");
+    } else {
+        let _ = writeln!(out, "  openspec                 MISSING");
+        let _ = writeln!(out, "  {:<24}   npm install -g @fission-ai/openspec", "");
+        let _ = writeln!(
+            out,
+            "  {:<24}   the sdd-brainstorm, sdd-plan and sdd-execute skills call it",
+            ""
+        );
+    }
+
+    if !initialised {
+        let _ = writeln!(out, "  this repository          not set up for specs");
+        // --tools is not optional: a bare `openspec init` exits with a list
+        // of thirty editor names and creates nothing.
+        let _ = writeln!(out, "  {:<24}   openspec init --tools claude", "");
+    }
 }
 
 fn report_workspace(store: &Store, here: &Path, out: &mut String) {

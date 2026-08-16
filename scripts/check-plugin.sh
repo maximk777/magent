@@ -109,6 +109,28 @@ for agent in sdd-implementer sdd-spec-reviewer sdd-code-reviewer; do
   fi
 done
 
+# The SDD skills are invoked as commands with a subject or a change id. Without
+# the placeholder the argument still arrives, but appended as raw text rather
+# than in a place the skill can frame.
+for skill in sdd-brainstorm sdd-plan sdd-execute; do
+  path="plugin/skills/$skill/SKILL.md"
+  [ -f "$path" ] || continue
+  grep -q 'argument-hint:' "$path" || fail "$path has no argument-hint, so /$skill autocompletes with no clue what to type"
+  grep -q '\$ARGUMENTS' "$path" || fail "$path never places \$ARGUMENTS, so an argument arrives unframed"
+done
+
+# A bare `openspec init` exits with a list of thirty editor names and creates
+# nothing. Any place that prints it as a suggestion has to print the working
+# form, or the person follows a hint that fails.
+# Comment lines are excluded: explaining why the bare form fails is not
+# suggesting it, and a check that cannot tell the difference gets disabled.
+for path in plugin/skills/sdd-*/SKILL.md crates/magent-cli/src/doctor.rs; do
+  [ -f "$path" ] || continue
+  if grep -v '^[[:space:]]*//' "$path" | grep 'openspec init' | grep -qv -- '--tools'; then
+    fail "$path suggests a bare 'openspec init', which fails; use 'openspec init --tools claude'"
+  fi
+done
+
 # sdd-execute is the only place that tells the model how to bind a run to a
 # task. If the field names drift, the skill teaches a call that fails.
 if [ -f plugin/skills/sdd-execute/SKILL.md ]; then

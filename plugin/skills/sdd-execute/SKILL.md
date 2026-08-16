@@ -1,9 +1,21 @@
 ---
 name: sdd-execute
 description: Use when working through an agreed OpenSpec task list. Runs tasks one at a time — inline or by dispatching a fresh subagent per task with two-stage review — keeps the Magent run bound to the task in hand so a compaction resumes at the right step, and refuses to tick a box whose verification has not run.
+argument-hint: "[change-id]"
+allowed-tools: Bash(openspec list:*), Bash(openspec status:*)
 ---
 
 # Execute the plan
+
+**Change:** $ARGUMENTS
+
+Where things stand:
+
+!`command -v openspec >/dev/null 2>&1 || { echo "openspec is not installed: npm install -g @fission-ai/openspec"; exit 0; }; [ -d openspec ] || { echo "this repository has no openspec/ yet: openspec init --tools claude"; exit 0; }; openspec list 2>&1`
+
+Before the first task, call `magent_status`. If a run is already bound to a
+change, that is what is being resumed — pick up at its `current_task` rather
+than starting the list again.
 
 Read `openspec/changes/<change-id>/tasks.md` once, extract every task with its
 full text, and hold them. Then work them in order.
