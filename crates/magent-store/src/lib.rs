@@ -12,6 +12,7 @@ mod facts;
 mod git;
 mod grouping;
 mod migrations;
+mod sdd;
 mod sessions;
 mod setup;
 mod store;

@@ -36,6 +36,12 @@ pub enum StoreError {
 
     #[error("dependency {0} does not exist")]
     DependencyNotFound(DependencyId),
+
+    /// The unique index on live slugs (`sdd_changes_live_slug`) would catch
+    /// this too, but "UNIQUE constraint failed" does not tell a caller what
+    /// to do about it. Checked explicitly so the message does.
+    #[error("slug {0:?} is already in use by a change in flight")]
+    SlugTaken(String),
 }
 
 impl StoreError {
@@ -53,6 +59,7 @@ impl StoreError {
             Self::UnsupportedSchema(_) => "unsupported_schema",
             Self::NoOpenRun => "no_open_run",
             Self::DependencyNotFound(_) => "dependency_not_found",
+            Self::SlugTaken(_) => "slug_taken",
         }
     }
 }
