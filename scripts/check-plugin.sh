@@ -79,6 +79,32 @@ for manifest in plugin/hooks/hooks.json plugin/.mcp.json; do
   fi
 done
 
+# --- the workflow skills ----------------------------------------------------
+
+for skill in sdd-brainstorm sdd-plan sdd-execute; do
+  path="plugin/skills/$skill/SKILL.md"
+  if [ ! -f "$path" ]; then
+    fail "$path is missing"
+  elif ! "$git" ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+    fail "$path exists but is not tracked; a clone would not get it"
+  elif ! head -5 "$path" | grep -q "^name: $skill\$"; then
+    fail "$path does not name itself $skill; without it the directory name is used, and that changes on a marketplace update"
+  fi
+done
+
+# sdd-execute is the only place that tells the model how to bind a run to a
+# task. If the field names drift, the skill teaches a call that fails.
+if [ -f plugin/skills/sdd-execute/SKILL.md ]; then
+  for field in spec_change_id spec_paths current_task; do
+    if ! grep -q "$field" plugin/skills/sdd-execute/SKILL.md; then
+      fail "sdd-execute no longer mentions $field, which is how a run is bound to a task"
+    fi
+    if ! grep -rq "$field" crates/magent-mcp/src/lib.rs; then
+      fail "sdd-execute teaches $field but the MCP server does not accept it"
+    fi
+  done
+fi
+
 # --- the language plugin ----------------------------------------------------
 
 for required in \

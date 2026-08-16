@@ -1174,3 +1174,127 @@ async fn a_declined_setup_changes_nothing() {
     let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
     assert!(store.workspaces().expect("workspaces").is_empty());
 }
+
+// --- spec-driven work -------------------------------------------------------
+
+/// The binding rides on the checkpoint rather than on a tool of its own. A
+/// checkpoint already happens at every task boundary, which is exactly when the
+/// current task changes, and a separate tool would be one more thing to forget.
+#[tokio::test]
+async fn a_checkpoint_can_bind_the_run_to_a_spec_change() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "add a retry budget" }),
+    )
+    .await;
+
+    call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "budget type is in",
+            "spec_change_id": "add-retry-budget",
+            "spec_paths": ["openspec/changes/add-retry-budget/tasks.md"],
+            "current_task": "2: wire the budget into the client"
+        }),
+    )
+    .await;
+
+    let status = call(&client, "magent_status", json!({})).await;
+    assert_eq!(
+        status["run"]["spec"]["change_id"].as_str(),
+        Some("add-retry-budget"),
+        "{status}"
+    );
+    assert_eq!(
+        status["run"]["spec"]["current_task"].as_str(),
+        Some("2: wire the budget into the client")
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Advancing must take one field. Making the model restate the change every
+/// time is how a run ends up bound to a task of a change it no longer names.
+#[tokio::test]
+async fn advancing_to_the_next_task_takes_one_field() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "add a retry budget" }),
+    )
+    .await;
+    call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "task 1 done",
+            "spec_change_id": "add-retry-budget",
+            "spec_paths": ["openspec/changes/add-retry-budget/tasks.md"],
+            "current_task": "1"
+        }),
+    )
+    .await;
+
+    call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "task 2 started",
+            "current_task": "2"
+        }),
+    )
+    .await;
+
+    let status = call(&client, "magent_status", json!({})).await;
+    let spec = &status["run"]["spec"];
+    assert_eq!(spec["current_task"].as_str(), Some("2"));
+    assert_eq!(
+        spec["change_id"].as_str(),
+        Some("add-retry-budget"),
+        "the change was dropped by a checkpoint that did not mention it: {status}"
+    );
+    assert_eq!(
+        spec["paths"][0].as_str(),
+        Some("openspec/changes/add-retry-budget/tasks.md")
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Most work is not spec-driven, and the schema must not imply otherwise.
+#[tokio::test]
+async fn the_spec_fields_are_all_optional() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let tools = client.list_all_tools().await.expect("tools");
+    let checkpoint = tools
+        .iter()
+        .find(|tool| tool.name == "magent_checkpoint")
+        .expect("magent_checkpoint");
+    let required: Vec<&str> = checkpoint
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .expect("required")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    for field in ["spec_change_id", "spec_paths", "current_task"] {
+        assert!(!required.contains(&field), "{field} became required");
+    }
+    client.cancel().await.expect("shutdown");
+}

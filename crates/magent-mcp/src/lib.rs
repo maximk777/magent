@@ -58,6 +58,10 @@ magent_deps lists repositories checked out for reference and gives their paths \
 on disk. Read and grep those files directly rather than guessing at a \
 library's behaviour.
 
+When work follows a written plan, pass spec_change_id and current_task to \
+magent_checkpoint. Restored context then names the task in hand rather than \
+the prompt that opened the run.
+
 Every mutating call takes an operation_id. Generate a fresh UUID per call, and \
 reuse the same one when retrying, so a retry cannot duplicate state.
 
@@ -169,6 +173,17 @@ pub struct CheckpointToolInput {
     pub verification: Vec<String>,
     #[serde(default)]
     pub risks: Vec<String>,
+
+    /// The spec change this run is executing, `add-retry-budget`. Set it once;
+    /// later checkpoints that omit it leave it bound.
+    #[serde(default)]
+    pub spec_change_id: Option<String>,
+    /// Repository-relative paths to the proposal and task list.
+    #[serde(default)]
+    pub spec_paths: Vec<String>,
+    /// The task now in hand, as it reads in the list: `2: wire the budget`.
+    #[serde(default)]
+    pub current_task: Option<String>,
 }
 
 /// What the client may supply when finishing.
@@ -458,12 +473,30 @@ impl MagentMcp {
             handoff_summary: input.handoff_summary,
         };
 
-        render(
-            &self
-                .store
-                .save_checkpoint(&command)
-                .map_err(|error| render_error(&error))?,
-        )
+        let saved = self
+            .store
+            .save_checkpoint(&command)
+            .map_err(|error| render_error(&error))?;
+
+        // After the checkpoint, so a rejected checkpoint cannot leave the run
+        // pointing at a task nobody recorded reaching.
+        if input.spec_change_id.is_some()
+            || !input.spec_paths.is_empty()
+            || input.current_task.is_some()
+        {
+            self.store
+                .bind_spec(
+                    run_id,
+                    &magent_core::SpecBinding {
+                        change_id: input.spec_change_id,
+                        paths: input.spec_paths,
+                        current_task: input.current_task,
+                    },
+                )
+                .map_err(|error| render_error(&error))?;
+        }
+
+        render(&saved)
     }
 
     #[tool(

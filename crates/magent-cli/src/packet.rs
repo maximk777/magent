@@ -38,6 +38,7 @@ pub fn render(
 
     let _ = writeln!(out, "run {} · stage {}", run.run_id, stage_name(run.stage));
     let _ = writeln!(out, "Task: {}", run.task.trim());
+    push_spec(&mut out, run.spec.as_ref());
 
     if let Some(checkpoint) = run.latest_checkpoint.as_ref() {
         let _ = writeln!(
@@ -59,6 +60,31 @@ pub fn render(
 
     out.push_str("Detail: magent_search, magent_recall\n");
     Some(out)
+}
+
+/// The spec change and the task in flight.
+///
+/// Placed directly under the task because it is more specific than the task:
+/// the run's title is whatever prompt opened it, while this says which step of
+/// which plan is actually in hand. After a compaction that is the difference
+/// between resuming and starting over.
+fn push_spec(out: &mut String, spec: Option<&magent_core::SpecBinding>) {
+    let Some(spec) = spec else {
+        return;
+    };
+
+    if let Some(change_id) = &spec.change_id {
+        let _ = writeln!(out, "Change: {change_id}");
+    }
+    if let Some(task) = &spec.current_task {
+        let _ = writeln!(out, "On task: {task}");
+    }
+    // The paths, not their contents. The files are in the working tree and
+    // reading them costs the agent one tool call; copying them here would spend
+    // the packet's whole budget on something already on disk.
+    if !spec.paths.is_empty() {
+        let _ = writeln!(out, "Spec: {}", spec.paths.join(", "));
+    }
 }
 
 fn push_checkpoint(out: &mut String, checkpoint: &CheckpointSnapshot) {
@@ -220,6 +246,7 @@ mod tests {
             task: task.into(),
             status: RunStatus::Open,
             stage: WorkflowStage::Executing,
+            spec: None,
             latest_checkpoint: None,
         }
     }
@@ -292,6 +319,45 @@ mod tests {
             rendered.contains(&format!("(+{} more)", 200 - FILE_LIMIT)),
             "the files that did not fit must still be counted:\n{rendered}"
         );
+    }
+
+    /// The payoff of the binding. After a compaction this packet is all the
+    /// model has, and "task 2 of add-retry-budget" is worth more than the
+    /// prompt that happened to open the run.
+    #[test]
+    fn a_bound_run_says_which_task_of_which_change() {
+        let mut snapshot = run("look into the timeouts");
+        snapshot.spec = Some(magent_core::SpecBinding {
+            change_id: Some("add-retry-budget".into()),
+            paths: vec!["openspec/changes/add-retry-budget/tasks.md".into()],
+            current_task: Some("2: wire the budget into the client".into()),
+        });
+
+        let packet = render(&snapshot, &[], None, None, chrono::Utc::now()).expect("packet");
+
+        assert!(packet.contains("add-retry-budget"), "{packet}");
+        assert!(
+            packet.contains("wire the budget into the client"),
+            "{packet}"
+        );
+        assert!(
+            packet.contains("openspec/changes/add-retry-budget/tasks.md"),
+            "the path is what lets it read the rest: {packet}"
+        );
+        assert!(
+            !packet.contains("- [ ]"),
+            "the spec's contents belong on disk, not in the packet: {packet}"
+        );
+    }
+
+    /// And an ordinary run says nothing about specs, because most work is not
+    /// spec-driven and a blank line about it is a line wasted.
+    #[test]
+    fn an_unbound_run_mentions_no_spec() {
+        let packet =
+            render(&run("fix the flake"), &[], None, None, chrono::Utc::now()).expect("packet");
+        assert!(!packet.contains("Change:"), "{packet}");
+        assert!(!packet.contains("Spec:"), "{packet}");
     }
 
     /// A session with no checkpoint and no task has nothing worth injecting.

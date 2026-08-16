@@ -64,6 +64,30 @@ personal memory, and it is not the daemon this design deliberately does
 without: it opens the same file every hook opens, holds nothing, and can be
 closed at any moment.
 
+Spec-driven work, with the run pointing at the step.
+
+Three skills: `sdd-brainstorm` turns a want into
+`openspec/changes/<id>/proposal.md` and refuses to propose before the problem is
+stated; `sdd-plan` turns an agreed proposal into `tasks.md` where every task
+carries its own verification; `sdd-execute` works the list one task at a time
+and will not tick a box whose check has not run.
+
+The files are the source of truth and Magent never copies them. What it holds
+is a reference — which change, which task, right now — because that is the one
+thing a plan on disk cannot say about the session executing it. After a
+compaction the restored context reads:
+
+```
+Task: make retries bounded
+Change: add-retry-budget
+On task: 3: bound the retries
+Spec: openspec/changes/add-retry-budget/tasks.md
+```
+
+rather than only the prompt that opened the run. The binding rides on
+`magent_checkpoint`, which already happens at task boundaries; set the change
+once and later checkpoints need only `current_task`.
+
 Languages, as a second plugin.
 
 ```

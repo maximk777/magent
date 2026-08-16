@@ -17,5 +17,5 @@ pub use model::{
     CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
     DependencyId, FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState,
     HarnessKind, OperationId, Repository, RepositoryId, RepositoryRole, RunId, RunSnapshot,
-    RunStatus, SessionId, StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
+    RunStatus, SessionId, SpecBinding, StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
 };

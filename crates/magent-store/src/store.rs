@@ -9,7 +9,7 @@ use magent_core::{
     CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
     FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState, HarnessKind,
     OperationId, RepositoryId, RepositoryRole, RunId, RunSnapshot, RunStatus, SessionId,
-    StartRunCommand, StartRunResult, Validate, WorkflowStage, WorkspaceId,
+    SpecBinding, StartRunCommand, StartRunResult, Validate, WorkflowStage, WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Serialize, de::DeserializeOwned};
@@ -390,7 +390,47 @@ impl Store {
             status: row.status,
             stage: row.stage,
             latest_checkpoint,
+            spec: row.spec,
         })
+    }
+
+    /// Points a run at the spec change it is executing.
+    ///
+    /// Every field is optional and `None` leaves what is stored alone, so
+    /// advancing to the next task is a one-field call. Nothing here checks that
+    /// the paths exist: the spec lives in git, and a run bound to a file on a
+    /// branch this checkout does not have is still correctly bound. Refusing it
+    /// would make the reference useless exactly where it is most wanted.
+    ///
+    /// # Errors
+    /// Fails on a database error, or if the run does not exist.
+    pub fn bind_spec(&self, run_id: RunId, binding: &SpecBinding) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+
+        // Stored newline-joined rather than as JSON: these are read by hand in
+        // sqlite3 as often as by this code, and a path never contains one.
+        let paths = (!binding.paths.is_empty()).then(|| binding.paths.join("\n"));
+
+        let changed = connection.execute(
+            "UPDATE runs SET
+                 spec_change_id = COALESCE(?1, spec_change_id),
+                 spec_paths     = COALESCE(?2, spec_paths),
+                 current_task   = COALESCE(?3, current_task),
+                 updated_at     = ?4
+             WHERE id = ?5",
+            (
+                &binding.change_id,
+                &paths,
+                &binding.current_task,
+                Utc::now().to_rfc3339(),
+                run_id.to_string(),
+            ),
+        )?;
+
+        if changed == 0 {
+            return Err(StoreError::RunNotFound(run_id));
+        }
+        Ok(())
     }
 
     /// Resolves a working directory to its repository and workspace, creating
@@ -760,12 +800,14 @@ pub(crate) struct RunRow {
     task: String,
     status: RunStatus,
     stage: WorkflowStage,
+    spec: Option<SpecBinding>,
 }
 
 pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow, StoreError> {
     let row = tx
         .query_row(
-            "SELECT workspace_id, task, status, stage FROM runs WHERE id = ?1",
+            "SELECT workspace_id, task, status, stage, spec_change_id, spec_paths, current_task
+             FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
                 Ok((
@@ -773,17 +815,44 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
         .optional()?
         .ok_or(StoreError::RunNotFound(run_id))?;
 
+    // A binding exists only when something is in it. An empty one reads as a
+    // broken reference rather than as the absence of one, and plenty of work is
+    // not spec-driven.
+    let paths: Vec<String> = row
+        .5
+        .as_deref()
+        .map(|joined| {
+            joined
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let bound = row.4.is_some() || !paths.is_empty() || row.6.is_some();
+    let spec = bound.then_some(SpecBinding {
+        change_id: row.4,
+        paths,
+        current_task: row.6,
+    });
+
     Ok(RunRow {
         workspace_id: parse_id(&row.0)?,
         task: row.1,
         status: enum_from_sql(&row.2)?,
         stage: enum_from_sql(&row.3)?,
+        spec,
     })
 }
 

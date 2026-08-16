@@ -312,6 +312,35 @@ pub struct RunSnapshot {
     pub status: RunStatus,
     pub stage: WorkflowStage,
     pub latest_checkpoint: Option<CheckpointSnapshot>,
+    /// The spec change this run is executing, when it is executing one. `None`
+    /// for the plenty of work that is not spec-driven.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<SpecBinding>,
+}
+
+/// A reference into `openspec/`, never a copy of it.
+///
+/// The proposal and the task list are files in git and they are the source of
+/// truth. What they cannot say is which task is in flight in this session,
+/// after a compaction that erased the model's own memory of it — that is what
+/// this holds, and it holds nothing else. Copying the spec here would create a
+/// second version that drifts, and the moment the two disagree the wrong one is
+/// the one the agent trusts.
+///
+/// Every field is optional on the way in, where `None` means "leave as it is".
+/// Advancing to the next task must not require restating the change; making the
+/// caller repeat it is how a run ends up half-bound.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SpecBinding {
+    /// The change's directory name, `add-retry-budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
+    /// Repository-relative paths to the proposal and task list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+    /// The task in flight, as it reads in the list: `2: wire the budget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_task: Option<String>,
 }
 
 /// A repository as Magent identifies it: canonical path plus origin URL.
