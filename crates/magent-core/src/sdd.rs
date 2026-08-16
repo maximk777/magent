@@ -300,6 +300,183 @@ impl Validate for SpecifyCommand {
     }
 }
 
+/// One task a plan breaks a change into. The agent that executes it sees
+/// only this row — never the plan around it, never a sibling task's history
+/// — so anything it needs to do the work and prove it is done has to be
+/// written down here.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskDraft {
+    /// The task's place in the plan's hierarchy — `"1"`, `"1.2"`,
+    /// `"3.10.4"` — dot-separated digits with no leading or trailing dot. A
+    /// run binds to its task by this number rather than by re-deriving
+    /// position from list order, so it has to be stable and unambiguous on
+    /// its own.
+    pub number: String,
+    /// One line naming the task: what an agent picking work reads first, and
+    /// what a reviewer skimming the whole plan uses to place this task among
+    /// the rest.
+    pub title: String,
+    /// The steps, code and reasoning the plan worked out for this task. The
+    /// executing agent has no view of the plan that produced it, so anything
+    /// it needs for "how", beyond the title, belongs here rather than being
+    /// left implicit.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Paths this task is expected to touch, named ahead of time so a
+    /// reviewer can tell an expected diff from a surprising one.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// The exact names and signatures an earlier task promised to produce,
+    /// that this task now depends on. `superpowers`' idiom: the executing
+    /// agent never sees the sibling task that produced them, only what is
+    /// written here, so a promise not repeated here is a promise it cannot
+    /// know about.
+    #[serde(default)]
+    pub consumes: Option<String>,
+    /// The exact names and signatures this task hands to a later task in the
+    /// plan. Left unset when nothing downstream depends on this task's
+    /// output.
+    #[serde(default)]
+    pub produces: Option<String>,
+    /// The exact command a caller runs to check this task actually happened.
+    /// Required: a task with no way to be checked is not a task, and the
+    /// executing agent has no other way to know it is done.
+    pub verify_command: String,
+    /// What `verify_command` should print when the task is genuinely done,
+    /// so its output can be compared against something rather than eyeballed
+    /// by whoever runs it.
+    pub expected_output: String,
+    /// Names of the requirements this task implements. Exists so "which
+    /// requirement has no task covering it" is a query against this field,
+    /// not a self-grade the executing agent hands itself.
+    #[serde(default)]
+    pub covers: Vec<String>,
+}
+
+/// Phrases borrowed from `superpowers`, where the same rule is stated in
+/// prose and so goes unenforced. Checked case-insensitively against every
+/// field a plan writes prose into. Extend this list rather than adding a
+/// second one elsewhere.
+const PLACEHOLDER_PHRASES: &[&str] = &[
+    "tbd",
+    "todo",
+    "implement later",
+    "fill in details",
+    "add appropriate error handling",
+    "handle edge cases",
+    "similar to task",
+];
+
+/// The phrase a field carries, if any, matched on word boundaries.
+///
+/// Boundaries matter for the two short entries: `todo` sits inside
+/// `mastodon`, and a plan for a to-do list would be refused for naming its
+/// own subject. A rule that rejects valid work costs more than one that
+/// misses a stub — the stub surfaces on the agent that hits it, while a false
+/// refusal blocks now and offers no way around itself.
+fn placeholder_in(text: &str) -> Option<&'static str> {
+    let lowered = text.to_lowercase();
+    let bytes = lowered.as_bytes();
+
+    PLACEHOLDER_PHRASES.iter().copied().find(|phrase| {
+        lowered.match_indices(phrase).any(|(at, matched)| {
+            let before = at.checked_sub(1).map(|index| bytes[index]);
+            let after = bytes.get(at + matched.len()).copied();
+            let is_word = |byte: Option<u8>| byte.is_some_and(|byte| byte.is_ascii_alphanumeric());
+            !is_word(before) && !is_word(after)
+        })
+    })
+}
+
+impl Validate for TaskDraft {
+    fn validate(&self) -> Result<(), DomainError> {
+        if !is_hierarchical_number(&self.number) {
+            return Err(DomainError::InvalidTaskNumber);
+        }
+        if self.title.trim().is_empty() {
+            return Err(DomainError::InvalidTaskTitle);
+        }
+        if self.verify_command.trim().is_empty() {
+            return Err(DomainError::InvalidVerifyCommand);
+        }
+        if self.expected_output.trim().is_empty() {
+            return Err(DomainError::InvalidExpectedOutput);
+        }
+
+        // Named field by field: the caller may have sent a dozen tasks, and
+        // "one of them holds a placeholder" sends it back to re-read its own
+        // input against seven phrases.
+        for (field, text) in [
+            ("title", Some(self.title.as_str())),
+            ("body", self.body.as_deref()),
+            ("verify_command", Some(self.verify_command.as_str())),
+            ("expected_output", Some(self.expected_output.as_str())),
+        ] {
+            if let Some(phrase) = text.and_then(placeholder_in) {
+                return Err(DomainError::PlaceholderTextInTask {
+                    number: self.number.clone(),
+                    field,
+                    phrase: phrase.to_owned(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// A request to break an already-specified change into an ordered list of
+/// tasks.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct PlanCommand {
+    pub operation_id: OperationId,
+    pub change: ChangeId,
+    /// The whole plan in one call. A task list is reasoned about as a unit —
+    /// by the reviewer checking coverage, by the store checking every
+    /// requirement has a task — and submitting it piecemeal would let a plan
+    /// go stale between calls before anyone ever saw the whole of it.
+    pub tasks: Vec<TaskDraft>,
+}
+
+impl Validate for PlanCommand {
+    fn validate(&self) -> Result<(), DomainError> {
+        if self.tasks.is_empty() {
+            return Err(DomainError::MissingTasks);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for task in &self.tasks {
+            if !seen.insert(task.number.as_str()) {
+                return Err(DomainError::DuplicateTaskNumber);
+            }
+        }
+
+        for task in &self.tasks {
+            task.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A request to close out a change once every task on it is done.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ArchiveCommand {
+    pub operation_id: OperationId,
+    pub change: ChangeId,
+}
+
+impl Validate for ArchiveCommand {
+    fn validate(&self) -> Result<(), DomainError> {
+        // Nothing here is checkable by shape alone. Whether the change
+        // exists, whether every task on it is actually done: only the store
+        // knows, because only the store has the rows. Inventing a rule here
+        // for the sake of symmetry with the other commands would just be a
+        // check that always passes, dressed up as one that means something.
+        Ok(())
+    }
+}
+
 /// A slug is read back as a path segment, so it is restricted to lowercase
 /// ASCII letters, digits and single interior hyphens. Matches `is_slug` in
 /// `fact.rs`, for the same reason: an address has to survive a filename and
@@ -313,4 +490,15 @@ fn is_kebab_case(value: &str) -> bool {
         && !value.starts_with('-')
         && !value.ends_with('-')
         && !value.contains("--")
+}
+
+/// A task number is `tasks.number` in `0009_tasks.sql`: dot-separated
+/// digits, hierarchical rather than sequential ("1.2", "3.10.4"), with no
+/// leading, trailing or doubled dot to keep every representation of one
+/// number unambiguous.
+fn is_hierarchical_number(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        })
 }

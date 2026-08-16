@@ -81,6 +81,36 @@ pub enum DomainError {
 
     #[error("a scenario's when and then must not be blank")]
     InvalidScenario,
+
+    #[error("a plan must carry at least one task")]
+    MissingTasks,
+
+    #[error("task numbers must not repeat within one plan")]
+    DuplicateTaskNumber,
+
+    #[error("a task number must be dot-separated digits, like 1.2 or 3.10.4")]
+    InvalidTaskNumber,
+
+    #[error("a task title must not be blank")]
+    InvalidTaskTitle,
+
+    #[error("a task's verify_command must not be blank")]
+    InvalidVerifyCommand,
+
+    #[error("a task's expected_output must not be blank")]
+    InvalidExpectedOutput,
+
+    /// A plan with a stub in its text looks finished, and falls apart on the
+    /// agent that executes the one task carrying it: it sees only that task,
+    /// never the surrounding plan, and has no way to guess what the stub was
+    /// meant to say. Cheaper to refuse at write time than to discover it mid
+    /// task.
+    #[error("task {number} has {phrase:?} in its {field}, which is a stub rather than a plan")]
+    PlaceholderTextInTask {
+        number: String,
+        field: &'static str,
+        phrase: String,
+    },
 }
 
 impl DomainError {
@@ -114,6 +144,13 @@ impl DomainError {
             Self::MissingRequirementId => "missing_requirement_id",
             Self::UnexpectedRequirementId => "unexpected_requirement_id",
             Self::InvalidScenario => "invalid_scenario",
+            Self::MissingTasks => "missing_tasks",
+            Self::DuplicateTaskNumber => "duplicate_task_number",
+            Self::InvalidTaskNumber => "invalid_task_number",
+            Self::InvalidTaskTitle => "invalid_task_title",
+            Self::InvalidVerifyCommand => "invalid_verify_command",
+            Self::InvalidExpectedOutput => "invalid_expected_output",
+            Self::PlaceholderTextInTask { .. } => "placeholder_text_in_task",
         }
     }
 }

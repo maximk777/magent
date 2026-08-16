@@ -7,8 +7,8 @@
 //! change already have a proposal — belong to the store.
 
 use magent_core::{
-    Classification, DeltaOp, ProposeCommand, RequirementDraft, ScenarioDraft, SpecifyCommand,
-    Validate,
+    ArchiveCommand, Classification, DeltaOp, PlanCommand, ProposeCommand, RequirementDraft,
+    ScenarioDraft, SpecifyCommand, TaskDraft, Validate,
 };
 
 fn valid_propose() -> ProposeCommand {
@@ -44,6 +44,35 @@ fn valid_requirement() -> RequirementDraft {
         migration: None,
         requirement_id: None,
         scenarios: vec![valid_scenario()],
+    }
+}
+
+fn valid_task() -> TaskDraft {
+    TaskDraft {
+        number: "1.2".into(),
+        title: "Add the retry budget field".into(),
+        body: Some("Add a `budget: u32` field to `RetryPolicy` and thread it through.".into()),
+        files: vec!["crates/worker/src/retry.rs".into()],
+        consumes: None,
+        produces: Some("RetryPolicy::budget".into()),
+        verify_command: "cargo test -p worker retry_budget".into(),
+        expected_output: "test retry_budget ... ok".into(),
+        covers: vec!["retry-budget-cap".into()],
+    }
+}
+
+fn valid_plan() -> PlanCommand {
+    PlanCommand {
+        operation_id: magent_core::OperationId::new(),
+        change: magent_core::ChangeId::new(),
+        tasks: vec![valid_task()],
+    }
+}
+
+fn valid_archive() -> ArchiveCommand {
+    ArchiveCommand {
+        operation_id: magent_core::OperationId::new(),
+        change: magent_core::ChangeId::new(),
     }
 }
 
@@ -437,6 +466,217 @@ fn a_well_formed_specify_command_is_accepted() {
     assert!(valid_specify().validate().is_ok());
 }
 
+// --- PlanCommand -----------------------------------------------------------
+
+/// A plan with no tasks is a plan that plans nothing.
+#[test]
+fn a_plan_must_carry_at_least_one_task() {
+    let command = PlanCommand {
+        tasks: vec![],
+        ..valid_plan()
+    };
+
+    assert_eq!(command.validate().unwrap_err().code(), "missing_tasks");
+}
+
+/// Two tasks sharing a number in the same plan would collide in the store's
+/// unique index; catching it here names exactly what was duplicated instead
+/// of surfacing a raw `SQLite` error.
+#[test]
+fn task_numbers_must_not_repeat_within_a_plan() {
+    let command = PlanCommand {
+        tasks: vec![valid_task(), valid_task()],
+        ..valid_plan()
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "duplicate_task_number"
+    );
+}
+
+#[test]
+fn a_well_formed_plan_is_accepted() {
+    assert!(valid_plan().validate().is_ok());
+}
+
+// --- TaskDraft ---------------------------------------------------------
+
+/// A run binds to its task by number, so the number must be unambiguous:
+/// digits separated by single dots, with no leading or trailing dot.
+#[test]
+fn a_task_number_must_be_dot_separated_digits() {
+    for rejected in ["", ".1", "1.", "1..2", "1.a", "a", "1.2.", "-1"] {
+        let command = PlanCommand {
+            tasks: vec![TaskDraft {
+                number: rejected.into(),
+                ..valid_task()
+            }],
+            ..valid_plan()
+        };
+        assert_eq!(
+            command.validate().unwrap_err().code(),
+            "invalid_task_number",
+            "{rejected} should not be a valid task number"
+        );
+    }
+
+    for accepted in ["1", "1.2", "3.10.4"] {
+        let command = PlanCommand {
+            tasks: vec![TaskDraft {
+                number: accepted.into(),
+                ..valid_task()
+            }],
+            ..valid_plan()
+        };
+        assert!(
+            command.validate().is_ok(),
+            "{accepted} should be a valid task number"
+        );
+    }
+}
+
+/// A blank title, `verify_command` or `expected_output` is not a task,
+/// whatever whitespace it is padded with.
+#[test]
+fn a_task_title_verify_command_and_expected_output_must_not_be_blank() {
+    let command = PlanCommand {
+        tasks: vec![TaskDraft {
+            title: "   ".into(),
+            ..valid_task()
+        }],
+        ..valid_plan()
+    };
+    assert_eq!(command.validate().unwrap_err().code(), "invalid_task_title");
+
+    let command = PlanCommand {
+        tasks: vec![TaskDraft {
+            verify_command: "\t".into(),
+            ..valid_task()
+        }],
+        ..valid_plan()
+    };
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_verify_command"
+    );
+
+    let command = PlanCommand {
+        tasks: vec![TaskDraft {
+            expected_output: "\n".into(),
+            ..valid_task()
+        }],
+        ..valid_plan()
+    };
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_expected_output"
+    );
+}
+
+/// A word that merely contains a placeholder is not one.
+///
+/// `todo` sits inside `mastodon`, and a plan for a to-do list would be refused
+/// for naming its own subject. Rejecting valid work costs more than missing a
+/// stub: the stub surfaces on the agent that hits it, while a false refusal
+/// blocks now and offers no way around itself.
+#[test]
+fn a_word_that_merely_contains_a_placeholder_is_accepted() {
+    for innocent in [
+        "Import posts from Mastodon",
+        "Render the todos list",
+        "Fix TODOS.md parsing",
+    ] {
+        let command = PlanCommand {
+            tasks: vec![TaskDraft {
+                title: innocent.into(),
+                ..valid_task()
+            }],
+            ..valid_plan()
+        };
+
+        assert!(
+            command.validate().is_ok(),
+            "{innocent:?} is ordinary prose, not a stub"
+        );
+    }
+}
+
+/// A plan with a stub in its text looks finished and falls apart on the
+/// agent executing it, who sees only this one task and has no way to guess
+/// what was meant. Cheaper to refuse at write time than to discover it mid
+/// task. Checked without regard to case, and across every field a plan
+/// writes prose into.
+#[test]
+fn a_task_must_not_contain_placeholder_text() {
+    let placeholders = [
+        "TBD",
+        "TODO",
+        "implement later",
+        "fill in details",
+        "add appropriate error handling",
+        "handle edge cases",
+        "similar to task",
+    ];
+
+    for placeholder in placeholders {
+        // Mixed case, to prove the check is not case-sensitive.
+        let mixed_case = placeholder
+            .chars()
+            .enumerate()
+            .map(|(index, character)| {
+                if index % 2 == 0 {
+                    character.to_ascii_uppercase()
+                } else {
+                    character.to_ascii_lowercase()
+                }
+            })
+            .collect::<String>();
+
+        for field in ["title", "body", "verify_command", "expected_output"] {
+            let task = match field {
+                "title" => TaskDraft {
+                    title: format!("Wire up retries ({mixed_case})"),
+                    ..valid_task()
+                },
+                "body" => TaskDraft {
+                    body: Some(format!("Steps: ...{mixed_case}...")),
+                    ..valid_task()
+                },
+                "verify_command" => TaskDraft {
+                    verify_command: format!("echo {mixed_case}"),
+                    ..valid_task()
+                },
+                "expected_output" => TaskDraft {
+                    expected_output: format!("output ({mixed_case})"),
+                    ..valid_task()
+                },
+                _ => unreachable!(),
+            };
+
+            let command = PlanCommand {
+                tasks: vec![task],
+                ..valid_plan()
+            };
+            assert_eq!(
+                command.validate().unwrap_err().code(),
+                "placeholder_text_in_task",
+                "{field} containing {mixed_case:?} should be rejected"
+            );
+        }
+    }
+}
+
+// --- ArchiveCommand ----------------------------------------------------
+
+/// Everything an archive needs checked — is the change real, are all its
+/// tasks done — is knowledge only the store has. There is no form-level rule
+/// to enforce here, so `validate` always succeeds.
+#[test]
+fn an_archive_command_has_nothing_to_validate() {
+    assert!(valid_archive().validate().is_ok());
+}
+
 // --- wire shape ------------------------------------------------------------
 
 /// The string values must match the migration's `CHECK` constraints
@@ -486,6 +726,24 @@ fn a_specify_command_round_trips() {
     let command = valid_specify();
     let encoded = serde_json::to_string(&command).expect("serialize");
     let decoded: SpecifyCommand = serde_json::from_str(&encoded).expect("deserialize");
+
+    assert_eq!(decoded, command);
+}
+
+#[test]
+fn a_plan_command_round_trips() {
+    let command = valid_plan();
+    let encoded = serde_json::to_string(&command).expect("serialize");
+    let decoded: PlanCommand = serde_json::from_str(&encoded).expect("deserialize");
+
+    assert_eq!(decoded, command);
+}
+
+#[test]
+fn an_archive_command_round_trips() {
+    let command = valid_archive();
+    let encoded = serde_json::to_string(&command).expect("serialize");
+    let decoded: ArchiveCommand = serde_json::from_str(&encoded).expect("deserialize");
 
     assert_eq!(decoded, command);
 }
