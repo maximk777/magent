@@ -211,6 +211,37 @@ fn an_invalid_command_is_rejected_before_anything_is_written() {
     assert_eq!(total, 0, "validation must fail before any row is written");
 }
 
+/// A context with no workspace is answered, not left to the schema.
+///
+/// This is reachable rather than theoretical: the MCP server builds its
+/// context with `resolve_workspace_for(root).ok()`, so any directory that
+/// fails to resolve arrives here as `None`. Left to the `NOT NULL` column,
+/// the caller would be told a constraint failed — true, and useless, since
+/// what needs fixing is the working directory.
+#[test]
+fn a_context_without_a_workspace_is_named_rather_than_left_to_the_column() {
+    let (dir, path, store) = temp_store();
+    let _ = dir;
+
+    let context = FactContext {
+        workspace_id: None,
+        namespace: None,
+        ..FactContext::default()
+    };
+
+    let result = store.propose(&propose_command("add-retry-budget"), &context);
+    assert!(
+        matches!(result, Err(StoreError::NoWorkspace)),
+        "expected the workspace to be named as missing, got {result:?}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let total: i64 = raw
+        .query_row("SELECT COUNT(*) FROM sdd_changes", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(total, 0, "nothing may be written without a workspace");
+}
+
 /// Validation must not reach for the writer lock.
 ///
 /// The test above cannot tell where `validate` sits: an error returned from

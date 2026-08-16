@@ -42,6 +42,13 @@ pub enum StoreError {
     /// to do about it. Checked explicitly so the message does.
     #[error("slug {0:?} is already in use by a change in flight")]
     SlugTaken(String),
+
+    /// A change belongs to a workspace, and the caller's context did not name
+    /// one. The column is `NOT NULL`, so the database would refuse this
+    /// anyway — with a message about a constraint rather than about the
+    /// working directory, which is where the answer actually is.
+    #[error("this directory does not resolve to a workspace; call magent_setup")]
+    NoWorkspace,
 }
 
 impl StoreError {
@@ -60,6 +67,7 @@ impl StoreError {
             Self::NoOpenRun => "no_open_run",
             Self::DependencyNotFound(_) => "dependency_not_found",
             Self::SlugTaken(_) => "slug_taken",
+            Self::NoWorkspace => "no_workspace",
         }
     }
 }

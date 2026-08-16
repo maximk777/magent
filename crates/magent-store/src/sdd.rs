@@ -36,14 +36,21 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::Domain`] for an invalid command,
-    /// [`StoreError::SlugTaken`] when the slug already names a change still
-    /// in flight, or a database error.
+    /// [`StoreError::NoWorkspace`] when the context names no workspace to
+    /// file the change under, [`StoreError::SlugTaken`] when the slug already
+    /// names a change still in flight, or a database error.
     pub fn propose(
         &self,
         command: &ProposeCommand,
         context: &FactContext,
     ) -> Result<ChangeId, StoreError> {
         command.validate()?;
+
+        // Resolved before the writer lock, for the same reason validation is:
+        // the column is NOT NULL, so the database would refuse this anyway,
+        // but it would refuse it by naming a constraint. What the caller has
+        // to fix is the working directory, and only this layer knows that.
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
 
         self.execute_operation("propose", command.operation_id, command, |tx| {
             // Mirrors sdd_changes_live_slug (0007_sdd.sql): a slug is taken
@@ -57,7 +64,7 @@ impl Store {
                      WHERE workspace_id = ?1 AND namespace IS ?2 AND slug = ?3
                        AND status NOT IN ('archived', 'abandoned')",
                     rusqlite::params![
-                        context.workspace_id.map(|id| id.to_string()),
+                        workspace_id.to_string(),
                         context.namespace.as_deref(),
                         &command.slug,
                     ],
@@ -78,7 +85,7 @@ impl Store {
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
                 rusqlite::params![
                     change_id.to_string(),
-                    context.workspace_id.map(|id| id.to_string()),
+                    workspace_id.to_string(),
                     context.namespace.as_deref(),
                     &command.slug,
                     &command.title,
