@@ -89,7 +89,14 @@ fn a_proposal_without_capabilities_must_skip_specs() {
 /// path segment: lowercase letters, digits and interior hyphens only.
 #[test]
 fn a_proposal_slug_must_be_kebab_case() {
-    for rejected in ["", "Add-Feature", "add_feature", "-leading", "trailing-"] {
+    for rejected in [
+        "",
+        "Add-Feature",
+        "add_feature",
+        "-leading",
+        "trailing-",
+        "add--retry",
+    ] {
         let command = ProposeCommand {
             slug: rejected.into(),
             ..valid_propose()
@@ -161,6 +168,33 @@ fn a_specify_command_must_carry_at_least_one_requirement() {
 fn a_specify_purpose_must_meet_the_length_floor() {
     let command = SpecifyCommand {
         purpose: Some("too short".into()),
+        ..valid_specify()
+    };
+
+    assert_eq!(command.validate().unwrap_err().code(), "invalid_purpose");
+}
+
+/// The floor is counted in characters, not bytes. Thirty Cyrillic
+/// characters are thirty characters, well under the floor, but sixty bytes
+/// in UTF-8 — over it. A byte-counting check would wave this through.
+#[test]
+fn the_purpose_length_floor_counts_characters_not_bytes() {
+    let purpose = "воркер должен ограничивать повторы"
+        .chars()
+        .take(30)
+        .collect::<String>();
+    assert_eq!(
+        purpose.chars().count(),
+        30,
+        "fixture must be exactly 30 characters"
+    );
+    assert!(
+        purpose.len() > 50,
+        "fixture must exceed 50 bytes for the test to prove anything"
+    );
+
+    let command = SpecifyCommand {
+        purpose: Some(purpose),
         ..valid_specify()
     };
 
@@ -380,4 +414,57 @@ fn scenario_when_and_then_must_not_be_blank() {
 #[test]
 fn a_well_formed_specify_command_is_accepted() {
     assert!(valid_specify().validate().is_ok());
+}
+
+// --- wire shape ------------------------------------------------------------
+
+/// The string values must match the migration's `CHECK` constraints
+/// verbatim (`crates/magent-store/migrations/0007_sdd.sql`): a wrong
+/// `rename_all` here would compile clean and only surface later, as a
+/// constraint violation in the store, far from where it was introduced.
+#[test]
+fn enums_use_their_snake_case_names() {
+    let cases: Vec<(String, &str)> = vec![
+        (
+            serde_json::to_string(&Classification::Architectural).unwrap(),
+            "\"architectural\"",
+        ),
+        (
+            serde_json::to_string(&magent_core::ChangeStatus::Executing).unwrap(),
+            "\"executing\"",
+        ),
+        (
+            serde_json::to_string(&DeltaOp::Renamed).unwrap(),
+            "\"renamed\"",
+        ),
+    ];
+
+    for (actual, expected) in cases {
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn change_ids_serialize_as_bare_strings() {
+    let encoded = serde_json::to_string(&magent_core::ChangeId::new()).expect("serialize");
+    assert!(encoded.starts_with('"'), "{encoded}");
+    assert_eq!(encoded.trim_matches('"').len(), 36);
+}
+
+#[test]
+fn a_propose_command_round_trips() {
+    let command = valid_propose();
+    let encoded = serde_json::to_string(&command).expect("serialize");
+    let decoded: ProposeCommand = serde_json::from_str(&encoded).expect("deserialize");
+
+    assert_eq!(decoded, command);
+}
+
+#[test]
+fn a_specify_command_round_trips() {
+    let command = valid_specify();
+    let encoded = serde_json::to_string(&command).expect("serialize");
+    let decoded: SpecifyCommand = serde_json::from_str(&encoded).expect("deserialize");
+
+    assert_eq!(decoded, command);
 }

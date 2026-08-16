@@ -59,9 +59,19 @@ pub enum ChangeStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaOp {
+    /// A new requirement. Needs `text` and at least one scenario; carries no
+    /// `requirement_id` because there is nothing yet to point at.
     Added,
+    /// Replaces an existing requirement's text. Needs `requirement_id`,
+    /// `text` and at least one scenario — the whole requirement, not a
+    /// diff, so nothing is lost if only part of it is supplied.
     Modified,
+    /// Retires an existing requirement. Needs `requirement_id`, `reason`
+    /// and `migration`: a removal without a path forward is a break nobody
+    /// explained.
     Removed,
+    /// Renames an existing requirement without changing its text. Needs
+    /// `requirement_id` and `rename_to`.
     Renamed,
 }
 
@@ -94,12 +104,21 @@ impl Validate for ScenarioDraft {
 pub struct RequirementDraft {
     pub op: DeltaOp,
     pub name: String,
+    /// The requirement's full text. Required, and must be non-blank, for
+    /// `Added` and `Modified`; left `None` for `Removed` and `Renamed`,
+    /// which do not change what the requirement says.
     #[serde(default)]
     pub text: Option<String>,
+    /// The requirement's new name. Required for `Renamed`, meaningless for
+    /// every other op.
     #[serde(default)]
     pub rename_to: Option<String>,
+    /// Why the requirement is going away. Required for `Removed`.
     #[serde(default)]
     pub reason: Option<String>,
+    /// What a caller relying on the removed requirement should do instead.
+    /// Required for `Removed`, alongside `reason`: a removal without a path
+    /// forward is a break nobody explained.
     #[serde(default)]
     pub migration: Option<String>,
     /// Addresses an existing requirement by id. Required for everything but
@@ -107,6 +126,9 @@ pub struct RequirementDraft {
     /// requirement that already exists rather than re-pasting its text.
     #[serde(default)]
     pub requirement_id: Option<String>,
+    /// Required, and must be non-empty, for `Added` and `Modified`. A
+    /// requirement without at least one scenario is the failure `OpenSpec`
+    /// lets through silently when a scenario is malformed.
     #[serde(default)]
     pub scenarios: Vec<ScenarioDraft>,
 }
@@ -161,12 +183,27 @@ impl Validate for RequirementDraft {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ProposeCommand {
     pub operation_id: OperationId,
+    /// The change's address: lowercase letters, digits and single interior
+    /// hyphens, free while the change is in flight and released again once
+    /// it is archived or abandoned.
     pub slug: String,
+    /// One line, readable on its own in a list of open changes.
     pub title: String,
     pub classification: Classification,
+    /// Why this change is worth making. Not a summary of what changes —
+    /// `what_changes` covers that — but the reasoning a reviewer needs to
+    /// judge whether it should happen at all.
     pub why: String,
+    /// The change in outline, one entry per notable edit. What a reviewer
+    /// reads before the diff.
     pub what_changes: Vec<String>,
+    /// Paths of the capabilities this change touches, `worker/retry`-style.
+    /// A path need not exist yet: naming a new one is how a change proposes
+    /// to add it, and the deltas that spell out what changes come from a
+    /// later `magent_specify` call, not from here.
     pub capabilities: Vec<String>,
+    /// What could go wrong, or who else is affected. Free text, and
+    /// optional: not every change carries a risk worth naming.
     #[serde(default)]
     pub impact: Option<String>,
     /// A change may legitimately touch no capability — a pure refactor,
@@ -199,7 +236,16 @@ impl Validate for ProposeCommand {
 pub struct SpecifyCommand {
     pub operation_id: OperationId,
     pub change: ChangeId,
+    /// The capability these requirements belong to, `worker/retry`-style.
+    /// Must match one of the paths the change's `magent_propose` call
+    /// named.
     pub capability_path: String,
+    /// What the capability is for, in prose. Only meaningful when the
+    /// capability is new — an existing one already has a purpose on
+    /// record — but whenever it is given, it must run at least 50
+    /// characters: `OpenSpec`'s own strict validator uses the same floor,
+    /// because anything shorter reads as a placeholder rather than an
+    /// explanation.
     #[serde(default)]
     pub purpose: Option<String>,
     pub requirements: Vec<RequirementDraft>,
@@ -209,6 +255,10 @@ pub struct SpecifyCommand {
 /// too glib to be useful, and their archival step fills the gap with a
 /// "TBD" placeholder nobody circles back to fill in. Rejecting the write
 /// here means no placeholder is ever created to be forgotten.
+///
+/// Counted in characters, not bytes: `String::len()` would halve the
+/// effective floor for any non-ASCII writer, Cyrillic included, since this
+/// project is worked in both English and Russian.
 const MIN_PURPOSE_LEN: usize = 50;
 
 impl Validate for SpecifyCommand {
@@ -217,7 +267,7 @@ impl Validate for SpecifyCommand {
             return Err(DomainError::MissingRequirements);
         }
         if let Some(purpose) = &self.purpose
-            && purpose.len() < MIN_PURPOSE_LEN
+            && purpose.chars().count() < MIN_PURPOSE_LEN
         {
             return Err(DomainError::InvalidPurpose);
         }
@@ -238,7 +288,10 @@ impl Validate for SpecifyCommand {
 }
 
 /// A slug is read back as a path segment, so it is restricted to lowercase
-/// ASCII letters, digits and interior hyphens.
+/// ASCII letters, digits and single interior hyphens. Matches `is_slug` in
+/// `fact.rs`, for the same reason: an address has to survive a filename and
+/// a URL unchanged, and `"add--retry"` is not obviously distinct from
+/// `"add-retry"` once it has.
 fn is_kebab_case(value: &str) -> bool {
     !value.is_empty()
         && value.chars().all(|character| {
@@ -246,4 +299,5 @@ fn is_kebab_case(value: &str) -> bool {
         })
         && !value.starts_with('-')
         && !value.ends_with('-')
+        && !value.contains("--")
 }
