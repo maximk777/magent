@@ -32,6 +32,7 @@ fn migration(version: i64) -> String {
         5 => "0005_identity.sql",
         6 => "0006_dependencies.sql",
         7 => "0007_sdd.sql",
+        8 => "0008_drop_orphan_distill_jobs.sql",
         other => panic!("no migration {other}"),
     };
 

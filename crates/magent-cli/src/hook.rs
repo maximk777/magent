@@ -65,6 +65,13 @@ impl Event {
 ///
 /// Returns any underlying failure so the caller can log it and still exit 0.
 pub fn handle(event: Event, input: &Value, state_dir: &Path) -> anyhow::Result<String> {
+    if std::env::var_os(magent_distill::RECURSION_GUARD).is_some() {
+        // Inside the distiller's own `claude`. Acting here would open a run
+        // for the summary of a run, and compaction would queue another
+        // distillation: a loop that bills itself.
+        return Ok(String::new());
+    }
+
     let Some(session) = string_field(input, "session_id") else {
         // Without a session id nothing can be attributed. Not an error: some
         // events legitimately arrive without one.
@@ -270,20 +277,19 @@ fn spawn_worker() {
         .spawn();
 }
 
-fn session_end(store: &Store, session: &str, input: &Value) -> anyhow::Result<String> {
-    if let Some(binding) = store.binding_for_external_session(session)? {
-        store.enqueue_job(
-            DISTILL_JOB,
-            &binding.session_id.to_string(),
-            &serde_json::json!({
-                "run_id": binding.run_id,
-                "session_id": binding.session_id,
-                "transcript_path": string_field(input, "transcript_path"),
-            })
-            .to_string(),
-        )?;
-    }
-
+/// Closes the session. Deliberately queues nothing.
+///
+/// This used to enqueue a `distill_session` job. Nothing has ever claimed one:
+/// the worker drains `enrich_checkpoint` and no other kind, and `Distillation`
+/// describes a checkpoint's reasoning rather than the durable facts a session
+/// summary would produce — so the job had a producer, no consumer, and no
+/// designed result. One row accumulated per session, and the console counted
+/// them as work in progress.
+///
+/// Turning a session into remembered facts is worth doing, but it is a design
+/// question and not a queue: memory that asserts unverified things is worse
+/// than memory that stays quiet. Until that is settled, nothing is queued.
+fn session_end(store: &Store, session: &str, _input: &Value) -> anyhow::Result<String> {
     // The run stays open: closing an editor is not finishing a task.
     store.close_external_session(session)?;
     spawn_worker();

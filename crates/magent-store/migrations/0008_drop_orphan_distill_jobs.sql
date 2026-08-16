@@ -1,0 +1,13 @@
+-- Removes the queue nobody was draining.
+--
+-- `SessionEnd` enqueued a `distill_session` job for every session that ever
+-- ended, and no worker has ever claimed one: the worker drains
+-- `enrich_checkpoint` and nothing else. The rows accumulated at one per
+-- session and the console counted them as work in progress, which is worse
+-- than counting nothing — a queue that only grows reads as a backlog rather
+-- than as a feature that was never finished.
+--
+-- The producer is gone as of this change. These rows cannot be processed by
+-- any build, past or future, so they are deleted rather than left to be
+-- explained again by whoever next opens the console.
+DELETE FROM jobs WHERE kind = 'distill_session';

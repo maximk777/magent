@@ -349,16 +349,20 @@ fn transcript_fixture() -> String {
 
 /// Guards the invariant that the engine cannot recurse.
 ///
-/// The distiller runs `claude`. Without `--bare`, that nested session would
-/// load our own hooks and MCP server, open a run, and on compaction queue
-/// another distillation — a loop that bills itself.
+/// The distiller runs `claude`, the CLI this integration hooks into. Left
+/// alone that nested session would open a run and, on compaction, queue
+/// another distillation — a loop that bills itself. The guard is an
+/// environment variable the hook honours, not a flag on the CLI: `--bare`
+/// used to serve here and also skipped keychain reads, so on a subscription
+/// the engine could not authenticate at all.
 #[test]
 fn the_engine_disables_the_integration_it_runs_under() {
     let arguments = ClaudeHeadless::default().command_arguments();
 
     assert!(
-        arguments.iter().any(|argument| argument == "--bare"),
-        "missing --bare, so distillation would recurse: {arguments:?}"
+        !arguments.iter().any(|argument| argument == "--bare"),
+        "--bare forces API-key auth, so a subscription cannot distil: {arguments:?}"
     );
     assert!(arguments.iter().any(|argument| argument == "-p"));
+    assert_eq!(magent_distill::RECURSION_GUARD, "MAGENT_DISTILLING");
 }

@@ -18,7 +18,7 @@ use magent_core::{
 use magent_store::Store;
 use serde::{Deserialize, Serialize};
 
-pub use engine::ClaudeHeadless;
+pub use engine::{ClaudeHeadless, RECURSION_GUARD};
 
 /// Job kind this worker drains.
 pub const ENRICH_JOB: &str = "enrich_checkpoint";

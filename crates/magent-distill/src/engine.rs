@@ -19,6 +19,14 @@ use crate::{DistillRequest, Distillation, Distiller};
 /// state lives, so that is what gets read.
 const TRANSCRIPT_TAIL_BYTES: usize = 96 * 1024;
 
+/// Set on the nested `claude` process so our hooks stand down inside it.
+///
+/// The distiller runs the same CLI this integration hooks into. Left to
+/// itself that session would open a run, compact, and queue another
+/// distillation — a loop that bills itself. The hook checks this and returns
+/// before it touches the store.
+pub const RECURSION_GUARD: &str = "MAGENT_DISTILLING";
+
 /// What `claude --output-format json` wraps the reply in.
 #[derive(Debug, Deserialize)]
 struct HeadlessEnvelope {
@@ -53,15 +61,19 @@ impl ClaudeHeadless {
 
     /// The arguments this engine invokes `claude` with.
     ///
-    /// Exposed so a test can assert `--bare` is present without running the
-    /// model. That flag is load-bearing: it skips hooks, plugins, MCP servers,
-    /// auto memory and `CLAUDE.md`, which is what stops the distiller from
-    /// starting a session that opens a run, compacts, and queues another
-    /// distillation — a loop that bills itself.
+    /// Exposed so a test can read them without running the model.
+    ///
+    /// `--bare` used to be here, to stop the nested session loading our hooks
+    /// and queueing another distillation. It also skips keychain reads, and
+    /// its own help says auth is then strictly `ANTHROPIC_API_KEY` — so on a
+    /// subscription it could not authenticate at all, and every distillation
+    /// this profile ever queued failed. The recursion guard moved to
+    /// [`RECURSION_GUARD`], which the hook honours; a flag on someone else's
+    /// CLI could never have been the right place for a guarantee we can make
+    /// ourselves.
     #[must_use]
     pub fn command_arguments(&self) -> Vec<String> {
         vec![
-            "--bare".to_owned(),
             "-p".to_owned(),
             "--model".to_owned(),
             self.model.clone(),
@@ -79,20 +91,34 @@ impl Distiller for ClaudeHeadless {
         let output = Command::new(&self.binary)
             .args(self.command_arguments())
             .arg(&prompt)
+            .env(RECURSION_GUARD, "1")
             // Without this the CLI waits several seconds for input that will
             // never arrive.
             .stdin(Stdio::null())
             .output()?;
 
+        let envelope: Option<HeadlessEnvelope> = serde_json::from_slice(&output.stdout).ok();
+
         if !output.status.success() {
-            anyhow::bail!(
-                "claude exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            // The reason is in the envelope on stdout, not on stderr: a
+            // refused login reports "Not logged in" there and leaves stderr
+            // empty. Reading only the exit status recorded a failure whose
+            // stored message ended at the colon, and it stayed unexplained
+            // for as long as anyone cared to look.
+            let reason = envelope
+                .as_ref()
+                .map(|envelope| envelope.result.trim())
+                .filter(|reason| !reason.is_empty())
+                .map_or_else(
+                    || String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    ToOwned::to_owned,
+                );
+            anyhow::bail!("claude exited with {}: {reason}", output.status);
         }
 
-        let envelope: HeadlessEnvelope = serde_json::from_slice(&output.stdout)?;
+        let envelope = envelope.ok_or_else(|| {
+            anyhow::anyhow!("claude returned something that was not the json envelope")
+        })?;
         if envelope.is_error {
             anyhow::bail!("claude reported an error: {}", envelope.result.trim());
         }

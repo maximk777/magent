@@ -49,8 +49,21 @@ impl HookRun {
 }
 
 fn run_hook(state_dir: &Path, event: &str, input: &Value) -> HookRun {
+    run_hook_with_env(state_dir, event, input, &[])
+}
+
+fn run_hook_with_env(
+    state_dir: &Path,
+    event: &str,
+    input: &Value,
+    extra: &[(&str, &str)],
+) -> HookRun {
     let started = Instant::now();
-    let mut child = Command::new(MAGENT)
+    let mut command = Command::new(MAGENT);
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let mut child = command
         .args(["hook", event])
         .env("MAGENT_STATE_DIR", state_dir)
         .stdin(Stdio::piped())
@@ -136,6 +149,10 @@ impl Fixture {
 
     fn hook(&self, event: &str, input: &Value) -> HookRun {
         run_hook(&self.state_dir, event, input)
+    }
+
+    fn hook_with_env(&self, event: &str, input: &Value, extra: &[(&str, &str)]) -> HookRun {
+        run_hook_with_env(&self.state_dir, event, input, extra)
     }
 }
 
@@ -730,6 +747,44 @@ fn session_end_closes_the_session_but_leaves_the_run_open() {
         store.get_run(run_id).expect("get_run").status,
         magent_core::RunStatus::Open,
         "closing the editor does not finish the task"
+    );
+
+    let (queued, _) = store.job_counts().expect("job counts");
+    assert_eq!(
+        queued, 0,
+        "nothing may be queued that no worker claims: a distill_session row \
+         per session is a backlog that only grows"
+    );
+}
+
+/// Inside the distiller's own `claude`, the hooks stand down.
+///
+/// Without this the summary of a run opens a run of its own, which compacts
+/// and queues another distillation. The guard lives here rather than in a CLI
+/// flag because this is a guarantee we can make ourselves.
+#[test]
+fn a_hook_running_inside_a_distillation_does_nothing() {
+    let fixture = Fixture::new();
+    let session = "s12";
+
+    let run = fixture.hook_with_env(
+        "user-prompt-submit",
+        &with(
+            fixture.base("UserPromptSubmit", session),
+            "prompt",
+            json!("this must not open a run"),
+        ),
+        &[(magent_distill::RECURSION_GUARD, "1")],
+    );
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+
+    let store = fixture.store();
+    assert!(
+        store
+            .run_for_external_session(session)
+            .expect("lookup")
+            .is_none(),
+        "a distillation must not open a run of its own"
     );
 }
 
