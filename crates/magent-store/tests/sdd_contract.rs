@@ -210,3 +210,39 @@ fn an_invalid_command_is_rejected_before_anything_is_written() {
         .expect("count");
     assert_eq!(total, 0, "validation must fail before any row is written");
 }
+
+/// Validation must not reach for the writer lock.
+///
+/// The test above cannot tell where `validate` sits: an error returned from
+/// inside `execute_operation` rolls the transaction back, so "no rows" holds
+/// either way. The difference is only visible while somebody else is writing.
+/// `execute_operation` opens with `BEGIN IMMEDIATE`, so validation placed
+/// inside it would queue behind the other writer and spend the five-second
+/// busy timeout before failing — and fail with a database error rather than
+/// saying what was wrong with the command.
+#[test]
+fn an_invalid_command_is_rejected_without_waiting_for_the_writer_lock() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    // Held for the duration of the call below, so the writer lock is
+    // genuinely unavailable rather than merely contended.
+    let blocker = Connection::open(&path).expect("blocker");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE; CREATE TABLE lock_probe (id INTEGER);")
+        .expect("hold the writer lock");
+
+    let mut command = propose_command("add-retry-budget");
+    command.capabilities = Vec::new();
+    command.skip_specs = false;
+
+    let result = store.propose(&command, &ctx);
+
+    blocker.execute_batch("ROLLBACK").expect("release");
+
+    assert!(
+        matches!(result, Err(StoreError::Domain(_))),
+        "a malformed command must be named as such without queueing behind a \
+         writer; got {result:?}"
+    );
+}
