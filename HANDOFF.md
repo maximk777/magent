@@ -45,10 +45,16 @@ Everything lands in one SQLite file, `~/.magent/magent.db`. There is no daemon.
   Magent off exactly when someone is new to it.
 - **Grouping is proposed, never inferred silently.** A parent directory is also
   where unrelated work lives.
-- **SDD borrows rather than invents.** Process from `superpowers`, artifacts
-  from the `openspec` CLI, and only the run-to-task binding is ours. If you are
+- **SDD borrows rather than invents.** Process from `superpowers`, the artifact
+  model from `openspec`, and only the run-to-task binding is ours. If you are
   tempted to write a workflow prompt from first principles, read those two
-  first — that mistake has already been made here once.
+  first — that mistake has already been made here once. Both are checked out
+  under `~/.magent/deps/`; read them there.
+- **The spec process lives in the store, not in `openspec/`.** The `openspec`
+  CLI is not used: its validator runs to 842 lines because markdown lets an
+  invalid document be written, and its own instructions admit a scenario under
+  the wrong heading "will fail silently". As rows, that is unrepresentable.
+  Markdown stays an export.
 
 ## How the work is done
 
@@ -79,13 +85,13 @@ Everything lands in one SQLite file, `~/.magent/magent.db`. There is no daemon.
 
 ## Where things stand
 
-25 commits, 279 tests, schema version 6.
+53 commits, 395 tests, schema version 9.
 
 ```
 crates/magent-core      domain types, I/O free
 crates/magent-store     SQLite: facts, runs, git, grouping, deps, curation, setup
 crates/magent-mcp       the stdio MCP server
-crates/magent-distill   Distiller trait + a `claude --bare -p` engine
+crates/magent-distill   Distiller trait + a headless `claude -p` engine
 crates/magent-web       the local console (Axum + Askama + HTMX, dark navy)
 crates/magent-cli       magent hook/mcp/deps/doctor/web/import/export/workspace
 plugin/                 the Magent plugin: hooks, .mcp.json, SDD skills, agents
@@ -98,9 +104,23 @@ FTS and prompt-driven retrieval; import and export of the user's real corpus
 curation console on `magent web`; `magent doctor`; `magent_setup` with
 elicitation; the SDD skills and three subagents.
 
-Not built: no `openspec/` directory in this repo yet — Magent does not yet
-dogfood its own SDD skills. Distillation has a working queue and engine but has
-not been exercised at length. There is no `project.md` constitution.
+The spec process is in the store: `magent_propose`, `magent_specify`,
+`magent_plan`, `magent_archive` and `magent_changes`, fourteen tools in all,
+with a change addressable by its slug. Every write is one operation and either
+lands whole or not at all.
+
+**Not built, and the gap that matters most:** nothing closes a task. `plan`
+writes tasks as `pending`, no verb moves them, and `archive` refuses while any
+is open — so the loop reaches `planned` and stops. The decision was that
+`magent_checkpoint` ticks a task off with its evidence, and no task in the plan
+ever built it. Running the loop on itself is what found this; eight reviews did
+not, because each looked at its own piece and the hole was between them.
+
+Also not built: the three SDD skills still call the `openspec` CLI and are
+wrong in two known places (`openspec status <id>` is `--change <id>`, and
+`openspec/project.md` is never created — project context lives in
+`config.yaml`). Distillation now runs, but has not been exercised at length.
+There is no `project.md` constitution.
 
 ## Getting oriented fast
 
