@@ -638,10 +638,14 @@ fn pre_compact_writes_a_deterministic_checkpoint_and_queues_enrichment() {
         1,
         "compaction must never happen without a checkpoint behind it"
     );
+    // Asked for, not claimed. `pre-compact` spawns a detached worker against
+    // this same queue, so racing it to `claim_job` tests which of the two got
+    // there first — not the contract, which is that compaction leaves the
+    // enrichment queued for someone.
     assert!(
         store
-            .claim_job("enrich_checkpoint", Duration::from_mins(1))
-            .expect("claim")
+            .job_state("enrich_checkpoint", &run_id.to_string())
+            .expect("job state")
             .is_some(),
         "the reasoning behind the work is enriched asynchronously"
     );
