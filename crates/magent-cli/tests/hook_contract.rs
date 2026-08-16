@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use magent_core::{HarnessKind, OperationId, StartRunCommand};
+use magent_core::{HarnessKind, OperationId, SpecBinding, StartRunCommand};
 use magent_store::Store;
 use serde_json::{Value, json};
 
@@ -302,6 +302,152 @@ fn session_start_replays_the_latest_checkpoint() {
     assert!(
         run.stdout.to_lowercase().contains("deterministic"),
         "the packet must say the checkpoint has not been enriched yet:\n{}",
+        run.stdout
+    );
+}
+
+/// The user's complaint that started this task: fifteen commits went straight
+/// to `main` on an agreed spec change because nothing noticed. A run bound to
+/// a spec change and left on `main` must say so, naming the branch.
+#[test]
+fn session_start_flags_a_spec_bound_run_left_on_main() {
+    let fixture = Fixture::new();
+    let store = fixture.store();
+    let started = store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "wire the budget into the client".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![fixture.repo.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start run");
+    store
+        .bind_spec(
+            started.run_id,
+            &SpecBinding {
+                change_id: Some("add-retry-budget".into()),
+                paths: vec![],
+                current_task: None,
+            },
+        )
+        .expect("bind spec");
+    drop(store);
+
+    let run = fixture.hook("session-start", &fixture.base("SessionStart", "s-main"));
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    // `main` alone would pass on the `Git:` line above whether or not the
+    // note fired, so the branch is asserted as the note interpolates it.
+    assert!(
+        run.stdout.contains("agreed spec change") && run.stdout.contains("directly on `main`"),
+        "the note must name the branch and the spec change in flight:\n{}",
+        run.stdout
+    );
+}
+
+/// The other half of the heuristic.
+///
+/// Review deleted `master` from the guard and every test stayed green: the
+/// fixture always creates the repository with `-b main`, so half of what the
+/// comment claims was covered by nothing.
+#[test]
+fn session_start_flags_a_spec_bound_run_left_on_master() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["checkout", "-b", "master"]);
+
+    let store = fixture.store();
+    let started = store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "wire the budget into the client".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![fixture.repo.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start run");
+    store
+        .bind_spec(
+            started.run_id,
+            &SpecBinding {
+                change_id: Some("add-retry-budget".into()),
+                paths: vec![],
+                current_task: None,
+            },
+        )
+        .expect("bind spec");
+    drop(store);
+
+    let run = fixture.hook("session-start", &fixture.base("SessionStart", "s-master"));
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("directly on `master`"),
+        "the older default branch is half the heuristic:\n{}",
+        run.stdout
+    );
+}
+
+/// Same run, but on a branch of its own: the whole point is that Magent stays
+/// quiet once a human has already made the call.
+#[test]
+fn session_start_says_nothing_on_a_feature_branch() {
+    let fixture = Fixture::new();
+    git(&fixture.repo, &["checkout", "-b", "feature/x"]);
+    let store = fixture.store();
+    let started = store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "wire the budget into the client".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![fixture.repo.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start run");
+    store
+        .bind_spec(
+            started.run_id,
+            &SpecBinding {
+                change_id: Some("add-retry-budget".into()),
+                paths: vec![],
+                current_task: None,
+            },
+        )
+        .expect("bind spec");
+    drop(store);
+
+    let run = fixture.hook("session-start", &fixture.base("SessionStart", "s-feature"));
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        !run.stdout.contains("agreed spec change"),
+        "a branch of its own is a decision already made, not one to flag:\n{}",
+        run.stdout
+    );
+}
+
+/// Ordinary work on `main` is the common case and must stay silent: the note
+/// exists only for spec-driven work that landed on the default branch.
+#[test]
+fn session_start_says_nothing_without_a_spec_change() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "fix the flaky payment test");
+
+    let run = fixture.hook("session-start", &fixture.base("SessionStart", "s-nospec"));
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        !run.stdout.contains("agreed spec change"),
+        "no spec change is in flight, so there is nothing to flag:\n{}",
         run.stdout
     );
 }

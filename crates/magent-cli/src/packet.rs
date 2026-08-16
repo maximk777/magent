@@ -56,6 +56,7 @@ pub fn render(
 
     if let Some(state) = git {
         let _ = writeln!(out, "Git: {}", describe_git(state));
+        push_branch_note(&mut out, run.spec.as_ref(), state);
     }
 
     out.push_str("Detail: magent_search, magent_recall\n");
@@ -166,6 +167,38 @@ fn push_list(out: &mut String, label: &str, items: &[String]) {
     if !joined.is_empty() {
         let _ = writeln!(out, "{label}: {joined}");
     }
+}
+
+/// Names the branch when an agreed spec change is being executed on what is
+/// probably the repository's default branch.
+///
+/// Magent only observes; it does not tell anyone to branch, because the
+/// decision is the human's. It stays silent when there is no spec change in
+/// flight, when the branch is not `main`/`master`, and on a detached HEAD —
+/// a line that appears every session is a line nobody reads.
+///
+/// `main`/`master` is a heuristic, not a fact: nothing here can ask an
+/// arbitrary repository what its actual default branch is, and this guess
+/// covers nearly every case without ever having been told the truth.
+fn push_branch_note(out: &mut String, spec: Option<&magent_core::SpecBinding>, git: &GitState) {
+    let has_spec = spec
+        .and_then(|spec| spec.change_id.as_deref())
+        .is_some_and(|id| !id.trim().is_empty());
+    if !has_spec {
+        return;
+    }
+
+    let Some(branch) = git.branch.as_deref() else {
+        return;
+    };
+    if branch != "main" && branch != "master" {
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "Note: the agreed spec change is being executed directly on `{branch}`."
+    );
 }
 
 fn describe_git(state: &GitState) -> String {
