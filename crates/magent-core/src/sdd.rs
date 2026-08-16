@@ -126,9 +126,11 @@ pub struct RequirementDraft {
     /// requirement that already exists rather than re-pasting its text.
     #[serde(default)]
     pub requirement_id: Option<String>,
-    /// Required, and must be non-empty, for `Added` and `Modified`. A
-    /// requirement without at least one scenario is the failure `OpenSpec`
-    /// lets through silently when a scenario is malformed.
+    /// Required, and must be non-empty, for `Added` and `Modified`: a
+    /// requirement with no scenario can only be asserted, never checked
+    /// against. `OpenSpec` states the same rule in prose, where a scenario
+    /// written with the wrong heading simply is not read as one and the
+    /// requirement loses it without complaint.
     #[serde(default)]
     pub scenarios: Vec<ScenarioDraft>,
 }
