@@ -92,9 +92,31 @@ pub enum StoreError {
     /// would not be caught at all — the key only knows the row exists — and a
     /// missing one would be reported as a constraint rather than as the
     /// mistyped id it is.
-    #[error("requirement {requirement_id} is not a requirement of capability {capability_path:?}")]
+    ///
+    /// "live" covers all three ways the target can be wrong: absent, another
+    /// capability's, or already retired. A retired requirement is kept rather
+    /// than deleted, so it is findable and still may not be patched — the
+    /// message says *live* so that a caller holding a correct id is told what
+    /// is actually the matter with it.
+    #[error(
+        "requirement {requirement_id} is not a live requirement of capability {capability_path:?}"
+    )]
     RequirementNotFound {
         requirement_id: String,
+        capability_path: String,
+    },
+
+    /// A change accumulates deltas: a second `specify` for the same capability
+    /// adds to what is already proposed rather than replacing it, so a
+    /// requirement name it has used once cannot be used again. The
+    /// `spec_deltas_identity` index says so too, and says it as "UNIQUE
+    /// constraint failed" — the message this method's other checks exist to
+    /// keep a caller from having to interpret.
+    #[error(
+        "this change already proposes a requirement named {requirement_name:?} for capability {capability_path:?}"
+    )]
+    DeltaAlreadyProposed {
+        requirement_name: String,
         capability_path: String,
     },
 }
@@ -121,6 +143,7 @@ impl StoreError {
             Self::CapabilityPurposeRequired(_) => "capability_purpose_required",
             Self::CapabilityPurposeRedundant(_) => "capability_purpose_redundant",
             Self::RequirementNotFound { .. } => "requirement_not_found",
+            Self::DeltaAlreadyProposed { .. } => "delta_already_proposed",
         }
     }
 }

@@ -117,12 +117,20 @@ fn seed_capability(connection: &Connection, workspace_id: &str, id: &str, path: 
         .expect("seed capability");
 }
 
-fn seed_requirement(connection: &Connection, capability_id: &str, id: &str, name: &str) {
+/// `status` is `live` or `removed`: a retired requirement is kept rather than
+/// deleted, so a delta can still name one that nothing may patch.
+fn seed_requirement(
+    connection: &Connection,
+    capability_id: &str,
+    id: &str,
+    name: &str,
+    status: &str,
+) {
     connection
         .execute(
             "INSERT INTO requirements (id, capability_id, name, text, status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'The worker SHALL retry.', 'live', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
-            rusqlite::params![id, capability_id, name],
+             VALUES (?1, ?2, ?3, 'The worker SHALL retry.', ?4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![id, capability_id, name, status],
         )
         .expect("seed requirement");
 }
@@ -530,7 +538,13 @@ fn a_modified_delta_naming_a_requirement_of_this_capability_is_accepted() {
 
     let raw = Connection::open(&path).expect("raw connection");
     seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
-    seed_requirement(&raw, "cap-retry", "req-budget", "a budget caps retries");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
 
     let command = specify_command(
         change,
@@ -575,6 +589,7 @@ fn a_modified_delta_naming_another_capabilitys_requirement_is_rejected() {
         "cap-queue",
         "req-queue-depth",
         "the queue has a depth",
+        "live",
     );
 
     let command = specify_command(
@@ -695,5 +710,166 @@ fn specify_against_a_change_that_does_not_exist_is_named_rather_than_left_to_the
     assert!(
         matches!(&result, Err(StoreError::ChangeNotFound(id)) if *id == missing),
         "expected the unknown change to be named, got {result:?}"
+    );
+}
+
+/// A spec that changed under a plan invalidates it, so `specify` pulls the
+/// change back to `specified` from any open status rather than only advancing
+/// it. Pinned because the behaviour reads like a bug to anyone who has not
+/// been told the reasoning: better the next step discovers the plan needs
+/// revisiting than the change sits at `planned` carrying a description that
+/// plan never covered.
+#[test]
+fn specify_pulls_a_planned_change_back_to_specified() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    // Planning is slice 2's verb, so the status is set the way archiving is
+    // in the test above.
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'planned' WHERE id = ?1",
+        [change.to_string()],
+    )
+    .expect("plan");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let report = store.specify(&command, &ctx).expect("specify");
+
+    assert_eq!(report.status, ChangeStatus::Specified);
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        status, "specified",
+        "a spec written after planning sends the change back to be re-planned"
+    );
+}
+
+#[test]
+fn a_modified_delta_naming_a_removed_requirement_is_rejected() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-retired",
+        "retries are unbounded",
+        "removed",
+    );
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![modified("retries are unbounded", "req-retired")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::RequirementNotFound { requirement_id, .. })
+                if requirement_id == "req-retired"
+        ),
+        "a requirement already retired cannot be patched, got {result:?}"
+    );
+}
+
+/// Reached on the ordinary path: a model refining a spec calls `specify`
+/// again and repeats a requirement name it already sent. Left to
+/// `spec_deltas_identity`, the answer is "UNIQUE constraint failed", which is
+/// the message the other checks in this method exist to avoid.
+#[test]
+fn a_requirement_name_this_change_already_proposed_is_named_rather_than_left_to_the_index() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let first = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    store.specify(&first, &ctx).expect("first specify");
+
+    // A fresh operation_id, so this is a second call rather than a replay.
+    let again = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let result = store.specify(&again, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::DeltaAlreadyProposed { requirement_name, capability_path })
+                if requirement_name == "a spent budget parks the job"
+                    && capability_path == "worker/retry"
+        ),
+        "expected the repeated requirement name to be named, got {result:?}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        1,
+        "the first call's delta stands; the second added nothing"
+    );
+}
+
+/// The complement of the test above: a second `specify` adds to what the
+/// change already proposes rather than replacing it.
+#[test]
+fn a_second_specify_adds_to_the_deltas_already_proposed() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let first = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    store.specify(&first, &ctx).expect("first specify");
+
+    let second = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("the budget is configurable")],
+    );
+    let report = store.specify(&second, &ctx).expect("second specify");
+
+    assert_eq!(
+        report.added, 1,
+        "the report counts this call, not the change"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        2,
+        "the earlier delta is kept alongside the new one"
     );
 }

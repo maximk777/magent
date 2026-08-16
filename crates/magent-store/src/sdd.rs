@@ -145,6 +145,12 @@ impl Store {
     /// Every delta and every scenario lands in one transaction: a spec is one
     /// artifact, and half of it is not a smaller spec but an unreviewed one.
     ///
+    /// Called again for the same capability, it *adds* to the deltas the
+    /// change already carries — nothing written earlier is replaced or
+    /// removed, and a requirement name used once cannot be used again. There
+    /// is deliberately no way to edit a delta here: correcting one is
+    /// reworking the change, not appending to it.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Domain`] for an invalid command,
@@ -153,8 +159,9 @@ impl Store {
     /// change cannot take deltas, [`StoreError::CapabilityPurposeRequired`] or
     /// [`StoreError::CapabilityPurposeRedundant`] when the purpose does not
     /// match what the capability needs, [`StoreError::RequirementNotFound`]
-    /// when a delta patches a requirement this capability does not have, or a
-    /// database error.
+    /// when a delta patches a requirement this capability does not have live,
+    /// [`StoreError::DeltaAlreadyProposed`] when it repeats a requirement name
+    /// this change has already used, or a database error.
     pub fn specify(
         &self,
         command: &SpecifyCommand,
@@ -186,6 +193,7 @@ impl Store {
             for requirement in &command.requirements {
                 let requirement_id =
                     resolve_requirement(tx, capability_id.as_deref(), requirement, command)?;
+                require_unproposed(tx, &change_id, command, requirement)?;
                 write_delta(
                     tx,
                     &change_id,
@@ -204,6 +212,12 @@ impl Store {
                 }
             }
 
+            // From any open status, not only from `drafting`: a change that
+            // was already `planned` comes *back* to `specified`. The plan was
+            // written against the spec as it stood, so a spec that has moved
+            // leaves it describing work nobody agreed to. Better the next step
+            // finds a change waiting to be re-planned than one sitting at
+            // `planned` under a plan that no longer covers it.
             tx.execute(
                 "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![enum_to_sql(&ChangeStatus::Specified)?, &now, &change_id,],
@@ -280,12 +294,16 @@ fn resolve_capability(
     }
 }
 
-/// The requirement a delta patches, checked to be one this capability has.
+/// The requirement a delta patches, checked to be a live one of this
+/// capability.
 ///
 /// `Added` names none: there is nothing yet to point at, so an id supplied
 /// alongside it is not written. For the other three `magent-core` has already
 /// insisted an id is present, and what is left is whether it is *this*
-/// capability's — a foreign key would happily accept another's.
+/// capability's — a foreign key would happily accept another's — and whether
+/// it is still live. A retired requirement is kept rather than deleted, and
+/// none of the three ops means anything against one: modifying, removing or
+/// renaming something already withdrawn changes nothing that ships.
 fn resolve_requirement<'a>(
     tx: &Transaction<'_>,
     capability_id: Option<&str>,
@@ -305,7 +323,8 @@ fn resolve_requirement<'a>(
         // yet is refused here too.
         let belongs: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM requirements WHERE id = ?1 AND capability_id IS ?2",
+                "SELECT 1 FROM requirements
+                 WHERE id = ?1 AND capability_id IS ?2 AND status = 'live'",
                 rusqlite::params![id, capability_id],
                 |row| row.get(0),
             )
@@ -319,6 +338,40 @@ fn resolve_requirement<'a>(
     }
 
     Ok(requirement_id)
+}
+
+/// Refuses a requirement name this change has already proposed for this
+/// capability.
+///
+/// Calling `specify` again *adds* to a change's deltas; it does not replace
+/// them, which is what makes a repeated name a collision rather than an
+/// overwrite. A model refining a spec runs into this on the ordinary path, so
+/// what it gets back has to be its own words rather than the name of the
+/// `spec_deltas_identity` index. Duplicates *within* one command are already
+/// `magent-core`'s to catch; this is the second call.
+fn require_unproposed(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    command: &SpecifyCommand,
+    requirement: &RequirementDraft,
+) -> Result<(), StoreError> {
+    let taken: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM spec_deltas
+             WHERE change_id = ?1 AND capability_path = ?2 AND name = ?3",
+            rusqlite::params![change_id, &command.capability_path, &requirement.name],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if taken.is_some() {
+        return Err(StoreError::DeltaAlreadyProposed {
+            requirement_name: requirement.name.clone(),
+            capability_path: command.capability_path.clone(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Writes one delta and the scenarios that belong to it.
