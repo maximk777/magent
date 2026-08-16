@@ -27,7 +27,7 @@ pub use git::{
 };
 pub use grouping::WorkspaceGrouping;
 pub use migrations::CURRENT_VERSION;
-pub use sdd::SpecifyReport;
+pub use sdd::{ArchiveReport, PlanReport, SpecifyReport};
 pub use sessions::SessionBinding;
 pub use setup::{GroupingProposal, Sibling};
 pub use store::{Job, JobState, Store, WorkspaceResolution};

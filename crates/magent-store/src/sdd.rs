@@ -4,9 +4,12 @@
 //! is already in the database, so the checks that depend on existing rows —
 //! is this slug already live — belong here rather than there.
 
+use std::collections::HashSet;
+
 use chrono::Utc;
 use magent_core::{
-    ChangeId, ChangeStatus, DeltaOp, ProposeCommand, RequirementDraft, SpecifyCommand, Validate,
+    ArchiveCommand, ChangeId, ChangeStatus, DeltaOp, PlanCommand, ProposeCommand, RequirementDraft,
+    SpecifyCommand, Validate,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,47 @@ pub struct SpecifyReport {
     pub removed: usize,
     pub renamed: usize,
     /// Where the change now sits — `specified`, since that is what this call
+    /// moves it to.
+    pub status: ChangeStatus,
+}
+
+/// What a `plan` wrote, in terms the caller can check against what it sent.
+///
+/// A count of the whole plan rather than of what this call added, because a
+/// plan replaces whatever stood before it: "four tasks, now planned" is the
+/// state of the change, and after a re-plan of two tasks it says two.
+///
+/// There is deliberately no list of uncovered requirements here. A plan that
+/// leaves one uncovered is refused outright
+/// ([`StoreError::RequirementsUncovered`]), so the field could only ever come
+/// back empty — and a field that is always empty reads as a promise the caller
+/// is meant to check.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanReport {
+    pub tasks: usize,
+    /// Where the change now sits — `planned`, since that is what this call
+    /// moves it to.
+    pub status: ChangeStatus,
+}
+
+/// What an `archive` folded into the live base, in terms the caller can check
+/// against the deltas it wrote.
+///
+/// Counted by operation like [`SpecifyReport`], because that is the shape the
+/// caller can compare with the change it has been reading all along. The
+/// capabilities are named rather than counted: a capability created here is a
+/// new heading in the live base that existed nowhere before this call, and
+/// "one capability created" leaves the caller to work out which.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArchiveReport {
+    pub added: usize,
+    pub modified: usize,
+    pub removed: usize,
+    pub renamed: usize,
+    /// Paths of the capabilities this call created, in the order the deltas
+    /// were applied.
+    pub capabilities_created: Vec<String>,
+    /// Where the change now sits — `archived`, since that is what this call
     /// moves it to.
     pub status: ChangeStatus,
 }
@@ -228,6 +272,644 @@ impl Store {
             Ok(report)
         })
     }
+
+    /// Writes a change's task list and moves it to `planned`.
+    ///
+    /// The whole plan lands in one transaction, and — unlike [`Store::specify`],
+    /// which accumulates deltas — a second call *replaces* the tasks the change
+    /// already had rather than adding to them. A plan is one connected thing:
+    /// its numbers and the dependencies its tasks declare on each other are
+    /// agreed against one another, so a task appended to the side of one
+    /// belongs to a plan nobody reviewed. Re-planning submits the whole list
+    /// again, and what was there before goes.
+    ///
+    /// Task numbers are unique per change (`tasks_number`), and nothing here
+    /// checks that separately: duplicates within one command are
+    /// `magent-core`'s to catch, and the tasks already on the change are gone
+    /// by the time these are written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Domain`] for an invalid command,
+    /// [`StoreError::NoWorkspace`] when the context names no workspace,
+    /// [`StoreError::ChangeNotFound`] or [`StoreError::ChangeClosed`] when the
+    /// change cannot be planned at all, [`StoreError::ChangeNotSpecified`]
+    /// when it has no spec to plan against,
+    /// [`StoreError::RequirementsUncovered`] when a requirement the change
+    /// proposes has no task implementing it, or a database error.
+    pub fn plan(
+        &self,
+        command: &PlanCommand,
+        context: &FactContext,
+    ) -> Result<PlanReport, StoreError> {
+        command.validate()?;
+
+        // Outside the closure, as in `Store::propose` and `Store::specify`:
+        // an answer already known is not worth another writer's turn at the
+        // lock.
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        self.execute_operation("plan", command.operation_id, command, |tx| {
+            let change_id = command.change.to_string();
+            require_plannable_change(tx, command.change, &workspace_id.to_string())?;
+            require_full_coverage(tx, &change_id, command)?;
+
+            let now = Utc::now().to_rfc3339();
+
+            // The replacement the doc comment describes. Ahead of the inserts
+            // rather than after them, so a re-plan reusing a number is not
+            // fighting `tasks_number` with itself.
+            tx.execute("DELETE FROM tasks WHERE change_id = ?1", [&change_id])?;
+
+            for task in &command.tasks {
+                tx.execute(
+                    "INSERT INTO tasks (
+                         id, change_id, number, title, body, files_json, consumes, produces,
+                         verify_command, expected_output, covers_json, status,
+                         created_at, updated_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?12)",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().to_string(),
+                        &change_id,
+                        &task.number,
+                        &task.title,
+                        task.body.as_deref(),
+                        serde_json::to_string(&task.files)?,
+                        task.consumes.as_deref(),
+                        task.produces.as_deref(),
+                        &task.verify_command,
+                        &task.expected_output,
+                        serde_json::to_string(&task.covers)?,
+                        &now,
+                    ],
+                )?;
+            }
+
+            tx.execute(
+                "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![enum_to_sql(&ChangeStatus::Planned)?, &now, &change_id],
+            )?;
+
+            Ok(PlanReport {
+                tasks: command.tasks.len(),
+                status: ChangeStatus::Planned,
+            })
+        })
+    }
+
+    /// Folds a change's deltas into the live base and moves it to `archived`.
+    ///
+    /// This is the step the other three exist for. Until it runs, a change's
+    /// deltas are a proposal and `capabilities`, `requirements` and
+    /// `scenarios` still describe the product as it was; after it, they
+    /// describe the product as it is, and the next change reads them as its
+    /// starting point. Every delta lands in one transaction for that reason —
+    /// a half-applied archive is a live base describing a product that never
+    /// existed, and nothing downstream can tell which half landed.
+    ///
+    /// A `removed` delta retires its requirement rather than deleting it:
+    /// `requirements.status` exists so that a withdrawn requirement stays
+    /// legible as a decision that was taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Domain`] for an invalid command,
+    /// [`StoreError::NoWorkspace`] when the context names no workspace,
+    /// [`StoreError::ChangeNotFound`] or [`StoreError::ChangeClosed`] when the
+    /// change cannot be archived at all, [`StoreError::ChangeNotExecuted`]
+    /// when a task of it is still open or it was never planned,
+    /// [`StoreError::NothingToArchive`] when it proposes no deltas and did not
+    /// declare `skip_specs`, [`StoreError::CapabilityPurposeRequired`] when a
+    /// delta creating a capability carries no purpose, or a database error.
+    pub fn archive(
+        &self,
+        command: &ArchiveCommand,
+        context: &FactContext,
+    ) -> Result<ArchiveReport, StoreError> {
+        command.validate()?;
+
+        // Outside the closure, as in the three verbs above.
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        self.execute_operation("archive", command.operation_id, command, |tx| {
+            let change_id = command.change.to_string();
+            let workspace = workspace_id.to_string();
+            let (namespace, skip_specs) =
+                require_archivable_change(tx, command.change, &workspace)?;
+            require_tasks_closed(tx, command.change, &change_id, skip_specs)?;
+
+            let deltas = load_deltas(tx, &change_id)?;
+            if deltas.is_empty() && !skip_specs {
+                return Err(StoreError::NothingToArchive(command.change));
+            }
+
+            let now = Utc::now().to_rfc3339();
+            let mut report = ArchiveReport {
+                added: 0,
+                modified: 0,
+                removed: 0,
+                renamed: 0,
+                capabilities_created: Vec::new(),
+                status: ChangeStatus::Archived,
+            };
+
+            for delta in &deltas {
+                apply_delta(
+                    tx,
+                    &workspace,
+                    namespace.as_deref(),
+                    delta,
+                    &now,
+                    &mut report,
+                )?;
+            }
+
+            tx.execute(
+                "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![enum_to_sql(&ChangeStatus::Archived)?, &now, &change_id],
+            )?;
+
+            Ok(report)
+        })
+    }
+}
+
+/// One row of `spec_deltas`, as archiving needs to read it.
+///
+/// `created_at` and the counts the report keeps are not here: this is the
+/// instruction, not the record of carrying it out.
+struct DeltaRow {
+    id: String,
+    capability_path: String,
+    capability_id: Option<String>,
+    purpose: Option<String>,
+    op: DeltaOp,
+    requirement_id: Option<String>,
+    name: String,
+    text: Option<String>,
+    rename_to: Option<String>,
+}
+
+/// Reads the change being archived and refuses one that is already closed.
+///
+/// Hands back the namespace, which a delta creating a capability needs, and
+/// `skip_specs`, which decides whether an empty change is legitimate. Scoped
+/// by workspace like its two siblings: an id from another workspace does not
+/// exist as far as this caller is concerned.
+///
+/// Unlike `require_plannable_change` there is no list of statuses that may
+/// archive. Planning replaces rows that carry evidence of work, so it has to
+/// care where the change stands; archiving only reads deltas nothing has
+/// applied yet, and a change is either still open or it is not.
+fn require_archivable_change(
+    tx: &Transaction<'_>,
+    change: ChangeId,
+    workspace_id: &str,
+) -> Result<(Option<String>, bool), StoreError> {
+    let row: Option<(String, Option<String>, bool)> = tx
+        .query_row(
+            "SELECT status, namespace, skip_specs FROM sdd_changes
+             WHERE id = ?1 AND workspace_id = ?2",
+            rusqlite::params![change.to_string(), workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+
+    let (status, namespace, skip_specs) = row.ok_or(StoreError::ChangeNotFound(change))?;
+    let status: ChangeStatus = enum_from_sql(&status)?;
+    if matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned) {
+        return Err(StoreError::ChangeClosed(change));
+    }
+
+    Ok((namespace, skip_specs))
+}
+
+/// Refuses to archive a change whose work is not finished.
+///
+/// `skipped` counts as closed: a task deliberately passed over is a decision
+/// somebody took, unlike one still `pending` or `running`. A change with no
+/// tasks at all is refused too, unless it was proposed with `skip_specs` —
+/// planning may legitimately never have happened for one of those, whereas a
+/// change that wrote specs and no plan has had nothing done to it.
+fn require_tasks_closed(
+    tx: &Transaction<'_>,
+    change: ChangeId,
+    change_id: &str,
+    skip_specs: bool,
+) -> Result<(), StoreError> {
+    // Ordered so that a caller re-reading the refusal after finishing one task
+    // sees the rest in the same order rather than a reshuffled list.
+    let mut statement = tx.prepare(
+        "SELECT number FROM tasks
+         WHERE change_id = ?1 AND status NOT IN ('done', 'skipped')
+         ORDER BY number",
+    )?;
+    let open = statement
+        .query_map([change_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !open.is_empty() {
+        return Err(StoreError::ChangeNotExecuted {
+            change,
+            tasks: open,
+        });
+    }
+
+    if !skip_specs {
+        let planned: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE change_id = ?1",
+            [change_id],
+            |row| row.get(0),
+        )?;
+        if planned == 0 {
+            return Err(StoreError::ChangeNotExecuted {
+                change,
+                tasks: Vec::new(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// The change's deltas, in the order they will be applied.
+///
+/// `created_at` then `name`, the ordering `require_full_coverage` already
+/// uses: every delta of one `specify` call shares a timestamp, so the name is
+/// what makes the order of two of them the same on every run.
+fn load_deltas(tx: &Transaction<'_>, change_id: &str) -> Result<Vec<DeltaRow>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT id, capability_path, capability_id, purpose, op, requirement_id,
+                name, text, rename_to
+         FROM spec_deltas WHERE change_id = ?1
+         ORDER BY created_at, name",
+    )?;
+
+    let rows = statement
+        .query_map([change_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(DeltaRow {
+                id: row.0,
+                capability_path: row.1,
+                capability_id: row.2,
+                purpose: row.3,
+                op: enum_from_sql(&row.4)?,
+                requirement_id: row.5,
+                name: row.6,
+                text: row.7,
+                rename_to: row.8,
+            })
+        })
+        .collect()
+}
+
+/// Folds one delta into the live base and counts it in the report.
+fn apply_delta(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    namespace: Option<&str>,
+    delta: &DeltaRow,
+    now: &str,
+    report: &mut ArchiveReport,
+) -> Result<(), StoreError> {
+    match delta.op {
+        DeltaOp::Added => {
+            let capability_id = ensure_capability(tx, workspace_id, namespace, delta, now, report)?;
+            let requirement_id = uuid::Uuid::new_v4().to_string();
+
+            // `text` is passed as it stands rather than defaulted: the column
+            // is NOT NULL and `magent-core` refuses an addition without text,
+            // so a NULL here is a row nothing in this crate can write, and a
+            // constraint failure says so far more usefully than a requirement
+            // silently filed with no text at all.
+            tx.execute(
+                "INSERT INTO requirements
+                     (id, capability_id, name, text, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'live', ?5, ?5)",
+                rusqlite::params![
+                    &requirement_id,
+                    &capability_id,
+                    &delta.name,
+                    delta.text.as_deref(),
+                    now,
+                ],
+            )?;
+            copy_scenarios(tx, &delta.id, &requirement_id)?;
+            report.added += 1;
+        }
+        DeltaOp::Modified => {
+            let requirement_id = patched_requirement(delta)?;
+            // `specify` checked this requirement was live, but that was then.
+            // Archiving is the only place the live base moves, and the window
+            // between the two calls is wide enough for another change to have
+            // been proposed, specified and archived — retiring this very
+            // requirement. Without the guard the update lands on the retired
+            // row and leaves it carrying fresh text nobody agreed to ship.
+            let patched = tx.execute(
+                "UPDATE requirements SET text = ?1, updated_at = ?2
+                 WHERE id = ?3 AND status = 'live'",
+                rusqlite::params![delta.text.as_deref(), now, requirement_id],
+            )?;
+            if patched == 0 {
+                return Err(StoreError::RequirementNotFound {
+                    requirement_id: requirement_id.to_owned(),
+                    capability_path: delta.capability_path.clone(),
+                });
+            }
+
+            // Replaced rather than merged, which is what "a delta carries the
+            // whole requirement, not a diff" means once it reaches the live
+            // base: a scenario the author dropped when rewriting the
+            // requirement has to disappear, and one kept is written again.
+            tx.execute(
+                "DELETE FROM scenarios WHERE requirement_id = ?1",
+                [requirement_id],
+            )?;
+            copy_scenarios(tx, &delta.id, requirement_id)?;
+            report.modified += 1;
+        }
+        DeltaOp::Removed => {
+            tx.execute(
+                "UPDATE requirements SET status = 'removed', updated_at = ?1 WHERE id = ?2",
+                rusqlite::params![now, patched_requirement(delta)?],
+            )?;
+            report.removed += 1;
+        }
+        DeltaOp::Renamed => {
+            let requirement_id = patched_requirement(delta)?;
+            // Guarded for the same reason as `Modified`. `Removed` is not:
+            // retiring a requirement that another change already retired
+            // changes nothing and needs no argument.
+            let renamed = tx.execute(
+                "UPDATE requirements SET name = ?1, updated_at = ?2
+                 WHERE id = ?3 AND status = 'live'",
+                rusqlite::params![delta.rename_to.as_deref(), now, requirement_id],
+            )?;
+            if renamed == 0 {
+                return Err(StoreError::RequirementNotFound {
+                    requirement_id: requirement_id.to_owned(),
+                    capability_path: delta.capability_path.clone(),
+                });
+            }
+            report.renamed += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// The requirement a `modified`, `removed` or `renamed` delta patches.
+///
+/// `magent-core` refuses all three without an id and `specify` checked that id
+/// against the capability's live requirements, so this cannot be `None` for a
+/// row this crate wrote. Named as an error rather than defaulted anyway,
+/// because the alternative is an `UPDATE ... WHERE id IS NULL`, which matches
+/// nothing, changes nothing and would still be counted in the report as
+/// applied.
+fn patched_requirement(delta: &DeltaRow) -> Result<&str, StoreError> {
+    delta
+        .requirement_id
+        .as_deref()
+        .ok_or_else(|| StoreError::RequirementNotFound {
+            requirement_id: format!("(none, on delta {:?})", delta.name),
+            capability_path: delta.capability_path.clone(),
+        })
+}
+
+/// The capability an `added` delta files its requirement under, created if it
+/// is not there yet.
+///
+/// The delta's own `capability_id` is trusted when set, and the table is
+/// consulted again when it is not: `specify` left it NULL because the
+/// capability did not exist *then*, and by now an earlier delta of this same
+/// change — or another change archived in between — may have created it.
+fn ensure_capability(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    namespace: Option<&str>,
+    delta: &DeltaRow,
+    now: &str,
+    report: &mut ArchiveReport,
+) -> Result<String, StoreError> {
+    if let Some(capability_id) = &delta.capability_id {
+        return Ok(capability_id.clone());
+    }
+
+    // Mirrors capabilities_path (0007_sdd.sql), NULL namespace folded the
+    // same way `resolve_capability` folds it.
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT id, purpose FROM capabilities
+             WHERE workspace_id = ?1 AND namespace IS ?2 AND path = ?3",
+            rusqlite::params![workspace_id, namespace, &delta.capability_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((capability_id, recorded)) = existing {
+        // Two deltas may name one capability that did not exist when either
+        // was written — `specify` cannot refuse a redundant purpose for a row
+        // that is not there yet, so both carry one and the second would lose
+        // its own the moment the first created the row. Refusing here is the
+        // rule `CapabilityPurposeRedundant` already states, arriving as late
+        // as it can: silently keeping whichever delta sorted first would
+        // discard text somebody wrote and report success.
+        if delta
+            .purpose
+            .as_deref()
+            .is_some_and(|offered| offered != recorded)
+        {
+            return Err(StoreError::CapabilityPurposeRedundant(
+                delta.capability_path.clone(),
+            ));
+        }
+        return Ok(capability_id);
+    }
+
+    // `specify` demands a purpose for a capability it cannot find, so this is
+    // the same refusal arriving late rather than a new rule. Reached only if
+    // the capability was deleted between the two calls — and filling the
+    // NOT NULL column with a placeholder instead is `OpenSpec`'s "TBD", which
+    // nobody ever circles back to.
+    let purpose = delta
+        .purpose
+        .as_deref()
+        .ok_or_else(|| StoreError::CapabilityPurposeRequired(delta.capability_path.clone()))?;
+
+    let capability_id = uuid::Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO capabilities
+             (id, workspace_id, namespace, path, purpose, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        rusqlite::params![
+            &capability_id,
+            workspace_id,
+            namespace,
+            &delta.capability_path,
+            purpose,
+            now,
+        ],
+    )?;
+    report
+        .capabilities_created
+        .push(delta.capability_path.clone());
+
+    Ok(capability_id)
+}
+
+/// Writes a delta's scenarios against a live requirement, keeping `seq`.
+///
+/// The rows in `delta_scenarios` stay where they are: they are what the change
+/// proposed, and an archived change whose scenarios had been moved out from
+/// under it would be a record of a decision with the decision removed.
+fn copy_scenarios(
+    tx: &Transaction<'_>,
+    delta_id: &str,
+    requirement_id: &str,
+) -> Result<(), StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT seq, name, given_text, when_text, then_text FROM delta_scenarios
+         WHERE delta_id = ?1 ORDER BY seq",
+    )?;
+    let scenarios = statement
+        .query_map([delta_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (seq, name, given_text, when_text, then_text) in scenarios {
+        tx.execute(
+            "INSERT INTO scenarios
+                 (id, requirement_id, seq, name, given_text, when_text, then_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                requirement_id,
+                seq,
+                &name,
+                given_text.as_deref(),
+                &when_text,
+                &then_text,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Reads the change a plan is for and refuses one that cannot take a plan.
+///
+/// Scoped by workspace for the same reason `require_open_change` is: an id from
+/// another workspace does not exist as far as this caller is concerned. It does
+/// not reuse that helper because what it needs from the row is different — the
+/// status and `skip_specs`, not the namespace — and reading the row twice to
+/// share a function would cost more than it saved.
+///
+/// `specified` is the ordinary starting point and `planned` is a re-plan.
+/// `drafting` is refused *unless* the change was proposed with `skip_specs`: a
+/// change that deliberately writes no specs never reaches `specified`, so
+/// insisting on that status would leave it with no way to be planned at all.
+fn require_plannable_change(
+    tx: &Transaction<'_>,
+    change: ChangeId,
+    workspace_id: &str,
+) -> Result<(), StoreError> {
+    let row: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT status, skip_specs FROM sdd_changes
+             WHERE id = ?1 AND workspace_id = ?2",
+            rusqlite::params![change.to_string(), workspace_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    let (raw_status, skip_specs) = row.ok_or(StoreError::ChangeNotFound(change))?;
+    let status: ChangeStatus = enum_from_sql(&raw_status)?;
+    if matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned) {
+        return Err(StoreError::ChangeClosed(change));
+    }
+
+    let plannable = match status {
+        ChangeStatus::Specified | ChangeStatus::Planned => true,
+        ChangeStatus::Drafting => skip_specs,
+        // `executing` and `ready` are past planning: the tasks are being
+        // worked, and replacing them would delete rows carrying the evidence
+        // of work already verified. `specify` pulls such a change back to
+        // `specified` first, which is the path that keeps that evidence's
+        // disappearance a decision rather than a side effect.
+        _ => false,
+    };
+    if !plannable {
+        return Err(StoreError::ChangeNotSpecified {
+            change,
+            status: raw_status,
+        });
+    }
+
+    Ok(())
+}
+
+/// Refuses a plan that leaves a requirement of this change to nobody.
+///
+/// Compared against `spec_deltas.name` rather than `requirements.name`: a
+/// task's `covers` holds the name the requirement was proposed under in *this*
+/// change, fixed at the moment of planning (`0009_tasks.sql`). A `renamed`
+/// delta moves the live name in `requirements` without touching the plan, so
+/// matching there would report a perfectly covered requirement as uncovered
+/// the first time one is renamed.
+///
+/// A change proposed with `skip_specs` has no deltas, so the query returns
+/// nothing and the check passes without needing a branch of its own.
+fn require_full_coverage(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    command: &PlanCommand,
+) -> Result<(), StoreError> {
+    let covered: HashSet<&str> = command
+        .tasks
+        .iter()
+        .flat_map(|task| task.covers.iter().map(String::as_str))
+        .collect();
+
+    // Ordered so that a caller re-reading the refusal after a failed fix sees
+    // the same list in the same order rather than a reshuffled one.
+    let mut statement = tx.prepare(
+        "SELECT name FROM spec_deltas WHERE change_id = ?1
+         ORDER BY created_at, name",
+    )?;
+    let uncovered = statement
+        .query_map([change_id], |row| row.get::<_, String>(0))?
+        .filter(|name| match name {
+            Ok(name) => !covered.contains(name.as_str()),
+            Err(_) => true,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !uncovered.is_empty() {
+        return Err(StoreError::RequirementsUncovered(uncovered));
+    }
+
+    Ok(())
 }
 
 /// Reads the change these deltas are for, refusing one that cannot take them,

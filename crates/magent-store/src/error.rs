@@ -119,6 +119,65 @@ pub enum StoreError {
         requirement_name: String,
         capability_path: String,
     },
+
+    /// A plan describes how to satisfy a spec, so there has to be one to plan
+    /// against. The status column takes any value the process puts there and
+    /// no constraint relates it to whether deltas exist, so the refusal has to
+    /// be here. The status is carried rather than assumed, because "specify it
+    /// first" is the wrong advice for a change that is already past planning.
+    #[error(
+        "change {change} is {status:?}; a plan is written from a specified change, or from a drafting one proposed with skip_specs"
+    )]
+    ChangeNotSpecified { change: ChangeId, status: String },
+
+    /// Every requirement a change proposes needs a task that implements it,
+    /// and the names are the part of that answer the caller cannot work out
+    /// from the command it just sent. Listed rather than counted: "coverage is
+    /// incomplete" makes the caller re-derive the query against a plan it has
+    /// only been told is wrong.
+    #[error("no task covers these requirements: {}", .0.join(", "))]
+    RequirementsUncovered(Vec<String>),
+
+    /// Archiving files a change's deltas as what is now true of the product,
+    /// so work still open would put an unbuilt behaviour into the live base
+    /// and every later change would read it as the starting point. Nothing in
+    /// the schema relates a change's status to its tasks', so the refusal has
+    /// to be here.
+    ///
+    /// The numbers are listed rather than counted, for the same reason
+    /// [`StoreError::RequirementsUncovered`] lists names: they are the part of
+    /// the answer the caller cannot derive from the command it just sent. An
+    /// empty list is the other shape of the same fault — a change with specs
+    /// and no plan at all was not executed either, and saying so in this
+    /// error keeps "nothing did this work" one answer instead of two.
+    #[error("change {change} is not executed: {}", unexecuted_detail(.tasks))]
+    ChangeNotExecuted {
+        change: ChangeId,
+        tasks: Vec<String>,
+    },
+
+    /// Archiving is the step that makes a change's deltas true; a change
+    /// carrying none has nothing to fold in. Moving it to `archived` anyway
+    /// would be the quietest possible way to lose it — the status would say
+    /// the work landed, and the live base would be untouched. Only a change
+    /// proposed with `skip_specs` may legitimately arrive here empty.
+    #[error(
+        "change {0} proposes no spec deltas and did not declare skip_specs; there is nothing to archive"
+    )]
+    NothingToArchive(ChangeId),
+}
+
+/// The tail of [`StoreError::ChangeNotExecuted`]'s message.
+///
+/// Two shapes rather than one: a list of numbers reads as work in progress,
+/// and an empty list means there was never a plan, which is a different thing
+/// for the caller to fix even though it is the same refusal.
+fn unexecuted_detail(tasks: &[String]) -> String {
+    if tasks.is_empty() {
+        "it has no tasks at all, so nothing on it was planned or done".to_owned()
+    } else {
+        format!("these tasks are still open: {}", tasks.join(", "))
+    }
 }
 
 impl StoreError {
@@ -144,6 +203,10 @@ impl StoreError {
             Self::CapabilityPurposeRedundant(_) => "capability_purpose_redundant",
             Self::RequirementNotFound { .. } => "requirement_not_found",
             Self::DeltaAlreadyProposed { .. } => "delta_already_proposed",
+            Self::ChangeNotSpecified { .. } => "change_not_specified",
+            Self::RequirementsUncovered(_) => "requirements_uncovered",
+            Self::ChangeNotExecuted { .. } => "change_not_executed",
+            Self::NothingToArchive(_) => "nothing_to_archive",
         }
     }
 }

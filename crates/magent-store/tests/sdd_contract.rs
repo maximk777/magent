@@ -1,14 +1,16 @@
-//! Opening a change and specifying it: `Store::propose`, `Store::specify`.
+//! Opening a change, specifying it, planning it and archiving it:
+//! `Store::propose`, `Store::specify`, `Store::plan`, `Store::archive`.
 //!
 //! Two properties carry this file. Each write is one operation — a change row
 //! and its proposal artifact appear together or not at all, and so do a
-//! change's deltas and their scenarios — and each is idempotent on
+//! change's deltas and their scenarios, a plan's tasks, and every delta an
+//! archive folds into the live base — and each is idempotent on
 //! `operation_id` the same way every other mutation in this store is, so a
 //! retry after a crash cannot duplicate state.
 
 use magent_core::{
-    ChangeId, ChangeStatus, Classification, DeltaOp, OperationId, ProposeCommand, RequirementDraft,
-    ScenarioDraft, SpecifyCommand,
+    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, OperationId, PlanCommand,
+    ProposeCommand, RequirementDraft, ScenarioDraft, SpecifyCommand, TaskDraft,
 };
 use magent_store::{FactContext, Store, StoreError};
 use rusqlite::Connection;
@@ -88,6 +90,34 @@ fn modified(name: &str, requirement_id: &str) -> RequirementDraft {
     }
 }
 
+/// A `Removed` requirement pointing at `requirement_id`.
+fn removed(name: &str, requirement_id: &str) -> RequirementDraft {
+    RequirementDraft {
+        op: DeltaOp::Removed,
+        name: name.into(),
+        text: None,
+        rename_to: None,
+        reason: Some("The budget subsumes it.".into()),
+        migration: Some("Set the budget to 1 for the old behaviour.".into()),
+        requirement_id: Some(requirement_id.into()),
+        scenarios: Vec::new(),
+    }
+}
+
+/// A `Renamed` requirement pointing at `requirement_id`.
+fn renamed(name: &str, requirement_id: &str, rename_to: &str) -> RequirementDraft {
+    RequirementDraft {
+        op: DeltaOp::Renamed,
+        name: name.into(),
+        text: None,
+        rename_to: Some(rename_to.into()),
+        reason: None,
+        migration: None,
+        requirement_id: Some(requirement_id.into()),
+        scenarios: Vec::new(),
+    }
+}
+
 fn specify_command(
     change: ChangeId,
     capability_path: &str,
@@ -133,6 +163,18 @@ fn seed_requirement(
             rusqlite::params![id, capability_id, name, status],
         )
         .expect("seed requirement");
+}
+
+/// A scenario already live against a seeded requirement, so that a delta
+/// replacing one can be told from a delta adding one beside it.
+fn seed_scenario(connection: &Connection, requirement_id: &str, seq: i64, name: &str) {
+    connection
+        .execute(
+            "INSERT INTO scenarios (id, requirement_id, seq, name, given_text, when_text, then_text)
+             VALUES (?1, ?2, ?3, ?4, NULL, 'the budget is exhausted', 'the job is parked')",
+            rusqlite::params![format!("{requirement_id}-scenario-{seq}"), requirement_id, seq, name],
+        )
+        .expect("seed scenario");
 }
 
 fn workspace_id(context: &FactContext) -> String {
@@ -871,5 +913,1051 @@ fn a_second_specify_adds_to_the_deltas_already_proposed() {
         count(&raw, "spec_deltas", "change_id", &change.to_string()),
         2,
         "the earlier delta is kept alongside the new one"
+    );
+}
+
+// --- planning ------------------------------------------------------------
+
+/// One task of a plan, covering the requirement names it is given.
+fn task(number: &str, covers: &[&str]) -> TaskDraft {
+    TaskDraft {
+        number: number.into(),
+        title: format!("Cap the retry loop, step {number}"),
+        body: Some("Read the budget from config and stop once it is spent.".into()),
+        files: vec!["crates/worker/src/retry.rs".into()],
+        consumes: None,
+        produces: Some("fn spend_budget(&mut self) -> bool".into()),
+        verify_command: "cargo test -p worker retry".into(),
+        expected_output: "test result: ok. 3 passed".into(),
+        covers: covers.iter().map(|name| (*name).to_string()).collect(),
+    }
+}
+
+fn plan_command(change: ChangeId, tasks: Vec<TaskDraft>) -> PlanCommand {
+    PlanCommand {
+        operation_id: OperationId::new(),
+        change,
+        tasks,
+    }
+}
+
+/// A change carrying one `Added` requirement and sitting at `specified` —
+/// the state a plan is normally written from.
+fn specified_change(store: &Store, ctx: &FactContext, slug: &str, requirement: &str) -> ChangeId {
+    let change = store.propose(&propose_command(slug), ctx).expect("propose");
+    store
+        .specify(
+            &specify_command(
+                change,
+                "worker/retry",
+                Some(PURPOSE),
+                vec![added(requirement)],
+            ),
+            ctx,
+        )
+        .expect("specify");
+    change
+}
+
+/// The ids of a change's tasks, in plan order — enough to tell a replay that
+/// wrote nothing from one that deleted the rows and wrote them again.
+fn task_ids(connection: &Connection, change_id: &str) -> Vec<String> {
+    connection
+        .prepare("SELECT id FROM tasks WHERE change_id = ?1 ORDER BY number")
+        .expect("prepare")
+        .query_map([change_id], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("task ids")
+}
+
+const REQUIREMENT: &str = "a spent budget parks the job";
+
+#[test]
+fn plan_writes_the_tasks_and_moves_the_change_to_planned() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let command = plan_command(
+        change,
+        vec![task("1", &[REQUIREMENT]), task("2.1", &[REQUIREMENT])],
+    );
+    let report = store.plan(&command, &ctx).expect("plan");
+
+    assert_eq!(report.tasks, 2);
+    assert_eq!(report.status, ChangeStatus::Planned);
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(count(&raw, "tasks", "change_id", &change.to_string()), 2);
+
+    let (number, verify_command, expected_output, covers_json, status): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = raw
+        .query_row(
+            "SELECT number, verify_command, expected_output, covers_json, status
+             FROM tasks WHERE change_id = ?1 AND number = '2.1'",
+            [change.to_string()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("task row");
+    assert_eq!(number, "2.1");
+    assert_eq!(verify_command, "cargo test -p worker retry");
+    assert_eq!(expected_output, "test result: ok. 3 passed");
+    assert_eq!(status, "pending");
+
+    let covers: Vec<String> = serde_json::from_str(&covers_json).expect("covers is json");
+    assert_eq!(covers, vec![REQUIREMENT.to_string()]);
+
+    let (_, _, change_status) = change_row(&raw, &change.to_string());
+    assert_eq!(change_status, "planned");
+}
+
+/// The refusal names what is uncovered. "Coverage is incomplete" leaves the
+/// caller to run the query itself against a plan it has just been told is
+/// wrong — and the names are the only part of the answer it cannot derive
+/// from the command it sent.
+#[test]
+fn a_requirement_no_task_covers_is_named_in_the_refusal() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let command = plan_command(change, vec![task("1", &[])]);
+    let error = store.plan(&command, &ctx).expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::RequirementsUncovered(names) if names == &[REQUIREMENT]),
+        "expected the uncovered requirement to be listed, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains(REQUIREMENT),
+        "the message must name what is uncovered, got {error}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "tasks", "change_id", &change.to_string()),
+        0,
+        "a refused plan writes no tasks"
+    );
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "specified", "a refused plan does not advance");
+}
+
+/// A plan is one artifact. Half of it is not a shorter plan but a plan whose
+/// numbering and dependencies nobody checked, so a task that cannot be
+/// written takes every task beside it with it.
+#[test]
+fn a_task_that_cannot_be_written_takes_the_whole_plan_with_it() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    // The second task is made unwritable from outside the store: nothing
+    // about the command itself is wrong, so the failure lands mid-write
+    // rather than during validation.
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_the_second_task BEFORE INSERT ON tasks
+         WHEN NEW.number = '2'
+         BEGIN SELECT RAISE(ABORT, 'the second task cannot be written'); END;",
+    )
+    .expect("trigger");
+
+    let command = plan_command(
+        change,
+        vec![task("1", &[REQUIREMENT]), task("2", &[REQUIREMENT])],
+    );
+    let error = store.plan(&command, &ctx).expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::Database(message)
+            if message.contains("the second task cannot be written")),
+        "expected the write to fail, got {error:?}"
+    );
+
+    assert_eq!(
+        count(&raw, "tasks", "change_id", &change.to_string()),
+        0,
+        "the accepted first task must not survive the rejected second"
+    );
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        status, "specified",
+        "a failed plan does not advance the change"
+    );
+}
+
+/// Planning again replaces the plan rather than adding to it — unlike
+/// `specify`, which accumulates. A plan's numbers and dependencies are agreed
+/// against each other, so a task appended to the side of one belongs to no
+/// plan anybody reviewed.
+#[test]
+fn replanning_replaces_the_previous_tasks_rather_than_adding_to_them() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    store
+        .plan(
+            &plan_command(
+                change,
+                vec![task("1", &[REQUIREMENT]), task("2", &[REQUIREMENT])],
+            ),
+            &ctx,
+        )
+        .expect("first plan");
+
+    // A fresh operation_id, so this is a second call rather than a replay.
+    let report = store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("replan");
+
+    assert_eq!(report.tasks, 1);
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "tasks", "change_id", &change.to_string()),
+        1,
+        "the earlier plan is replaced, not added to"
+    );
+}
+
+#[test]
+fn planning_a_change_that_was_never_specified_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let command = plan_command(change, vec![task("1", &[])]);
+    let result = store.plan(&command, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::ChangeNotSpecified { change: id, status })
+                if *id == change && status == "drafting"
+        ),
+        "expected an unspecified change to be named as such, got {result:?}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(count(&raw, "tasks", "change_id", &change.to_string()), 0);
+}
+
+/// A change that deliberately skips specs never reaches `specified`, so
+/// requiring that status would leave it with no way to be planned at all.
+#[test]
+fn a_change_that_skips_specs_is_planned_straight_from_drafting() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    let mut proposal = propose_command("retire-the-old-runner");
+    proposal.capabilities = Vec::new();
+    proposal.skip_specs = true;
+    let change = store.propose(&proposal, &ctx).expect("propose");
+
+    let report = store
+        .plan(&plan_command(change, vec![task("1", &[])]), &ctx)
+        .expect("a change without specs has nothing to leave uncovered");
+
+    assert_eq!(report.tasks, 1);
+    assert_eq!(report.status, ChangeStatus::Planned);
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "planned");
+}
+
+#[test]
+fn a_repeated_plan_returns_the_same_report_and_writes_nothing_twice() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let command = plan_command(
+        change,
+        vec![task("1", &[REQUIREMENT]), task("2", &[REQUIREMENT])],
+    );
+    let first = store.plan(&command, &ctx).expect("first plan");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let before = task_ids(&raw, &change.to_string());
+
+    let second = store.plan(&command, &ctx).expect("replayed plan");
+
+    assert_eq!(first, second);
+    assert_eq!(
+        count(&raw, "tasks", "change_id", &change.to_string()),
+        2,
+        "the replay must not have inserted more tasks"
+    );
+    assert_eq!(
+        task_ids(&raw, &change.to_string()),
+        before,
+        "the replay must not have rewritten the tasks under new ids"
+    );
+}
+
+#[test]
+fn plan_on_an_archived_change_is_rejected() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'archived' WHERE id = ?1",
+        [change.to_string()],
+    )
+    .expect("archive");
+
+    let result = store.plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx);
+
+    assert!(
+        matches!(&result, Err(StoreError::ChangeClosed(id)) if *id == change),
+        "expected a closed change to be named as closed, got {result:?}"
+    );
+}
+
+#[test]
+fn planning_a_change_that_does_not_exist_is_named_rather_than_left_to_the_key() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let absent = ChangeId::new();
+
+    let result = store.plan(&plan_command(absent, vec![task("1", &[REQUIREMENT])]), &ctx);
+
+    assert!(
+        matches!(&result, Err(StoreError::ChangeNotFound(id)) if *id == absent),
+        "expected the change to be named as missing, got {result:?}"
+    );
+}
+
+/// A change under execution keeps the plan it is executing.
+///
+/// Replanning replaces every task, and a task carries the evidence that its
+/// verification actually ran. Allowing it here would delete the record of
+/// work already done and proved, which is why the refusal is by status
+/// rather than by inspecting each task.
+#[test]
+fn planning_a_change_already_being_executed_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("the first plan lands");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'executing' WHERE id = ?1",
+        [change.to_string()],
+    )
+    .expect("start executing");
+
+    let result = store.plan(&plan_command(change, vec![task("9", &[REQUIREMENT])]), &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::ChangeNotSpecified { status, .. }) if status == "executing"
+        ),
+        "expected the refusal to name the status it refused on, got {result:?}"
+    );
+
+    let (number,): (String,) = raw
+        .query_row(
+            "SELECT number FROM tasks WHERE change_id = ?1",
+            [change.to_string()],
+            |row| Ok((row.get(0)?,)),
+        )
+        .expect("the task under execution must survive");
+    assert_eq!(number, "1", "the plan being executed was replaced anyway");
+}
+
+// --- archiving -----------------------------------------------------------
+
+fn archive_command(change: ChangeId) -> ArchiveCommand {
+    ArchiveCommand {
+        operation_id: OperationId::new(),
+        change,
+    }
+}
+
+/// Every task of a change closed, the way executing the plan would leave
+/// them. Marking a task done is not a verb this store has yet, so the rows
+/// are set the way `a_slug_is_free_again_once_the_change_holding_it_is_archived`
+/// sets a status.
+fn finish_tasks(connection: &Connection, change_id: &str) {
+    connection
+        .execute(
+            "UPDATE tasks SET status = 'done' WHERE change_id = ?1",
+            [change_id],
+        )
+        .expect("finish tasks");
+}
+
+/// A change specified with these requirements, planned with one task covering
+/// all of them and that task done: the state `archive` is called from.
+fn archivable_change(
+    store: &Store,
+    ctx: &FactContext,
+    connection: &Connection,
+    slug: &str,
+    purpose: Option<&str>,
+    requirements: Vec<RequirementDraft>,
+) -> ChangeId {
+    let change = store.propose(&propose_command(slug), ctx).expect("propose");
+    let covers: Vec<String> = requirements
+        .iter()
+        .map(|requirement| requirement.name.clone())
+        .collect();
+
+    store
+        .specify(
+            &specify_command(change, "worker/retry", purpose, requirements),
+            ctx,
+        )
+        .expect("specify");
+
+    let covers: Vec<&str> = covers.iter().map(String::as_str).collect();
+    store
+        .plan(&plan_command(change, vec![task("1", &covers)]), ctx)
+        .expect("plan");
+    finish_tasks(connection, &change.to_string());
+
+    change
+}
+
+/// A requirement's live scenarios, in sequence order.
+fn live_scenarios(connection: &Connection, requirement_id: &str) -> Vec<(i64, String)> {
+    connection
+        .prepare("SELECT seq, name FROM scenarios WHERE requirement_id = ?1 ORDER BY seq")
+        .expect("prepare")
+        .query_map([requirement_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("scenario rows")
+}
+
+/// The three text columns of a live scenario, read back in order.
+///
+/// `when_text` and `then_text` are adjacent columns of the same type, so a
+/// reordered `SELECT` in the copy would swap them and every assertion on
+/// `(seq, name)` alone would stay green.
+fn live_scenario_text(
+    connection: &Connection,
+    requirement_id: &str,
+) -> Vec<(Option<String>, String, String)> {
+    connection
+        .prepare(
+            "SELECT given_text, when_text, then_text FROM scenarios
+             WHERE requirement_id = ?1 ORDER BY seq",
+        )
+        .expect("prepare")
+        .query_map([requirement_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("scenario text")
+}
+
+fn requirement_row(connection: &Connection, id: &str) -> (String, String, String) {
+    connection
+        .query_row(
+            "SELECT name, text, status FROM requirements WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("requirement row")
+}
+
+/// The step the rest of the process exists for: until a change is archived
+/// its deltas are only a proposal, and the live base still describes the
+/// product as it was.
+#[test]
+fn archiving_an_added_delta_writes_the_requirement_its_scenarios_and_its_capability() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        Some(PURPOSE),
+        vec![added(REQUIREMENT)],
+    );
+
+    let report = store
+        .archive(&archive_command(change), &ctx)
+        .expect("archive");
+
+    assert_eq!(report.added, 1);
+    assert_eq!(report.modified, 0);
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.renamed, 0);
+    assert_eq!(
+        report.capabilities_created,
+        vec!["worker/retry".to_string()],
+        "a capability nothing had created yet is named as created here"
+    );
+    assert_eq!(report.status, ChangeStatus::Archived);
+
+    let (capability_id, purpose): (String, String) = raw
+        .query_row(
+            "SELECT id, purpose FROM capabilities WHERE path = 'worker/retry'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("capability row");
+    assert_eq!(
+        purpose, PURPOSE,
+        "the purpose the delta carried is what the new capability keeps"
+    );
+
+    let requirement_id: String = raw
+        .query_row(
+            "SELECT id FROM requirements WHERE capability_id = ?1",
+            [&capability_id],
+            |row| row.get(0),
+        )
+        .expect("requirement row");
+    let (name, text, status) = requirement_row(&raw, &requirement_id);
+    assert_eq!(name, REQUIREMENT);
+    assert_eq!(
+        text,
+        "The worker SHALL stop retrying once the budget is spent."
+    );
+    assert_eq!(status, "live");
+
+    assert_eq!(
+        live_scenarios(&raw, &requirement_id),
+        vec![(0, "first".to_string()), (1, "second".to_string())],
+        "the scenarios keep the sequence the delta wrote them in"
+    );
+
+    assert_eq!(
+        live_scenario_text(&raw, &requirement_id),
+        vec![
+            (
+                None,
+                "the budget is exhausted".into(),
+                "the job is parked".into()
+            ),
+            (
+                None,
+                "the budget is exhausted".into(),
+                "the job is parked".into()
+            ),
+        ],
+        "when and then are adjacent columns of one type: read them back or a \
+         swap in the copy goes unnoticed"
+    );
+
+    let (_, _, change_status) = change_row(&raw, &change.to_string());
+    assert_eq!(change_status, "archived");
+}
+
+/// A `modified` delta carries the whole requirement rather than a diff, so
+/// archiving it replaces the scenarios outright. Counted rather than probed
+/// for the new one: a scenario list that grew by one is a requirement
+/// describing two behaviours where its author wrote one.
+#[test]
+fn archiving_a_modified_delta_replaces_the_text_and_the_scenarios_wholesale() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
+    seed_scenario(&raw, "req-budget", 0, "stale");
+
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        None,
+        vec![modified("a budget caps retries", "req-budget")],
+    );
+
+    let report = store
+        .archive(&archive_command(change), &ctx)
+        .expect("archive");
+
+    assert_eq!(report.modified, 1);
+    assert!(
+        report.capabilities_created.is_empty(),
+        "the capability already existed"
+    );
+
+    let (name, text, status) = requirement_row(&raw, "req-budget");
+    assert_eq!(name, "a budget caps retries");
+    assert_eq!(
+        text,
+        "The worker SHALL stop retrying once the budget is spent."
+    );
+    assert_eq!(status, "live");
+
+    assert_eq!(
+        live_scenarios(&raw, "req-budget"),
+        vec![(0, "first".to_string())],
+        "the delta's scenarios replace what stood before rather than joining it"
+    );
+}
+
+/// Two deltas cannot give one new capability two different purposes.
+///
+/// Neither `specify` call can refuse the second purpose: the capability does
+/// not exist yet either time, so both are legitimately required to carry one.
+/// The clash only becomes visible at archive, where the first delta creates
+/// the row — and keeping whichever sorted first would drop text somebody
+/// wrote and report success.
+#[test]
+fn two_deltas_giving_one_new_capability_different_purposes_are_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    store
+        .specify(
+            &specify_command(change, "worker/retry", Some(PURPOSE), vec![added("first")]),
+            &ctx,
+        )
+        .expect("the capability does not exist, so a purpose is required");
+
+    let other = "Something else entirely, written by someone who did not know \
+                 the capability was already being introduced next door.";
+    store
+        .specify(
+            &specify_command(change, "worker/retry", Some(other), vec![added("second")]),
+            &ctx,
+        )
+        .expect("still no row, so this purpose is required too");
+
+    store
+        .plan(
+            &plan_command(change, vec![task("1", &["first", "second"])]),
+            &ctx,
+        )
+        .expect("plan");
+    finish_tasks(&raw, &change.to_string());
+
+    let result = store.archive(&archive_command(change), &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::CapabilityPurposeRedundant(path)) if path == "worker/retry"
+        ),
+        "expected the clash to be named, got {result:?}"
+    );
+    assert_eq!(
+        count(&raw, "capabilities", "path", "worker/retry"),
+        0,
+        "nothing may be written when the two disagree"
+    );
+}
+
+/// A requirement retired between `specify` and `archive` is not patched.
+///
+/// `specify` checks the target is live, but archiving is what moves the live
+/// base, and the gap between the two calls is wide enough for another change
+/// to have been proposed, specified and archived — retiring this very
+/// requirement. Left unguarded the update lands anyway, leaving a retired row
+/// carrying text nobody agreed to ship.
+#[test]
+fn archiving_a_modified_delta_whose_target_was_retired_meanwhile_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
+
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        None,
+        vec![modified("a budget caps retries", "req-budget")],
+    );
+
+    // Another change got there first.
+    raw.execute(
+        "UPDATE requirements SET status = 'removed' WHERE id = 'req-budget'",
+        [],
+    )
+    .expect("retire it");
+
+    let result = store.archive(&archive_command(change), &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::RequirementNotFound { requirement_id, .. })
+                if requirement_id == "req-budget"
+        ),
+        "expected the retired target to be named, got {result:?}"
+    );
+
+    let (_, text, status) = requirement_row(&raw, "req-budget");
+    assert_eq!(status, "removed", "it must stay retired");
+    assert_eq!(
+        text, "The worker SHALL retry.",
+        "a retired requirement must not be rewritten"
+    );
+}
+
+/// Kept rather than deleted: a retired requirement is the record of a
+/// decision, and `requirements.status` exists for exactly this.
+#[test]
+fn archiving_a_removed_delta_retires_the_requirement_without_deleting_it() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
+
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        None,
+        vec![removed("a budget caps retries", "req-budget")],
+    );
+
+    let report = store
+        .archive(&archive_command(change), &ctx)
+        .expect("archive");
+
+    assert_eq!(report.removed, 1);
+    assert_eq!(
+        count(&raw, "requirements", "id", "req-budget"),
+        1,
+        "the row stays; only its status moves"
+    );
+    let (name, _, status) = requirement_row(&raw, "req-budget");
+    assert_eq!(name, "a budget caps retries");
+    assert_eq!(status, "removed");
+}
+
+#[test]
+fn archiving_a_renamed_delta_moves_the_name_and_leaves_the_text_and_scenarios() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
+    seed_scenario(&raw, "req-budget", 0, "stale");
+
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        None,
+        vec![renamed(
+            "a budget caps retries",
+            "req-budget",
+            "retries are capped by a budget",
+        )],
+    );
+
+    let report = store
+        .archive(&archive_command(change), &ctx)
+        .expect("archive");
+
+    assert_eq!(report.renamed, 1);
+
+    let (name, text, status) = requirement_row(&raw, "req-budget");
+    assert_eq!(name, "retries are capped by a budget");
+    assert_eq!(
+        text, "The worker SHALL retry.",
+        "a rename does not touch what the requirement says"
+    );
+    assert_eq!(status, "live");
+    assert_eq!(
+        live_scenarios(&raw, "req-budget"),
+        vec![(0, "stale".to_string())],
+        "a rename does not touch the scenarios either"
+    );
+}
+
+/// Archiving files the change's spec as what is now true, so a task nobody
+/// finished would put an unwritten behaviour into the live base. The refusal
+/// names the numbers: "something is open" sends the caller to re-run the
+/// query against a plan it has only been told is incomplete.
+#[test]
+fn archiving_a_change_with_an_open_task_names_that_task() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    store
+        .plan(
+            &plan_command(
+                change,
+                vec![task("1", &[REQUIREMENT]), task("2.1", &[REQUIREMENT])],
+            ),
+            &ctx,
+        )
+        .expect("plan");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE tasks SET status = 'done' WHERE change_id = ?1 AND number = '1'",
+        [change.to_string()],
+    )
+    .expect("finish the first task");
+
+    let error = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::ChangeNotExecuted { change: id, tasks }
+            if *id == change && tasks == &["2.1".to_string()]),
+        "expected the open task to be listed, got {error:?}"
+    );
+    assert!(
+        error.to_string().contains("2.1"),
+        "the message must name the open task, got {error}"
+    );
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "planned", "a refused archive does not advance");
+}
+
+/// A change with specs but no plan was never executed either. It reaches the
+/// same refusal as one with an open task, because it is the same fault: the
+/// spec is about to be filed as true and nothing did the work.
+#[test]
+fn archiving_a_change_that_was_never_planned_is_refused() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let error = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::ChangeNotExecuted { change: id, tasks }
+            if *id == change && tasks.is_empty()),
+        "expected a change with no tasks to be refused, got {error:?}"
+    );
+}
+
+/// Archiving is what makes a change's deltas true. One carrying none, and not
+/// declaring that it never would, has nothing to fold in — and moving it to
+/// `archived` regardless would quietly lose it.
+#[test]
+fn archiving_a_change_that_proposes_no_deltas_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    // Planned and done, so the task check is not what refuses this.
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'specified' WHERE id = ?1",
+        [change.to_string()],
+    )
+    .expect("specified");
+    store
+        .plan(&plan_command(change, vec![task("1", &[])]), &ctx)
+        .expect("plan");
+    finish_tasks(&raw, &change.to_string());
+
+    let error = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::NothingToArchive(id) if *id == change),
+        "expected an empty change to be named as such, got {error:?}"
+    );
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "planned", "a refused archive does not close it");
+}
+
+/// The complement: a change proposed with `skip_specs` legitimately has
+/// neither deltas nor, if nothing was planned, tasks. Archiving it closes it
+/// and folds in nothing.
+#[test]
+fn a_change_that_skips_specs_archives_with_nothing_to_fold_in() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    let mut proposal = propose_command("retire-the-old-runner");
+    proposal.capabilities = Vec::new();
+    proposal.skip_specs = true;
+    let change = store.propose(&proposal, &ctx).expect("propose");
+
+    let report = store
+        .archive(&archive_command(change), &ctx)
+        .expect("archive");
+
+    assert_eq!(report.added, 0);
+    assert_eq!(report.status, ChangeStatus::Archived);
+    assert!(report.capabilities_created.is_empty());
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "archived");
+}
+
+#[test]
+fn a_repeated_archive_returns_the_same_report_and_applies_the_deltas_once() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        Some(PURPOSE),
+        vec![added(REQUIREMENT)],
+    );
+
+    let command = archive_command(change);
+    let first = store.archive(&command, &ctx).expect("first archive");
+
+    let requirements: i64 = raw
+        .query_row("SELECT COUNT(*) FROM requirements", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(requirements, 1);
+
+    let second = store.archive(&command, &ctx).expect("replayed archive");
+
+    assert_eq!(first, second);
+    let after: i64 = raw
+        .query_row("SELECT COUNT(*) FROM requirements", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        after, requirements,
+        "the replay must not have applied the deltas a second time"
+    );
+    let scenarios: i64 = raw
+        .query_row("SELECT COUNT(*) FROM scenarios", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(scenarios, 2, "nor their scenarios");
+}
+
+/// The live base is what the next change reads as its starting point, so a
+/// half-applied archive is worse than none: it describes a product that never
+/// existed, and nothing downstream can tell which half landed.
+#[test]
+fn a_delta_that_cannot_be_applied_leaves_no_trace_of_the_ones_before_it() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    let change = archivable_change(
+        &store,
+        &ctx,
+        &raw,
+        "add-retry-budget",
+        Some(PURPOSE),
+        vec![
+            added("a spent budget parks the job"),
+            added("b the budget is configurable"),
+        ],
+    );
+
+    // Made unwritable from outside the store: nothing about the command is
+    // wrong, so the failure lands mid-write rather than during validation.
+    // The deltas are applied in name order, so this is the second of the two.
+    raw.execute_batch(
+        "CREATE TRIGGER refuse_the_second_requirement BEFORE INSERT ON requirements
+         WHEN NEW.name = 'b the budget is configurable'
+         BEGIN SELECT RAISE(ABORT, 'the second requirement cannot be written'); END;",
+    )
+    .expect("trigger");
+
+    let error = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::Database(message)
+            if message.contains("the second requirement cannot be written")),
+        "expected the write to fail, got {error:?}"
+    );
+
+    let requirements: i64 = raw
+        .query_row("SELECT COUNT(*) FROM requirements", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        requirements, 0,
+        "the accepted first requirement must not survive the rejected second"
+    );
+    let scenarios: i64 = raw
+        .query_row("SELECT COUNT(*) FROM scenarios", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(scenarios, 0, "no scenario may outlive its requirement");
+    let capabilities: i64 = raw
+        .query_row("SELECT COUNT(*) FROM capabilities", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(
+        capabilities, 0,
+        "nor may the capability the first delta created"
+    );
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        status, "planned",
+        "a failed archive does not close the change"
     );
 }
