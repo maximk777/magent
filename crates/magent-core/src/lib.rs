@@ -7,6 +7,7 @@
 mod error;
 mod fact;
 mod model;
+mod sdd;
 
 pub use error::{DomainError, Validate};
 pub use fact::{
@@ -18,4 +19,8 @@ pub use model::{
     DependencyId, FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState,
     HarnessKind, OperationId, Repository, RepositoryId, RepositoryRole, RunId, RunSnapshot,
     RunStatus, SessionId, SpecBinding, StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
+};
+pub use sdd::{
+    ChangeId, ChangeStatus, Classification, DeltaOp, ProposeCommand, RequirementDraft,
+    ScenarioDraft, SpecifyCommand,
 };

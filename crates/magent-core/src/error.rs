@@ -31,6 +31,48 @@ pub enum DomainError {
 
     #[error("a verified fact must cite evidence")]
     VerifiedWithoutEvidence,
+
+    #[error("a change must name at least one capability, or set skip_specs")]
+    MissingCapabilities,
+
+    #[error("a change slug must be a kebab-case string")]
+    InvalidChangeSlug,
+
+    #[error("a change title must not be blank")]
+    InvalidChangeTitle,
+
+    #[error("a change rationale must not be blank")]
+    InvalidChangeWhy,
+
+    #[error("a specify command must carry at least one requirement")]
+    MissingRequirements,
+
+    #[error("a capability purpose must be at least 50 characters")]
+    InvalidPurpose,
+
+    #[error("requirement names must not repeat within one specify command")]
+    DuplicateRequirementName,
+
+    #[error("an added or modified requirement needs at least one scenario")]
+    MissingScenarios,
+
+    #[error("an added or modified requirement needs text")]
+    MissingRequirementText,
+
+    #[error("a removed requirement needs a reason")]
+    MissingRemovalReason,
+
+    #[error("a removed requirement needs a migration path")]
+    MissingRemovalMigration,
+
+    #[error("a renamed requirement needs a new name")]
+    MissingRenameTarget,
+
+    #[error("a modified, removed or renamed requirement needs a requirement_id")]
+    MissingRequirementId,
+
+    #[error("a scenario's when and then must not be blank")]
+    InvalidScenario,
 }
 
 impl DomainError {
@@ -49,6 +91,20 @@ impl DomainError {
             Self::InvalidFactBody => "invalid_fact_body",
             Self::InvalidConfidence => "invalid_confidence",
             Self::VerifiedWithoutEvidence => "verified_without_evidence",
+            Self::MissingCapabilities => "missing_capabilities",
+            Self::InvalidChangeSlug => "invalid_change_slug",
+            Self::InvalidChangeTitle => "invalid_change_title",
+            Self::InvalidChangeWhy => "invalid_change_why",
+            Self::MissingRequirements => "missing_requirements",
+            Self::InvalidPurpose => "invalid_purpose",
+            Self::DuplicateRequirementName => "duplicate_requirement_name",
+            Self::MissingScenarios => "missing_scenarios",
+            Self::MissingRequirementText => "missing_requirement_text",
+            Self::MissingRemovalReason => "missing_removal_reason",
+            Self::MissingRemovalMigration => "missing_removal_migration",
+            Self::MissingRenameTarget => "missing_rename_target",
+            Self::MissingRequirementId => "missing_requirement_id",
+            Self::InvalidScenario => "invalid_scenario",
         }
     }
 }

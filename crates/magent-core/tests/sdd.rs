@@ -1,0 +1,383 @@
+//! Contracts for the spec-driven process.
+//!
+//! `magent-core` knows nothing about what is already in the database, so what
+//! it checks here is shape only: a required field is present, a list is not
+//! empty, a string is not blank, names within one command do not repeat.
+//! Existence checks — is this capability real, is this slug taken, does this
+//! change already have a proposal — belong to the store.
+
+use magent_core::{
+    Classification, DeltaOp, ProposeCommand, RequirementDraft, ScenarioDraft, SpecifyCommand,
+    Validate,
+};
+
+fn valid_propose() -> ProposeCommand {
+    ProposeCommand {
+        operation_id: magent_core::OperationId::new(),
+        slug: "add-retry-budget".into(),
+        title: "Add a retry budget".into(),
+        classification: Classification::Bounded,
+        why: "Retries currently loop forever and starve the worker pool.".into(),
+        what_changes: vec!["Cap retries at a configurable budget.".into()],
+        capabilities: vec!["worker/retry".into()],
+        impact: None,
+        skip_specs: false,
+    }
+}
+
+fn valid_scenario() -> ScenarioDraft {
+    ScenarioDraft {
+        name: "budget exhausted".into(),
+        given: Some("a task that has failed three times".into()),
+        when: "the retry budget is checked".into(),
+        then: "the task is marked failed instead of retried".into(),
+    }
+}
+
+fn valid_requirement() -> RequirementDraft {
+    RequirementDraft {
+        op: DeltaOp::Added,
+        name: "retry-budget-cap".into(),
+        text: Some("The worker MUST cap retries at the configured budget.".into()),
+        rename_to: None,
+        reason: None,
+        migration: None,
+        requirement_id: None,
+        scenarios: vec![valid_scenario()],
+    }
+}
+
+fn valid_specify() -> SpecifyCommand {
+    SpecifyCommand {
+        operation_id: magent_core::OperationId::new(),
+        change: magent_core::ChangeId::new(),
+        capability_path: "worker/retry".into(),
+        purpose: Some(
+            "Defines how the worker pool retries failed tasks and when it gives up.".into(),
+        ),
+        requirements: vec![valid_requirement()],
+    }
+}
+
+// --- ProposeCommand ----------------------------------------------------
+
+/// A change must either name a capability it touches or explicitly say it
+/// carries no spec work. Without the flag, a change could invent a
+/// requirement solely to pass this check.
+#[test]
+fn a_proposal_without_capabilities_must_skip_specs() {
+    let command = ProposeCommand {
+        capabilities: vec![],
+        skip_specs: false,
+        ..valid_propose()
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "missing_capabilities"
+    );
+
+    let command = ProposeCommand {
+        capabilities: vec![],
+        skip_specs: true,
+        ..valid_propose()
+    };
+    assert!(command.validate().is_ok());
+}
+
+/// The slug is the change's address and must survive being read back as a
+/// path segment: lowercase letters, digits and interior hyphens only.
+#[test]
+fn a_proposal_slug_must_be_kebab_case() {
+    for rejected in ["", "Add-Feature", "add_feature", "-leading", "trailing-"] {
+        let command = ProposeCommand {
+            slug: rejected.into(),
+            ..valid_propose()
+        };
+        assert_eq!(
+            command.validate().unwrap_err().code(),
+            "invalid_change_slug",
+            "{rejected} should not be a valid slug"
+        );
+    }
+
+    for accepted in ["add-retry-budget", "a", "x-1-y"] {
+        let command = ProposeCommand {
+            slug: accepted.into(),
+            ..valid_propose()
+        };
+        assert!(
+            command.validate().is_ok(),
+            "{accepted} should be a valid slug"
+        );
+    }
+}
+
+/// A blank title or rationale is not a proposal, whatever whitespace it is
+/// padded with.
+#[test]
+fn a_proposal_title_and_why_must_not_be_blank() {
+    let command = ProposeCommand {
+        title: "   ".into(),
+        ..valid_propose()
+    };
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_change_title"
+    );
+
+    let command = ProposeCommand {
+        why: "\t\n".into(),
+        ..valid_propose()
+    };
+    assert_eq!(command.validate().unwrap_err().code(), "invalid_change_why");
+}
+
+#[test]
+fn a_well_formed_proposal_is_accepted() {
+    assert!(valid_propose().validate().is_ok());
+}
+
+// --- SpecifyCommand ------------------------------------------------------
+
+/// Specifying a capability with no requirements attached is a no-op that
+/// should never have been submitted.
+#[test]
+fn a_specify_command_must_carry_at_least_one_requirement() {
+    let command = SpecifyCommand {
+        requirements: vec![],
+        ..valid_specify()
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "missing_requirements"
+    );
+}
+
+/// A purpose shorter than 50 characters is too glib to be useful, the same
+/// threshold `OpenSpec`'s own strict validator uses.
+#[test]
+fn a_specify_purpose_must_meet_the_length_floor() {
+    let command = SpecifyCommand {
+        purpose: Some("too short".into()),
+        ..valid_specify()
+    };
+
+    assert_eq!(command.validate().unwrap_err().code(), "invalid_purpose");
+}
+
+/// Two requirements sharing a name in the same command would collide in the
+/// store's unique index; catching it here names exactly what was duplicated.
+#[test]
+fn requirement_names_must_not_repeat_within_a_specify_command() {
+    let command = SpecifyCommand {
+        requirements: vec![valid_requirement(), valid_requirement()],
+        ..valid_specify()
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "duplicate_requirement_name"
+    );
+}
+
+// --- RequirementDraft ----------------------------------------------------
+
+/// An ADDED or MODIFIED requirement with no scenarios is exactly the failure
+/// `OpenSpec` lets through silently when a scenario is malformed.
+#[test]
+fn added_or_modified_requirements_need_at_least_one_scenario() {
+    for op in [DeltaOp::Added, DeltaOp::Modified] {
+        let command = SpecifyCommand {
+            requirements: vec![RequirementDraft {
+                op,
+                requirement_id: Some("req-1".into()),
+                scenarios: vec![],
+                ..valid_requirement()
+            }],
+            ..valid_specify()
+        };
+        assert_eq!(
+            command.validate().unwrap_err().code(),
+            "missing_scenarios",
+            "{op:?} without scenarios should be rejected"
+        );
+    }
+}
+
+/// An ADDED or MODIFIED requirement with no text is a placeholder, not a
+/// requirement.
+#[test]
+fn added_or_modified_requirements_need_text() {
+    for op in [DeltaOp::Added, DeltaOp::Modified] {
+        let command = SpecifyCommand {
+            requirements: vec![RequirementDraft {
+                op,
+                requirement_id: Some("req-1".into()),
+                text: None,
+                ..valid_requirement()
+            }],
+            ..valid_specify()
+        };
+        assert_eq!(
+            command.validate().unwrap_err().code(),
+            "missing_requirement_text",
+            "{op:?} without text should be rejected"
+        );
+
+        let command = SpecifyCommand {
+            requirements: vec![RequirementDraft {
+                op,
+                requirement_id: Some("req-1".into()),
+                text: Some("   ".into()),
+                ..valid_requirement()
+            }],
+            ..valid_specify()
+        };
+        assert_eq!(
+            command.validate().unwrap_err().code(),
+            "missing_requirement_text",
+            "{op:?} with blank text should be rejected"
+        );
+    }
+}
+
+/// A REMOVED requirement without a reason and a migration path is a break
+/// nobody explained.
+#[test]
+fn removed_requirements_need_a_reason_and_a_migration() {
+    let base = RequirementDraft {
+        op: DeltaOp::Removed,
+        requirement_id: Some("req-1".into()),
+        text: None,
+        scenarios: vec![],
+        reason: Some("Superseded by the retry budget.".into()),
+        migration: Some("Callers should switch to the budgeted retry helper.".into()),
+        ..valid_requirement()
+    };
+
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            reason: None,
+            ..base.clone()
+        }],
+        ..valid_specify()
+    };
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "missing_removal_reason"
+    );
+
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            migration: None,
+            ..base.clone()
+        }],
+        ..valid_specify()
+    };
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "missing_removal_migration"
+    );
+
+    let command = SpecifyCommand {
+        requirements: vec![base],
+        ..valid_specify()
+    };
+    assert!(command.validate().is_ok());
+}
+
+/// A RENAMED requirement without a new name has nothing to rename to.
+#[test]
+fn renamed_requirements_need_a_new_name() {
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            op: DeltaOp::Renamed,
+            requirement_id: Some("req-1".into()),
+            text: None,
+            scenarios: vec![],
+            rename_to: None,
+            ..valid_requirement()
+        }],
+        ..valid_specify()
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "missing_rename_target"
+    );
+}
+
+/// MODIFIED, REMOVED and RENAMED all address an existing requirement by id
+/// rather than re-pasting its text, so all three need one.
+#[test]
+fn modified_removed_and_renamed_requirements_need_a_requirement_id() {
+    for op in [DeltaOp::Modified, DeltaOp::Removed, DeltaOp::Renamed] {
+        let command = SpecifyCommand {
+            requirements: vec![RequirementDraft {
+                op,
+                requirement_id: None,
+                text: Some("Updated text.".into()),
+                reason: Some("Because.".into()),
+                migration: Some("Do the thing.".into()),
+                rename_to: Some("new-name".into()),
+                ..valid_requirement()
+            }],
+            ..valid_specify()
+        };
+        assert_eq!(
+            command.validate().unwrap_err().code(),
+            "missing_requirement_id",
+            "{op:?} without a requirement_id should be rejected"
+        );
+    }
+}
+
+// --- ScenarioDraft ---------------------------------------------------------
+
+/// `when` and `then` are the scenario's substance; blank ones are not
+/// scenarios at all. `given` stays optional.
+#[test]
+fn scenario_when_and_then_must_not_be_blank() {
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            scenarios: vec![ScenarioDraft {
+                when: "  ".into(),
+                ..valid_scenario()
+            }],
+            ..valid_requirement()
+        }],
+        ..valid_specify()
+    };
+    assert_eq!(command.validate().unwrap_err().code(), "invalid_scenario");
+
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            scenarios: vec![ScenarioDraft {
+                then: "\t".into(),
+                ..valid_scenario()
+            }],
+            ..valid_requirement()
+        }],
+        ..valid_specify()
+    };
+    assert_eq!(command.validate().unwrap_err().code(), "invalid_scenario");
+
+    let command = SpecifyCommand {
+        requirements: vec![RequirementDraft {
+            scenarios: vec![ScenarioDraft {
+                given: None,
+                ..valid_scenario()
+            }],
+            ..valid_requirement()
+        }],
+        ..valid_specify()
+    };
+    assert!(command.validate().is_ok());
+}
+
+#[test]
+fn a_well_formed_specify_command_is_accepted() {
+    assert!(valid_specify().validate().is_ok());
+}
