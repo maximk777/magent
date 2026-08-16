@@ -4,7 +4,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::error::StoreError;
 
 /// Schema version this build writes and understands.
-pub const CURRENT_VERSION: i64 = 6;
+pub const CURRENT_VERSION: i64 = 7;
 
 const MIGRATION_0001: &str = include_str!("../migrations/0001_slice1.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_facts.sql");
@@ -12,6 +12,7 @@ const MIGRATION_0003: &str = include_str!("../migrations/0003_retrieval.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_grouping.sql");
 const MIGRATION_0005: &str = include_str!("../migrations/0005_identity.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_dependencies.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_sdd.sql");
 
 /// Brings `connection` up to [`CURRENT_VERSION`].
 ///
@@ -33,6 +34,7 @@ pub fn apply(connection: &mut Connection) -> Result<(), StoreError> {
         (4, MIGRATION_0004),
         (5, MIGRATION_0005),
         (6, MIGRATION_0006),
+        (7, MIGRATION_0007),
     ] {
         if installed < version {
             transaction.execute_batch(sql)?;
