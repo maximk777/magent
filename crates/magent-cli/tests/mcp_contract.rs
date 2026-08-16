@@ -48,13 +48,19 @@ const EXPECTED_TOOLS: [&str; 14] = [
 
 /// Tools that change state. Each must take an `operation_id` so a retry after a
 /// dropped connection cannot duplicate work.
-const MUTATING_TOOLS: [&str; 8] = [
+///
+/// `magent_setup` is here even though it only writes when asked to apply: a
+/// schema cannot say "required when apply is true", and the model would learn
+/// about the field from a refusal at the moment it is about to regroup
+/// someone's repositories.
+const MUTATING_TOOLS: [&str; 9] = [
     "magent_archive",
     "magent_checkpoint",
     "magent_finish",
     "magent_plan",
     "magent_propose",
     "magent_remember",
+    "magent_setup",
     "magent_specify",
     "magent_start",
 ];
@@ -236,6 +242,34 @@ async fn server_instructions_fit_the_two_kilobyte_limit() {
     client.cancel().await.expect("shutdown");
 }
 
+/// Five of the fourteen tools are one process, and a model that never hears
+/// the process exists has no reason to go and read their descriptions. The
+/// bootstrap contract is the only place it reads before deciding what to do.
+#[tokio::test]
+async fn the_instructions_name_the_spec_driven_process() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("instructions");
+
+    for tool in [
+        "magent_propose",
+        "magent_specify",
+        "magent_plan",
+        "magent_archive",
+        "magent_changes",
+    ] {
+        assert!(
+            instructions.contains(tool),
+            "{tool} is invisible to a model that only reads the instructions: {instructions}"
+        );
+    }
+    client.cancel().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn every_mutating_tool_requires_an_operation_id() {
     let fixture = Fixture::new();
@@ -259,6 +293,36 @@ async fn every_mutating_tool_requires_an_operation_id() {
         );
     }
 
+    client.cancel().await.expect("shutdown");
+}
+
+/// The key is demanded of every call, not only of the ones that apply
+/// something. Spelled out as the whole required set rather than as "contains
+/// the key", because the other half of the decision — that nothing else is
+/// compulsory, so looking stays a call with one field — is what keeps the read
+/// path cheap enough to be used.
+#[tokio::test]
+async fn setup_requires_an_operation_id_and_nothing_else() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let setup = client
+        .list_all_tools()
+        .await
+        .expect("list tools")
+        .into_iter()
+        .find(|tool| tool.name == "magent_setup")
+        .expect("magent_setup");
+
+    let mut required: Vec<&str> = setup
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|fields| fields.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    required.sort_unstable();
+
+    assert_eq!(required, ["operation_id"]);
     client.cancel().await.expect("shutdown");
 }
 
@@ -975,7 +1039,7 @@ async fn setup_finds_the_checkouts_that_belong_together() {
     checkouts(&bank, "github.com/someone", &["blog"]);
 
     let client = connect_in(&fixture, &bank.join("clients")).await;
-    let proposal = call(&client, "magent_setup", json!({})).await;
+    let proposal = call(&client, "magent_setup", json!({ "operation_id": uuid() })).await;
 
     assert_eq!(proposal["suggested_name"].as_str(), Some("bank"));
     let found: Vec<_> = proposal["siblings"]
@@ -1006,7 +1070,7 @@ async fn setup_without_applying_changes_nothing() {
     );
 
     let client = connect_in(&fixture, &bank.join("clients")).await;
-    call(&client, "magent_setup", json!({})).await;
+    call(&client, "magent_setup", json!({ "operation_id": uuid() })).await;
     client.cancel().await.expect("shutdown");
 
     let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
@@ -1030,7 +1094,12 @@ async fn applying_without_a_way_to_ask_refuses_and_says_what_to_run() {
     );
 
     let client = connect_in(&fixture, &bank.join("clients")).await;
-    let refusal = call_expecting_error(&client, "magent_setup", json!({ "apply": true })).await;
+    let refusal = call_expecting_error(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": uuid(), "apply": true }),
+    )
+    .await;
 
     assert!(
         refusal.contains("magent workspace group"),
@@ -1050,7 +1119,7 @@ async fn setup_says_when_there_is_nothing_to_do() {
     let fixture = Fixture::new();
     let client = connect(&fixture).await;
 
-    let proposal = call(&client, "magent_setup", json!({})).await;
+    let proposal = call(&client, "magent_setup", json!({ "operation_id": uuid() })).await;
 
     assert_eq!(proposal["suggested_name"], Value::Null);
     assert!(
@@ -1143,7 +1212,12 @@ async fn a_confirmed_setup_groups_the_repositories() {
     )
     .await;
 
-    let applied = call(&client, "magent_setup", json!({ "apply": true })).await;
+    let applied = call(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": uuid(), "apply": true }),
+    )
+    .await;
     assert_eq!(applied["grouped"].as_u64(), Some(3), "{applied}");
     assert_eq!(applied["workspace_name"].as_str(), Some("wbbank"));
     drop(client);
@@ -1176,12 +1250,136 @@ async fn a_declined_setup_changes_nothing() {
     )
     .await;
 
-    let refusal = call_expecting_error(&client, "magent_setup", json!({ "apply": true })).await;
+    let refusal = call_expecting_error(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": uuid(), "apply": true }),
+    )
+    .await;
     assert!(refusal.contains("declined"), "{refusal}");
     drop(client);
 
     let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
     assert!(store.workspaces().expect("workspaces").is_empty());
+}
+
+/// A retry must not group a second time. Grouping is idempotent on the
+/// workspace name only while nothing else moved: the person may have pulled a
+/// checkout out of the group between the two calls, and a replay that regrouped
+/// would drag it back in — silently, on a call they thought they had already
+/// answered.
+#[tokio::test]
+async fn a_retried_setup_does_not_group_a_second_time() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments", "ledger"],
+    );
+
+    let client = connect_answering(
+        &fixture,
+        &bank.join("clients"),
+        Answering {
+            action: ElicitationAction::Accept,
+            name: Some("wbbank"),
+        },
+    )
+    .await;
+
+    let key = uuid();
+    let applied = call(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": key.clone(), "apply": true }),
+    )
+    .await;
+    assert_eq!(applied["grouped"].as_u64(), Some(3), "{applied}");
+
+    // The person takes one checkout back out of the group. Regrouping would
+    // undo that; replaying leaves it where they put it.
+    {
+        let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+        store
+            .group_into_workspace("ledger-only", &[bank.join("ledger")])
+            .expect("regroup");
+    }
+
+    let replayed = call(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": key, "apply": true }),
+    )
+    .await;
+    assert_eq!(
+        replayed["grouped"].as_u64(),
+        Some(3),
+        "a replay answers what the first call answered: {replayed}"
+    );
+    assert_eq!(replayed["workspace_name"].as_str(), Some("wbbank"));
+    drop(client);
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    assert_eq!(
+        store.workspaces().expect("workspaces"),
+        vec![("ledger-only".to_owned(), 1), ("wbbank".to_owned(), 2)],
+        "the retry regrouped and undid what the person did in between"
+    );
+}
+
+/// The same key carrying a different request is a mistake rather than a retry.
+/// Here a fourth checkout appeared in between, so the second call is asking to
+/// group something the first call never mentioned — and answering it from the
+/// record would report a group that was never made.
+#[tokio::test]
+async fn a_setup_key_reused_for_a_different_request_conflicts() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "gitlab.example.com/fintech",
+        &["clients", "payments", "ledger"],
+    );
+
+    let client = connect_answering(
+        &fixture,
+        &bank.join("clients"),
+        Answering {
+            action: ElicitationAction::Accept,
+            name: Some("wbbank"),
+        },
+    )
+    .await;
+
+    let key = uuid();
+    call(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": key.clone(), "apply": true }),
+    )
+    .await;
+
+    checkouts(&bank, "gitlab.example.com/fintech", &["treasury"]);
+
+    let refusal = call_expecting_error(
+        &client,
+        "magent_setup",
+        json!({ "operation_id": key, "apply": true }),
+    )
+    .await;
+    assert!(
+        refusal.contains("idempotency_conflict"),
+        "a reused key with a different request has to be refused: {refusal}"
+    );
+    drop(client);
+
+    let store = magent_store::Store::open(&fixture.state_dir.join("magent.db")).expect("open");
+    assert_eq!(
+        store.workspaces().expect("workspaces"),
+        vec![("wbbank".to_owned(), 3)],
+        "it refused and grouped anyway"
+    );
 }
 
 // --- spec-driven work -------------------------------------------------------

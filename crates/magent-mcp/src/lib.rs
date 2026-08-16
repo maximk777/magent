@@ -15,8 +15,8 @@ use magent_core::{
     TaskDraft, WorkflowStage,
 };
 use magent_store::{
-    ChangeDetail, ChangeSummary, Dependency, FactContext, FactQuery, GroupingProposal, Store,
-    StoreError, dependency_checkout,
+    ChangeDetail, ChangeSummary, Dependency, FactContext, FactQuery, GroupingCommand,
+    GroupingProposal, Store, StoreError, dependency_checkout,
 };
 use rmcp::{
     ServerHandler,
@@ -61,9 +61,10 @@ magent_deps lists repositories checked out for reference and gives their paths \
 on disk. Read and grep those files directly rather than guessing at a \
 library's behaviour.
 
-When work follows a written plan, pass spec_change_id and current_task to \
-magent_checkpoint. Restored context then names the task in hand rather than \
-the prompt that opened the run.
+Spec-driven work: magent_propose a change, magent_specify its requirements, \
+magent_plan its tasks, magent_archive when done; magent_changes reads any of \
+it back. Executing one, pass spec_change_id and current_task to \
+magent_checkpoint, and restored context names the task in hand.
 
 Every mutating call takes an operation_id. Generate a fresh UUID per call, and \
 reuse the same one when retrying, so a retry cannot duplicate state.
@@ -77,16 +78,21 @@ in this harness.";
 /// server says what it noticed, in the one place the model reads before it does
 /// anything. Only when there is something to say — an instruction that is
 /// always present is one the model learns to skip.
+///
+/// Terse because it is spending the same 2 KB the bootstrap contract is: what
+/// it used to say at length — including the name it would suggest — is what
+/// `magent_setup` answers in full the moment this note is acted on.
 fn setup_note(proposal: &GroupingProposal) -> Option<String> {
-    let name = proposal.suggested_name.as_ref()?;
+    // Only the existence of a suggestion is the gate; the suggestion itself
+    // belongs in the tool's answer, not here.
+    proposal.suggested_name.as_ref()?;
     if proposal.already_grouped {
         return None;
     }
 
     Some(format!(
-        "\n\nThis workspace is not grouped: {} checkouts here share {}. \
-Memory learned in one of them will not reach the others until they are. Call \
-magent_setup to see what it would do, and offer it (suggested name: {name}).",
+        "\n\n{} ungrouped checkouts here share {}: memory learned in one never \
+reaches the others. Call magent_setup and offer it.",
         proposal.siblings.len(),
         proposal
             .organisation
@@ -368,11 +374,23 @@ struct DependencyReport {
 
 /// What setup was asked to do.
 ///
-/// No `operation_id`: grouping is idempotent on the workspace name, so a retry
-/// lands on the same group and an idempotency key would be ceremony that can
-/// only be got wrong.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+/// The key is required on every call, not only on the ones that apply
+/// something, though only those spend it. JSON Schema cannot express "required
+/// when `apply` is true", so the precise alternative — optional, and demanded
+/// at the moment of applying — is one the model could only learn from a
+/// refusal, and it would meet that refusal while it was about to regroup
+/// someone's repositories. What [`CheckpointToolInput`] learned argues the
+/// other way, but only against fields the model cannot know: a UUID it can
+/// always produce, so a read pays nothing for carrying one.
+///
+/// This replaces the reasoning this type shipped with — that grouping is
+/// idempotent on the workspace name, so no key was needed. It is, but only
+/// while nothing else moved: a retry after the person pulled a checkout back
+/// out of the group would silently undo them.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
 pub struct SetupToolInput {
+    /// Idempotency key. Reuse it when retrying the same call.
+    pub operation_id: OperationId,
     /// Look only. Applying regroups repositories, so it is never the default.
     #[serde(default)]
     pub apply: bool,
@@ -828,7 +846,11 @@ impl MagentMcp {
 
         let grouped = self
             .store
-            .group_into_workspace(name, &siblings)
+            .apply_grouping(&GroupingCommand {
+                operation_id: input.operation_id,
+                name: name.to_owned(),
+                roots: siblings,
+            })
             .map_err(|error| render_error(&error))?;
 
         report.grouped = Some(grouped.repositories);
