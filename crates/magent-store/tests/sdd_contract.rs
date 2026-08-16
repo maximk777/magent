@@ -194,6 +194,19 @@ fn change_row(connection: &Connection, id: &str) -> (String, String, String) {
         .expect("change row")
 }
 
+/// The change's proposal document, parsed. `UNIQUE(change_id, kind)` makes
+/// this a single row even after the proposal has been rewritten.
+fn proposal_body(connection: &Connection, change_id: &str) -> serde_json::Value {
+    let body_json: String = connection
+        .query_row(
+            "SELECT body_json FROM sdd_artifacts WHERE change_id = ?1 AND kind = 'proposal'",
+            [change_id],
+            |row| row.get(0),
+        )
+        .expect("proposal row");
+    serde_json::from_str(&body_json).expect("valid json")
+}
+
 fn count(connection: &Connection, table: &str, slug_or_id_column: &str, value: &str) -> i64 {
     connection
         .query_row(
@@ -282,22 +295,139 @@ fn a_repeated_operation_id_with_a_changed_body_is_an_idempotency_conflict() {
     );
 }
 
-// --- slug occupancy --------------------------------------------------------
+// --- slug occupancy, and rewriting a proposal ------------------------------
 
+/// An author who reaches the specify phase and finds the proposal named the
+/// wrong capability has to be able to say so. Refusing the second `propose`
+/// would leave that author with no way to declare it and no way to specify it
+/// — the work simply stops.
 #[test]
-fn a_slug_held_by_a_live_change_is_rejected_with_a_meaningful_error() {
-    let (dir, _path, store) = temp_store();
+fn a_second_propose_on_a_drafting_change_rewrites_its_proposal() {
+    let (dir, path, store) = temp_store();
     let ctx = context(&store, dir.path());
 
-    store
+    let first = store
         .propose(&propose_command("add-retry-budget"), &ctx)
         .expect("first propose");
+
+    let mut rewrite = propose_command("add-retry-budget");
+    rewrite.title = "Cap the retry loop and drain the queue".into();
+    rewrite.classification = Classification::Architectural;
+    rewrite.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
+
+    let second = store.propose(&rewrite, &ctx).expect("rewritten propose");
+
+    assert_eq!(
+        first, second,
+        "a rewrite corrects the change that is there, it does not open a second one"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let (_, title, status) = change_row(&raw, &first.to_string());
+    assert_eq!(title, "Cap the retry loop and drain the queue");
+    assert_eq!(status, "drafting");
+
+    let classification: String = raw
+        .query_row(
+            "SELECT classification FROM sdd_changes WHERE id = ?1",
+            [first.to_string()],
+            |row| row.get(0),
+        )
+        .expect("classification");
+    assert_eq!(classification, "architectural");
+
+    let body = proposal_body(&raw, &first.to_string());
+    assert_eq!(body["capabilities"][0], "worker/retry");
+    assert_eq!(body["capabilities"][1], "worker/queue");
+
+    assert_eq!(
+        count(&raw, "sdd_changes", "slug", "add-retry-budget"),
+        1,
+        "the rewrite must not have opened a second change"
+    );
+    assert_eq!(
+        count(&raw, "sdd_artifacts", "change_id", &first.to_string()),
+        1,
+        "the proposal is overwritten, not versioned beside itself"
+    );
+}
+
+/// Past `specified` the proposal has already produced a plan, and rewriting it
+/// underneath would move the agreement the plan was written against.
+#[test]
+fn a_slug_held_by_a_change_already_planned_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("first propose");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE sdd_changes SET status = 'planned' WHERE id = ?1",
+        [change.to_string()],
+    )
+    .expect("plan");
 
     let result = store.propose(&propose_command("add-retry-budget"), &ctx);
 
     assert!(
         matches!(&result, Err(StoreError::SlugTaken(slug)) if slug == "add-retry-budget"),
         "expected SlugTaken, got {result:?}"
+    );
+}
+
+/// The one thing a rewrite may not do is strand what the author already wrote.
+/// A delta cannot be withdrawn, so a proposal that stops declaring the
+/// capability holding one leaves that delta pointing at nothing agreed.
+#[test]
+fn a_rewrite_dropping_a_capability_that_already_has_deltas_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+
+    let mut proposal = propose_command("add-retry-budget");
+    proposal.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
+    let change = store.propose(&proposal, &ctx).expect("propose");
+
+    store
+        .specify(
+            &specify_command(
+                change,
+                "worker/retry",
+                Some(PURPOSE),
+                vec![added("a spent budget parks the job")],
+            ),
+            &ctx,
+        )
+        .expect("specify");
+
+    // The title moves too, so the assertion below tells a refused rewrite from
+    // one that landed rather than merely from one that changed nothing.
+    let mut rewrite = propose_command("add-retry-budget");
+    rewrite.title = "Drain the queue instead".into();
+    rewrite.capabilities = vec!["worker/queue".into()];
+    let result = store.propose(&rewrite, &ctx);
+
+    assert!(
+        matches!(
+            &result,
+            Err(StoreError::CapabilityDeltasStranded(paths))
+                if paths == &["worker/retry".to_string()]
+        ),
+        "expected the stranded capability to be named, got {result:?}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    let (_, title, _) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        title, "Add a retry budget",
+        "a refused rewrite leaves the proposal as it stood"
+    );
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        1,
+        "and leaves the delta it refused to strand"
     );
 }
 
@@ -913,6 +1043,152 @@ fn a_second_specify_adds_to_the_deltas_already_proposed() {
         count(&raw, "spec_deltas", "change_id", &change.to_string()),
         2,
         "the earlier delta is kept alongside the new one"
+    );
+}
+
+// --- the proposal as a contract -------------------------------------------
+
+/// `OpenSpec` calls the proposal's Capabilities section the contract between
+/// the proposal and the specs. Without this check a spec can be filed against
+/// a capability nobody ever agreed to touch, and nothing later notices.
+#[test]
+fn specify_naming_a_capability_the_proposal_never_declared_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let command = specify_command(
+        change,
+        "never/declared-in-the-proposal",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    let Err(StoreError::CapabilityNotProposed {
+        capability_path,
+        declared,
+    }) = &result
+    else {
+        panic!("expected the undeclared capability to be named, got {result:?}");
+    };
+    assert_eq!(capability_path, "never/declared-in-the-proposal");
+    assert_eq!(declared, &["worker/retry".to_string()]);
+
+    // Naming only the offending path would send the caller to read the
+    // proposal out of the database to find out what it may write instead.
+    let message = result.as_ref().expect_err("refused").to_string();
+    assert!(
+        message.contains("worker/retry"),
+        "the refusal must list what the proposal does declare, got {message:?}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        count(&raw, "spec_deltas", "change_id", &change.to_string()),
+        0,
+        "nothing may be written against a capability nobody proposed"
+    );
+}
+
+/// The other half of the contract: the ordinary path still works. A check that
+/// refuses the declared capability too would be indistinguishable from one
+/// that refuses everything.
+#[test]
+fn specify_naming_a_declared_capability_is_accepted() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        Some(PURPOSE),
+        vec![added("a spent budget parks the job")],
+    );
+    let report = store.specify(&command, &ctx).expect("specify");
+
+    assert_eq!(report.capability_path, "worker/retry");
+    assert_eq!(report.added, 1);
+}
+
+/// The contract above and the rewrite in `propose` are one mechanism: without
+/// the rewrite, an author who discovers a missing capability at the specify
+/// phase has no way to declare it and the work stops here.
+#[test]
+fn a_capability_added_by_a_rewritten_proposal_can_then_be_specified() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose");
+
+    let mut rewrite = propose_command("add-retry-budget");
+    rewrite.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
+    store.propose(&rewrite, &ctx).expect("rewritten propose");
+
+    let command = specify_command(
+        change,
+        "worker/queue",
+        Some(PURPOSE),
+        vec![added("the queue drains before shutdown")],
+    );
+    let report = store.specify(&command, &ctx).expect("specify");
+
+    assert_eq!(
+        report.capability_path, "worker/queue",
+        "a capability the rewrite declared is one the change may now specify"
+    );
+}
+
+/// Moving the capability list moves the contract, so the change goes back.
+///
+/// The specs were written against the scope the proposal named. A rewrite
+/// that changes that scope leaves them describing something nobody agreed
+/// to — the same reasoning that pulls a `planned` change back to `specified`
+/// when its spec moves.
+#[test]
+fn a_rewrite_that_changes_the_capabilities_returns_the_change_to_drafting() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(status, "specified", "the fixture starts specified");
+
+    let mut widened = propose_command("add-retry-budget");
+    widened.capabilities = vec!["worker/retry".into(), "worker/queue".into()];
+    store.propose(&widened, &ctx).expect("rewrite");
+
+    let (_, _, status) = change_row(&raw, &change.to_string());
+    assert_eq!(
+        status, "drafting",
+        "a change of scope has to be specified again"
+    );
+}
+
+/// Correcting the prose invalidates nothing.
+#[test]
+fn a_rewrite_that_only_fixes_the_wording_leaves_the_status_alone() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let raw = Connection::open(&path).expect("raw connection");
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    let mut reworded = propose_command("add-retry-budget");
+    reworded.title = "Cap the retry loop".into();
+    store.propose(&reworded, &ctx).expect("rewrite");
+
+    let (_, title, status) = change_row(&raw, &change.to_string());
+    assert_eq!(title, "Cap the retry loop", "the new title is recorded");
+    assert_eq!(
+        status, "specified",
+        "a better sentence is not a change of scope"
     );
 }
 

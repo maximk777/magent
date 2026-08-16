@@ -37,11 +37,47 @@ pub enum StoreError {
     #[error("dependency {0} does not exist")]
     DependencyNotFound(DependencyId),
 
-    /// The unique index on live slugs (`sdd_changes_live_slug`) would catch
-    /// this too, but "UNIQUE constraint failed" does not tell a caller what
-    /// to do about it. Checked explicitly so the message does.
-    #[error("slug {0:?} is already in use by a change in flight")]
+    /// The slug names a change that is already past its proposal. A change
+    /// still `drafting` or `specified` has its proposal rewritten instead, so
+    /// arriving here means the proposal has already produced a plan — and
+    /// moving the agreement out from under work already broken down is not a
+    /// correction but a substitution.
+    ///
+    /// The unique index on live slugs (`sdd_changes_live_slug`) would catch a
+    /// second insert too, but "UNIQUE constraint failed" does not tell a
+    /// caller what to do about it. Checked explicitly so the message does.
+    #[error(
+        "slug {0:?} belongs to a change that is already past its proposal; \
+         a proposal is rewritten only while the change is drafting or specified"
+    )]
     SlugTaken(String),
+
+    /// A rewritten proposal stopped declaring a capability this change has
+    /// already written deltas for. Accepting it would leave those deltas
+    /// filed under nothing the proposal agrees to — written work lost without
+    /// a word, which this store treats as worse than a refusal.
+    ///
+    /// The way out is to keep the capability in `capabilities`: there is no
+    /// verb that withdraws a delta, so the deltas cannot be cleared first.
+    #[error(
+        "this change already proposes deltas for capabilities this proposal drops: {}; \
+         keep them in capabilities, since a delta once written cannot be withdrawn",
+        .0.join(", ")
+    )]
+    CapabilityDeltasStranded(Vec<String>),
+
+    /// `OpenSpec` names the proposal's Capabilities section the contract
+    /// between the proposal and the specs written against it. Nothing in the
+    /// schema relates `spec_deltas.capability_path` to that list, so a spec
+    /// filed against a capability nobody proposed would be accepted and never
+    /// noticed. The declared paths are carried rather than left implied: a
+    /// caller told only that this one is wrong has to go and read the
+    /// proposal out of the database to find out which one is right.
+    #[error("capability {capability_path:?} is not one this change proposed; {}", declared_detail(.declared))]
+    CapabilityNotProposed {
+        capability_path: String,
+        declared: Vec<String>,
+    },
 
     /// A change belongs to a workspace, and the caller's context did not name
     /// one. The column is `NOT NULL`, so the database would refuse this
@@ -172,6 +208,20 @@ pub enum StoreError {
 /// Two shapes rather than one: a list of numbers reads as work in progress,
 /// and an empty list means there was never a plan, which is a different thing
 /// for the caller to fix even though it is the same refusal.
+/// The tail of [`StoreError::CapabilityNotProposed`]'s message.
+///
+/// Two shapes for the same reason `unexecuted_detail` has two: an empty list
+/// is what a change proposed with `skip_specs` looks like, and "the proposal
+/// declares: " trailing off into nothing reads as a bug in the message rather
+/// than as the fact that there is nothing to declare against.
+fn declared_detail(declared: &[String]) -> String {
+    if declared.is_empty() {
+        "its proposal declares no capabilities at all".to_owned()
+    } else {
+        format!("its proposal declares: {}", declared.join(", "))
+    }
+}
+
 fn unexecuted_detail(tasks: &[String]) -> String {
     if tasks.is_empty() {
         "it has no tasks at all, so nothing on it was planned or done".to_owned()
@@ -196,6 +246,8 @@ impl StoreError {
             Self::NoOpenRun => "no_open_run",
             Self::DependencyNotFound(_) => "dependency_not_found",
             Self::SlugTaken(_) => "slug_taken",
+            Self::CapabilityDeltasStranded(_) => "capability_deltas_stranded",
+            Self::CapabilityNotProposed { .. } => "capability_not_proposed",
             Self::NoWorkspace => "no_workspace",
             Self::ChangeNotFound(_) => "change_not_found",
             Self::ChangeClosed(_) => "change_closed",

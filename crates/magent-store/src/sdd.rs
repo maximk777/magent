@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     error::StoreError,
     facts::FactContext,
-    store::{Store, enum_from_sql, enum_to_sql},
+    store::{Store, enum_from_sql, enum_to_sql, parse_id},
 };
 
 /// What `sdd_artifacts.body_json` holds for a `kind = 'proposal'` row.
@@ -32,6 +32,20 @@ struct ProposalBody<'a> {
     what_changes: &'a [String],
     capabilities: &'a [String],
     impact: Option<&'a str>,
+}
+
+/// The one field of a proposal `specify` reads back: the capabilities the
+/// change declared it would touch.
+///
+/// A reading counterpart to [`ProposalBody`] rather than a `Deserialize` on
+/// that type, which borrows from the string it was parsed out of and so cannot
+/// outlive the query. Every other field is ignored on purpose: what this
+/// answers is one question, and a struct that had to name the whole document
+/// would need changing every time the document grew a field.
+#[derive(Deserialize)]
+struct DeclaredCapabilities {
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 /// What a `specify` wrote, in terms the caller can check against what it sent.
@@ -97,12 +111,25 @@ impl Store {
     /// Opens a change: one row in `sdd_changes` with status `drafting`, and
     /// one row in `sdd_artifacts` holding the proposal, written together.
     ///
+    /// Called again for a slug held by a change still `drafting` or
+    /// `specified`, it *rewrites* that change's proposal rather than refusing:
+    /// title, classification, `skip_specs` and the proposal document are
+    /// replaced in place, and the change keeps its id and its status. An
+    /// author who reaches the specify phase and finds a capability missing
+    /// from the proposal has to be able to declare it — [`Store::specify`]
+    /// accepts only capabilities the proposal names, so without the rewrite
+    /// that author has no way forward at all. `UNIQUE(change_id, kind)` on
+    /// `sdd_artifacts` is what makes the proposal a single row that a rewrite
+    /// overwrites; `0007_sdd.sql` explains why no revision history is kept.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::Domain`] for an invalid command,
     /// [`StoreError::NoWorkspace`] when the context names no workspace to
-    /// file the change under, [`StoreError::SlugTaken`] when the slug already
-    /// names a change still in flight, or a database error.
+    /// file the change under, [`StoreError::SlugTaken`] when the slug names a
+    /// change already past its proposal,
+    /// [`StoreError::CapabilityDeltasStranded`] when the rewrite drops a
+    /// capability whose deltas are already written, or a database error.
     pub fn propose(
         &self,
         command: &ProposeCommand,
@@ -117,14 +144,15 @@ impl Store {
         let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
 
         self.execute_operation("propose", command.operation_id, command, |tx| {
-            // Mirrors sdd_changes_live_slug (0007_sdd.sql): a slug is taken
+            // Mirrors sdd_changes_live_slug (0007_sdd.sql): a slug is held
             // only by a change that has not yet been archived or abandoned.
-            // Relying on the unique index itself to report this would surface
-            // a raw "UNIQUE constraint failed" to the caller, which does not
-            // say what to do about it.
-            let taken: Option<i64> = tx
+            // Relying on the unique index itself to report a collision would
+            // surface a raw "UNIQUE constraint failed" to the caller, which
+            // does not say what to do about it — and would refuse the rewrite
+            // below outright.
+            let live: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT 1 FROM sdd_changes
+                    "SELECT id, status FROM sdd_changes
                      WHERE workspace_id = ?1 AND namespace IS ?2 AND slug = ?3
                        AND status NOT IN ('archived', 'abandoned')",
                     rusqlite::params![
@@ -132,14 +160,16 @@ impl Store {
                         context.namespace.as_deref(),
                         &command.slug,
                     ],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if taken.is_some() {
-                return Err(StoreError::SlugTaken(command.slug.clone()));
-            }
 
             let now = Utc::now().to_rfc3339();
+
+            if let Some((existing_id, status)) = live {
+                return rewrite_proposal(tx, &existing_id, enum_from_sql(&status)?, command, &now);
+            }
+
             let change_id = ChangeId::new();
 
             tx.execute(
@@ -159,25 +189,7 @@ impl Store {
                     &now,
                 ],
             )?;
-
-            let body = ProposalBody {
-                why: &command.why,
-                what_changes: &command.what_changes,
-                capabilities: &command.capabilities,
-                impact: command.impact.as_deref(),
-            };
-            let body_json = serde_json::to_string(&body)?;
-
-            tx.execute(
-                "INSERT INTO sdd_artifacts (id, change_id, kind, body_json, created_at, updated_at)
-                 VALUES (?1, ?2, 'proposal', ?3, ?4, ?4)",
-                rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    change_id.to_string(),
-                    &body_json,
-                    &now,
-                ],
-            )?;
+            write_proposal(tx, &change_id.to_string(), command, &now)?;
 
             Ok(change_id)
         })
@@ -188,6 +200,12 @@ impl Store {
     ///
     /// Every delta and every scenario lands in one transaction: a spec is one
     /// artifact, and half of it is not a smaller spec but an unreviewed one.
+    ///
+    /// The capability has to be one the change's proposal declared —
+    /// `OpenSpec` calls that list the contract between the proposal and the
+    /// specs, and it is what keeps a spec from quietly widening the scope that
+    /// was agreed. A proposal that named the wrong capability is corrected by
+    /// calling [`Store::propose`] again, which rewrites it.
     ///
     /// Called again for the same capability, it *adds* to the deltas the
     /// change already carries — nothing written earlier is replaced or
@@ -200,7 +218,9 @@ impl Store {
     /// Returns [`StoreError::Domain`] for an invalid command,
     /// [`StoreError::NoWorkspace`] when the context names no workspace,
     /// [`StoreError::ChangeNotFound`] or [`StoreError::ChangeClosed`] when the
-    /// change cannot take deltas, [`StoreError::CapabilityPurposeRequired`] or
+    /// change cannot take deltas, [`StoreError::CapabilityNotProposed`] when
+    /// the capability is not one the proposal declared,
+    /// [`StoreError::CapabilityPurposeRequired`] or
     /// [`StoreError::CapabilityPurposeRedundant`] when the purpose does not
     /// match what the capability needs, [`StoreError::RequirementNotFound`]
     /// when a delta patches a requirement this capability does not have live,
@@ -224,6 +244,11 @@ impl Store {
             let change_id = command.change.to_string();
             let workspace = workspace_id.to_string();
             let namespace = require_open_change(tx, command.change, &workspace)?;
+            // Ahead of `resolve_capability`, so that a capability nobody
+            // proposed is answered as such rather than as one owing a purpose:
+            // the first is a disagreement about scope, the second a detail of
+            // a capability this change was never going to touch.
+            require_proposed_capability(tx, &change_id, command)?;
             let capability_id = resolve_capability(tx, &workspace, namespace.as_deref(), command)?;
 
             let now = Utc::now().to_rfc3339();
@@ -432,6 +457,149 @@ impl Store {
             Ok(report)
         })
     }
+}
+
+/// Rewrites the proposal of the change the slug already names, and hands back
+/// its id so a rewrite is indistinguishable from the first call to the caller.
+///
+/// Only `drafting` and `specified` may be rewritten. Past that the proposal
+/// has already been broken down into a plan, and moving the agreement out from
+/// under work someone is doing is a substitution rather than a correction, so
+/// the slug is reported as taken.
+///
+/// The status is deliberately left alone: a change that has written specs
+/// stays `specified`, because correcting the document the specs were written
+/// against does not un-write them. What moves it back is `Store::specify`,
+/// which owns that decision for the deltas it writes.
+fn rewrite_proposal(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    status: ChangeStatus,
+    command: &ProposeCommand,
+    now: &str,
+) -> Result<ChangeId, StoreError> {
+    if !matches!(status, ChangeStatus::Drafting | ChangeStatus::Specified) {
+        return Err(StoreError::SlugTaken(command.slug.clone()));
+    }
+    require_no_stranded_deltas(tx, change_id, command)?;
+
+    // A rewrite that moves the capability list moves the contract the specs
+    // were written against, so the change goes back to `drafting` and has to
+    // be specified again — the same reasoning that pulls a `planned` change
+    // back to `specified` when its spec changes. Correcting a title or a
+    // rationale invalidates nothing and leaves the status alone.
+    let status = if declared_capabilities(tx, change_id)? == command.capabilities {
+        status
+    } else {
+        ChangeStatus::Drafting
+    };
+
+    tx.execute(
+        "UPDATE sdd_changes
+         SET title = ?1, classification = ?2, skip_specs = ?3, status = ?4, updated_at = ?5
+         WHERE id = ?6",
+        rusqlite::params![
+            &command.title,
+            enum_to_sql(&command.classification)?,
+            command.skip_specs,
+            enum_to_sql(&status)?,
+            now,
+            change_id,
+        ],
+    )?;
+    write_proposal(tx, change_id, command, now)?;
+
+    parse_id(change_id)
+}
+
+/// The capability paths the change's proposal currently names.
+///
+/// Empty when there is no proposal row, which `Store::propose` makes
+/// unreachable for a change it wrote: the change and its proposal land in one
+/// transaction.
+fn declared_capabilities(tx: &Transaction<'_>, change_id: &str) -> Result<Vec<String>, StoreError> {
+    let body_json: Option<String> = tx
+        .query_row(
+            "SELECT body_json FROM sdd_artifacts WHERE change_id = ?1 AND kind = 'proposal'",
+            [change_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    Ok(match body_json {
+        Some(body_json) => serde_json::from_str::<DeclaredCapabilities>(&body_json)?.capabilities,
+        None => Vec::new(),
+    })
+}
+
+/// Refuses a rewrite that would leave deltas filed under a capability the
+/// proposal no longer declares.
+///
+/// The other answer — accept it and let the deltas sit there orphaned — loses
+/// text somebody wrote and reports success, and this store treats a silent
+/// loss as the worse outcome every time it has to choose (see
+/// `CapabilityPurposeRedundant`, which refuses for the same reason). Deltas
+/// are compared directly rather than the two capability lists, because what
+/// matters is not which declaration disappeared but whether anything was
+/// written against it: dropping a capability nobody specified yet is an
+/// ordinary correction and passes.
+fn require_no_stranded_deltas(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    command: &ProposeCommand,
+) -> Result<(), StoreError> {
+    let declared: HashSet<&str> = command.capabilities.iter().map(String::as_str).collect();
+
+    // Ordered so that a caller re-reading the refusal after a partial fix sees
+    // the same list in the same order, as `require_full_coverage` does.
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT capability_path FROM spec_deltas
+         WHERE change_id = ?1 ORDER BY capability_path",
+    )?;
+    let stranded = statement
+        .query_map([change_id], |row| row.get::<_, String>(0))?
+        .filter(|path| match path {
+            Ok(path) => !declared.contains(path.as_str()),
+            Err(_) => true,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !stranded.is_empty() {
+        return Err(StoreError::CapabilityDeltasStranded(stranded));
+    }
+
+    Ok(())
+}
+
+/// Writes the change's proposal document, replacing one already there.
+///
+/// An upsert rather than an insert and an update side by side: the two callers
+/// differ in whether a row exists, and `sdd_artifacts_kind` already states
+/// that at most one can. The row keeps its id and its `created_at` through a
+/// rewrite — it is the same proposal, corrected.
+fn write_proposal(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    command: &ProposeCommand,
+    now: &str,
+) -> Result<(), StoreError> {
+    let body = ProposalBody {
+        why: &command.why,
+        what_changes: &command.what_changes,
+        capabilities: &command.capabilities,
+        impact: command.impact.as_deref(),
+    };
+    let body_json = serde_json::to_string(&body)?;
+
+    tx.execute(
+        "INSERT INTO sdd_artifacts (id, change_id, kind, body_json, created_at, updated_at)
+         VALUES (?1, ?2, 'proposal', ?3, ?4, ?4)
+         ON CONFLICT (change_id, kind)
+         DO UPDATE SET body_json = excluded.body_json, updated_at = excluded.updated_at",
+        rusqlite::params![uuid::Uuid::new_v4().to_string(), change_id, &body_json, now],
+    )?;
+
+    Ok(())
 }
 
 /// One row of `spec_deltas`, as archiving needs to read it.
@@ -940,6 +1108,49 @@ fn require_open_change(
     }
 
     Ok(namespace)
+}
+
+/// Refuses a spec filed against a capability the change's proposal never
+/// declared.
+///
+/// The proposal's `capabilities` list is the contract between the two phases,
+/// and nothing in the schema relates it to `spec_deltas.capability_path` — so
+/// without this check a change can grow a spec for a capability nobody agreed
+/// to touch and no later step notices. The declared paths travel with the
+/// refusal because the caller cannot see them: they are inside `body_json`,
+/// and a refusal that named only the rejected path would send it to read the
+/// database to find out what it may write instead.
+fn require_proposed_capability(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    command: &SpecifyCommand,
+) -> Result<(), StoreError> {
+    let body_json: Option<String> = tx
+        .query_row(
+            "SELECT body_json FROM sdd_artifacts WHERE change_id = ?1 AND kind = 'proposal'",
+            [change_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    // No proposal row means no capability was declared, and the refusal says
+    // so. `Store::propose` writes the change and its proposal in one
+    // transaction, so this is only reachable for a change written around it —
+    // and inventing a permissive default for that case would make the one
+    // change nobody can account for the one nothing is checked against.
+    let declared = match body_json {
+        Some(body_json) => serde_json::from_str::<DeclaredCapabilities>(&body_json)?.capabilities,
+        None => Vec::new(),
+    };
+
+    if !declared.iter().any(|path| path == &command.capability_path) {
+        return Err(StoreError::CapabilityNotProposed {
+            capability_path: command.capability_path.clone(),
+            declared,
+        });
+    }
+
+    Ok(())
 }
 
 /// Finds the capability the deltas are filed under, and settles whether the
