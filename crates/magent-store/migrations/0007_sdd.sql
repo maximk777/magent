@@ -9,10 +9,21 @@
 CREATE TABLE sdd_changes (
     id             TEXT PRIMARY KEY,
     workspace_id   TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    -- The repository within the workspace this change belongs to, the same
+    -- meaning it has on a fact (0002_facts.sql). NULL means workspace-wide
+    -- rather than any one repository, which is why the unique index below
+    -- folds it to '': two NULLs would otherwise not collide, and the same
+    -- name could be taken twice at the workspace level.
     namespace      TEXT,
     slug           TEXT NOT NULL,
     title          TEXT NOT NULL,
     classification TEXT NOT NULL CHECK (classification IN ('spike', 'bounded', 'architectural')),
+    -- Not derived from classification, though related: classification picks
+    -- the path, this records the outcome. A spike never reaches the specify
+    -- phase; an architectural change usually writes specs but may
+    -- legitimately skip them for a change that alters no behaviour — a pure
+    -- refactor, tooling, docs. The flag exists so nobody invents a
+    -- requirement just to satisfy validation.
     skip_specs     INTEGER NOT NULL DEFAULT 0,
     status         TEXT NOT NULL CHECK (status IN ('drafting', 'specified', 'planned', 'executing', 'ready', 'archived', 'abandoned')),
     created_at     TEXT NOT NULL,
@@ -28,12 +39,19 @@ CREATE UNIQUE INDEX sdd_changes_live_slug
 -- One row per stage of the process. body_json rather than a column per kind,
 -- the idiom checkpoints.payload_json already uses: what a proposal or a task
 -- list looks like is a Rust concern, not a schema one.
+-- The UNIQUE(change_id, kind) index below means a rewritten proposal
+-- overwrites this row rather than versioning it. That is a deliberate
+-- departure from "facts are never overwritten": the reasoning behind the
+-- rewrite is already durable in the run's checkpoints, so a rewritten
+-- proposal does not lose history the way a rewritten fact would. Revision
+-- history is skipped on purpose, not missing by oversight.
 CREATE TABLE sdd_artifacts (
     id         TEXT PRIMARY KEY,
     change_id  TEXT NOT NULL REFERENCES sdd_changes(id) ON DELETE CASCADE,
     kind       TEXT NOT NULL CHECK (kind IN ('proposal', 'design', 'specs', 'tasks')),
     body_json  TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE UNIQUE INDEX sdd_artifacts_kind ON sdd_artifacts (change_id, kind);
@@ -43,6 +61,9 @@ CREATE UNIQUE INDEX sdd_artifacts_kind ON sdd_artifacts (change_id, kind);
 CREATE TABLE capabilities (
     id           TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    -- Same meaning as sdd_changes.namespace: the repository within the
+    -- workspace, or NULL for workspace-wide. Folded to '' in the unique
+    -- index below for the same reason — two NULLs must collide, not coexist.
     namespace    TEXT,
     path         TEXT NOT NULL,
     purpose      TEXT NOT NULL,
@@ -93,6 +114,10 @@ CREATE TABLE spec_deltas (
     capability_id   TEXT REFERENCES capabilities(id),
     purpose         TEXT,
     op              TEXT NOT NULL CHECK (op IN ('added', 'modified', 'removed', 'renamed')),
+    -- NULL for 'added': there is no requirement yet to point at. Set for
+    -- 'modified', 'removed' and 'renamed', and that is what closes OpenSpec's
+    -- trap where a partial MODIFIED block lost detail on archive — this
+    -- patches the requirement by id instead of re-pasting its whole text.
     requirement_id  TEXT REFERENCES requirements(id),
     name            TEXT NOT NULL,
     text            TEXT,
