@@ -974,39 +974,48 @@ fn close_task(
         rusqlite::params![&done.output, now, now, &change_id, &done.number],
     )?;
 
-    // Asked of `open_task_numbers`, which is the definition `require_tasks_closed`
-    // archives by: a second reading of "open" written here could report a change
-    // ready that archiving then refuses, and a caller told both has no way out.
-    let change_ready = sdd::open_task_numbers(tx, &change_id)?.is_empty();
-    if change_ready {
-        // The status `0009_tasks.sql` promises a change reaches when its tasks
-        // are all done, and this is the only place that writes it.
-        //
-        // No predicate on the change's own status. An archived or abandoned one
-        // cannot arrive: `change_by_slug` above resolved this id out of the live
-        // set, so it was already refused as a slug nothing answers to — the same
-        // refusal `require_archivable_change` words for the archive side.
-        //
-        // A `specified` one can, and does not get a guard. `specify` pulls a
-        // planned change back to `specified` without deleting its tasks, so
-        // ticking the rest of an old plan lands here on a change whose newest
-        // delta no task covers, and it reads `ready`. Guarding the row instead
-        // would leave `change_ready` — computed from the tasks, above — saying
-        // ready while the row says otherwise, and a caller told both has no way
-        // out. The disagreement worth fixing is upstream, between `specify`
-        // leaving a stale plan in place and archiving never checking that every
-        // delta is covered; both belong to a change of their own.
-        tx.execute(
-            "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![enum_to_sql(&ChangeStatus::Ready)?, now, &change_id],
-        )?;
-    }
+    let change_ready = mark_change_ready(tx, &change_id, now)?;
 
     Ok(TaskClosed {
         number: done.number.clone(),
         expected_output_found,
         change_ready,
     })
+}
+
+/// Moves a change to `ready` once no task of its plan is open, and says whether
+/// it is there. The only place that writes the status `0009_tasks.sql` promises
+/// a change reaches when its tasks are all done.
+///
+/// Readiness is asked of [`sdd::open_task_numbers`], which is the definition
+/// `require_tasks_closed` archives by. A second reading of "open" written here
+/// could report a change ready that archiving then refuses, and a caller told
+/// both has no way out.
+///
+/// No predicate on the change's own status, which is worth stating because two
+/// statuses reach here differently. An archived or abandoned change cannot:
+/// `close_task` resolved this id through `change_by_slug`, out of the live set,
+/// so it was refused earlier as a slug nothing answers to — the same refusal
+/// `require_archivable_change` words for the archive side. A `specified` change
+/// can, and deliberately gets no guard: `specify` pulls a planned change back
+/// without deleting its tasks, so ticking the rest of an old plan lands here on
+/// a change whose newest delta no task covers, and it reads `ready`. Guarding
+/// the row would leave the returned flag — computed from the tasks — saying
+/// ready while the row said otherwise, and a caller told both has no way out.
+/// The disagreement worth fixing is upstream, between `specify` leaving a stale
+/// plan in place and archiving never checking that every delta is covered; both
+/// belong to a change of their own.
+fn mark_change_ready(tx: &Transaction<'_>, change_id: &str, now: &str) -> Result<bool, StoreError> {
+    if !sdd::open_task_numbers(tx, change_id)?.is_empty() {
+        return Ok(false);
+    }
+
+    tx.execute(
+        "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        rusqlite::params![enum_to_sql(&ChangeStatus::Ready)?, now, change_id],
+    )?;
+
+    Ok(true)
 }
 
 fn assert_session_exists(tx: &Transaction<'_>, session_id: SessionId) -> Result<(), StoreError> {
