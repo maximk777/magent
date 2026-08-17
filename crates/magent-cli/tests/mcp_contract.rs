@@ -242,17 +242,47 @@ async fn server_instructions_fit_the_two_kilobyte_limit() {
     client.cancel().await.expect("shutdown");
 }
 
-/// The same limit, asserted where it is spent. The test above measures what one
-/// connection sent, which is the constant plus whatever that workspace made the
-/// server append; this one measures the sentences an author edits, so a rewrite
-/// that overruns names the thing to shorten and does so without a server.
-#[test]
-fn the_bootstrap_instructions_still_fit() {
-    assert!(
-        magent_mcp::INSTRUCTIONS.len() <= INSTRUCTIONS_LIMIT,
-        "the bootstrap contract is {} bytes, limit is {INSTRUCTIONS_LIMIT}",
-        magent_mcp::INSTRUCTIONS.len()
+/// The same limit against the worst payload the server can send. The test above
+/// measures a workspace with nothing to say about itself, so it measures the
+/// constant alone; an ungrouped one makes the server append its setup note, and
+/// the note is spent out of the same 2 KB. What sizes that note is the
+/// organisation it names, so this asks from a checkout whose organisation is as
+/// long as a client is likely to have — `github.com` and an org name at the 39
+/// characters GitHub allows. The remaining variable is the count of siblings,
+/// one or two more bytes, which is what the margin below the limit is for.
+///
+/// A margin measured without the note is a margin that is not there, which is
+/// why the note is asserted present before the length is read: a fixture that
+/// stopped triggering it would leave this quietly measuring the constant.
+#[tokio::test]
+async fn the_bootstrap_instructions_still_fit() {
+    let fixture = Fixture::new();
+    let bank = fixture.dir.path().join("bank");
+    checkouts(
+        &bank,
+        "github.com/platform-infrastructure-and-tooling-eng",
+        &["clients", "payments", "ledger"],
     );
+
+    let client = connect_in(&fixture, &bank.join("clients")).await;
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("instructions");
+
+    assert!(
+        instructions.contains("Call magent_setup and offer it"),
+        "no setup note, so this measures the contract alone: {instructions}"
+    );
+
+    let contract = magent_mcp::INSTRUCTIONS.len();
+    assert!(
+        instructions.len() <= INSTRUCTIONS_LIMIT,
+        "the instructions are {} bytes — {contract} of bootstrap contract and {} of setup note — and the limit is {INSTRUCTIONS_LIMIT}",
+        instructions.len(),
+        instructions.len() - contract
+    );
+    client.cancel().await.expect("shutdown");
 }
 
 /// Five of the fourteen tools are one process, and a model that never hears

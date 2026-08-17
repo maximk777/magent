@@ -65,10 +65,10 @@ magent_deps lists repositories checked out for reference and gives their paths \
 on disk. Read and grep those files directly rather than guessing at a \
 library's behaviour.
 
-Spec-driven work: magent_propose a change, magent_specify its requirements, \
-magent_plan its tasks, magent_archive when done; magent_changes reads any of \
-it back. Executing one, pass spec_change_id and current_task to \
-magent_checkpoint, and task_done to close a task with the command that proved it.
+Spec-driven work: magent_propose a change, magent_specify requirements, \
+magent_plan tasks, magent_archive when done; magent_changes reads it back. \
+Executing one, pass spec_change_id and current_task to magent_checkpoint, and \
+task_done to close a task with the command that proved it.
 
 Every mutating call takes an operation_id. Generate a fresh UUID per call, and \
 reuse the same one when retrying, so a retry cannot duplicate state.
