@@ -73,8 +73,17 @@ impl World {
     }
 
     /// A directory holding fake executables, so a test can say what is on PATH.
+    ///
+    /// Named after what it holds, so two different sets are two different
+    /// PATHs. A fixed `bin` returned the same string whatever was asked for,
+    /// which left a test wanting both states distinguished only by the order
+    /// its calls happened to run in — and reordering them broke nothing.
     fn with_tools(&self, names: &[&str]) -> String {
-        let bin = self.dir.path().join("bin");
+        let bin = self.dir.path().join(if names.is_empty() {
+            "bin-nothing".to_owned()
+        } else {
+            format!("bin-{}", names.join("-"))
+        });
         std::fs::create_dir_all(&bin).expect("mkdir");
         for name in names {
             let path = bin.join(name);
@@ -242,19 +251,18 @@ fn a_repository_that_declares_nothing_gets_no_toolchain_section() {
 fn the_doctor_never_mentions_openspec() {
     let world = World::new();
 
-    // Both PATHs, because the old section printed under either: an install hint
-    // when the binary was absent, a present line when it was there. The empty
-    // one goes first — `with_tools` adds to one directory and never clears it.
-    let absent = world.with_tools(&[]);
-    let (_, without) = world.doctor(&absent);
-    let present = world.with_tools(&["openspec"]);
-    let (_, with) = world.doctor(&present);
+    // Both states, because the old section printed under either: an install
+    // hint when the binary was absent, a present line when it was there. They
+    // are two PATHs pointing at two directories, so which call runs first
+    // decides nothing.
+    let (_, absent) = world.doctor(&world.with_tools(&[]));
+    let (_, present) = world.doctor(&world.with_tools(&["openspec"]));
 
-    for report in [&without, &with] {
+    for (state, report) in [("not on PATH", &absent), ("on PATH", &present)] {
         assert!(
             !report.to_lowercase().contains("openspec"),
             "the spec process is Magent's own; doctor has nothing to say about a \
-             CLI this project does not use: {report}"
+             CLI this project does not use ({state}): {report}"
         );
     }
 }
