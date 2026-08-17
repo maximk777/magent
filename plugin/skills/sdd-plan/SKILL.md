@@ -1,8 +1,8 @@
 ---
 name: sdd-plan
-description: Use when a proposal is agreed and before touching code, to turn it into an OpenSpec task list. Write it for an engineer who is skilled but knows nothing about this codebase — every step names its files, its command, and its expected output.
-argument-hint: "[change-id]"
-allowed-tools: Bash(openspec list:*)
+description: Use when a proposal is agreed and before touching code, to turn it into the change's task list. Write it for an engineer who is skilled but knows nothing about this codebase — every step names its files, its command, and its expected output.
+argument-hint: "[change-slug]"
+allowed-tools: Bash(magent changes:*)
 ---
 
 # Plan the work
@@ -11,19 +11,20 @@ allowed-tools: Bash(openspec list:*)
 
 Changes available:
 
-!`command -v openspec >/dev/null 2>&1 || { echo "openspec is not installed: npm install -g @fission-ai/openspec"; exit 0; }; [ -d openspec ] || { echo "this repository has no openspec/ yet: openspec init --tools claude"; exit 0; }; openspec list 2>&1`
+!`magent changes 2>&1 || echo "magent is not installed: run ./scripts/install.sh in the Magent checkout"`
 
 If no change was named and exactly one is open, that is the one. If several
 are, ask which — planning the wrong one is an hour nobody gets back.
 
-The output is `openspec/changes/<change-id>/tasks.md`.
+The output is one `magent_plan` call.
 
 **Announce at the start:** "I'm using sdd-plan to write the implementation
 plan."
 
-Read `proposal.md` and the delta specs first. If there is no proposal, the
-honest move is `sdd-brainstorm` — planning something nobody agreed to is work
-that gets thrown away.
+Read the proposal and its requirement deltas first: `magent_changes` naming the
+change returns both. If there is no proposal, the honest move is
+`sdd-brainstorm` — planning something nobody agreed to is work that gets thrown
+away.
 
 ## Who you are writing for
 
@@ -66,45 +67,60 @@ These are plan failures. Never write them:
 - A step that says what to do without showing how
 - A reference to a type or function no task defines
 
-## The file
+## The call
 
-Use OpenSpec's own shape rather than inventing one:
+The whole list goes in one `magent_plan`. A second call **replaces** the tasks
+rather than adding to them, so a revision resends the plan entire — including
+the tasks that were already fine.
 
-```bash
-openspec instructions tasks --change <change-id>
+```
+magent_plan { change: "add-retry-budget",
+              tasks: [
+                { number: "1.1",
+                  title: "Write the failing test for the attempt cap",
+                  body: "Add `caps_attempts` to tests/budget.rs: build a
+                         RetryBudget of 3, spend all three, assert the fourth
+                         attempt is refused. It must fail because RetryBudget
+                         has no constructor yet — a failure naming anything
+                         else in the test file is a bug in the test.",
+                  files: ["tests/budget.rs"],
+                  produces: "the test budget::caps_attempts, failing",
+                  verify_command: "cargo test budget::caps_attempts",
+                  expected_output: "no function or associated item named `new` found for struct `RetryBudget`",
+                  covers: ["A retry budget caps attempts"] },
+                { number: "1.2",
+                  title: "Implement RetryBudget in src/budget.rs",
+                  body: "RetryBudget::new(max: u32) and take(&mut self) -> bool,
+                         counting down and returning false once the count is
+                         spent. No clock and no jitter yet; 2.1 adds those.",
+                  files: ["src/budget.rs", "src/lib.rs"],
+                  consumes: "the test budget::caps_attempts from 1.1",
+                  produces: "RetryBudget::new(u32), RetryBudget::take(&mut self) -> bool",
+                  verify_command: "cargo test budget",
+                  expected_output: "test result: ok. 1 passed; 0 failed",
+                  covers: ["A retry budget caps attempts"] } ] }
 ```
 
-Sections with hierarchical numbering, checkboxes for tracking:
+`number`, `title`, `verify_command` and `expected_output` are required on every
+task; `body`, `files`, `consumes`, `produces` and `covers` are what make it
+executable by someone who cannot see the rest of the plan. `consumes` and
+`produces` repeat the exact names and signatures across the seam, because the
+agent doing 1.2 never sees 1.1.
 
-```markdown
-# Tasks
-
-## 1. Budget type
-- [ ] 1.1 Write the failing test in `tests/budget.rs`
-      Run: `cargo test budget::caps_attempts`
-      Expected: FAIL, "no function named caps_attempts"
-- [ ] 1.2 Implement `RetryBudget` in `src/budget.rs`
-- [ ] 1.3 Run: `cargo test budget` — expected PASS
-- [ ] 1.4 Commit
-```
-
-The numbering matters beyond tidiness: `sdd-execute` binds the run to a task by
-its number and text, and an unnumbered list renumbers itself the moment one is
-inserted.
-
-Then:
-
-```bash
-openspec validate <change-id>
-openspec status <change-id>
-```
+The numbering matters beyond tidiness: a run binds to its task by that number,
+and the checkpoint that closes the task names it. Numbers are addresses, not
+positions.
 
 ## Self-review against the spec
 
 Run this yourself; it is a checklist, not a subagent dispatch.
 
-1. **Coverage** — walk each requirement in the delta specs. Can you point at a
-   task that implements it? List the gaps and add tasks for them.
+1. **Coverage** — the store already refuses a plan that leaves a requirement
+   the change proposes out of every task's `covers`, so the question here is
+   not whether coverage exists but whether it is meaningful. Walk each
+   requirement, read the task claiming it, and ask whether that task actually
+   makes the requirement true. A `covers` entry added to satisfy the check is
+   the one failure the store cannot see.
 2. **Placeholders** — scan for every pattern above.
 3. **Name consistency** — does a function called `clear_layers` in task 3 stay
    `clear_layers` in task 7? A rename between tasks is a bug in the plan.
@@ -118,7 +134,7 @@ to change and expensive to have been wrong about.
 
 Then offer the choice:
 
-> Plan written to `openspec/changes/<id>/tasks.md`. Two ways to run it:
+> Plan recorded for `<slug>`. Two ways to run it:
 >
 > **1. Subagent-driven (recommended)** — a fresh subagent per task, two-stage
 > review between tasks, no waiting on me between steps.

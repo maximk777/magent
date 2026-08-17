@@ -1,8 +1,8 @@
 ---
 name: sdd-brainstorm
-description: "You MUST use this before any implementation work — building a feature, changing behaviour, adding functionality — including work that looks too simple to need it. Turns an idea into an agreed OpenSpec proposal through one-question-at-a-time dialogue, and refuses to write code until the design is approved."
+description: "You MUST use this before any implementation work — building a feature, changing behaviour, adding functionality — including work that looks too simple to need it. Turns an idea into an agreed proposal in Magent's store through one-question-at-a-time dialogue, and refuses to write code until the design is approved."
 argument-hint: "[what you want to build or change]"
-allowed-tools: Bash(openspec list:*)
+allowed-tools: Bash(magent changes:*)
 ---
 
 # Brainstorm a change
@@ -14,17 +14,18 @@ as the first of the one-at-a-time questions below, not as a form.
 
 Already in flight here:
 
-!`command -v openspec >/dev/null 2>&1 || { echo "openspec is not installed: npm install -g @fission-ai/openspec"; exit 0; }; [ -d openspec ] || { echo "this repository has no openspec/ yet: openspec init --tools claude"; exit 0; }; openspec list 2>&1`
+!`magent changes 2>&1 || echo "magent is not installed: run ./scripts/install.sh in the Magent checkout"`
 
 Read that before proposing anything. A change already open for this area is
 either the thing being asked for, or a conflict worth naming now rather than at
 merge time.
 
-Turn an idea into a design, in dialogue, and land it as an OpenSpec change.
+Turn an idea into a design, in dialogue, and land it as a change in Magent's
+store.
 
 This is the process from `superpowers:brainstorming` with two things added: the
-artifacts are OpenSpec's rather than hand-rolled, and Magent's memory is
-consulted before the user is.
+artifacts are rows Magent's own verbs write rather than hand-rolled files, and
+Magent's memory is consulted before the user is.
 
 <HARD-GATE>
 Do NOT write code, scaffold anything, or invoke an implementation skill until
@@ -52,9 +53,11 @@ approved.
    constraint is. Asking again is worse than not asking — it spends the
    person's patience on something they already told you.
 
-   Then read the project's own constraints: `openspec/project.md` if it exists,
-   and `openspec/specs/` for what is currently true. Run `openspec list --specs`
-   to see the domains.
+   Then read what is currently true. `magent_changes` returns the live
+   capabilities alongside the changes in flight, and a capability named to it
+   comes back with its requirements — that is the specification this change
+   will amend. Then the repository's own instructions, `CLAUDE.md` or
+   `AGENTS.md`, for the constraints that were never written as requirements.
 
 2. **Explore the code.** Files, recent commits, the shape of what is there.
 
@@ -77,23 +80,34 @@ approved.
 
 ## Then write the change
 
-Let OpenSpec own the layout — it has a CLI, and hand-rolled directories drift
-from what `openspec validate` and `openspec archive` expect:
+Two verbs, in this order. The proposal first:
 
-```bash
-openspec new change <change-id>          # verb-first kebab-case: add-retry-budget
-openspec instructions proposal --change <change-id>
+```
+magent_propose { slug: "add-retry-budget",     # verb-first kebab-case
+                 title: "Cap retries per job rather than per attempt",
+                 classification: "bounded",
+                 why: "A failing dependency currently multiplies into
+                       thousands of attempts, and the queue drains hours
+                       after the dependency comes back.",
+                 what_changes: ["RetryBudget in src/budget.rs",
+                                "the worker takes its budget from config"],
+                 capabilities: ["worker/retry"] }
 ```
 
-Follow those instructions rather than a template remembered from somewhere.
-Fill in `proposal.md` (intent, scope in and out, approach), the delta specs
-under `changes/<change-id>/specs/<domain>/spec.md` as ADDED / MODIFIED /
-REMOVED requirements with GIVEN/WHEN/THEN scenarios, and `design.md` when the
-technical approach needs argument rather than statement.
+`capabilities` are the areas of the specification this change touches, and the
+proposal is where they are declared. Then one `magent_specify` per capability,
+carrying that capability's requirement deltas — each one `added`, `modified`,
+`removed` or `renamed`, and each added or modified requirement with its full
+text and at least one GIVEN/WHEN/THEN scenario. A capability the proposal did
+not declare is refused; so is a requirement with no scenario, which is the
+point — a requirement nobody can check against is an assertion.
 
-```bash
-openspec validate <change-id>
-```
+To widen a change while it is still being written — before it is planned —
+call `magent_propose` again with the same slug. That rewrites the proposal, and
+it is the only way to declare a capability the first call missed.
+
+There is nothing to validate afterwards. The verbs refuse the shapes a
+validator used to catch, at the moment you write them.
 
 ## Self-review, then hand it to the user
 
@@ -106,8 +120,8 @@ Read what you wrote with fresh eyes:
 
 Fix inline. Then stop and ask:
 
-> Proposal written to `openspec/changes/<id>/`. Please review it before we plan
-> the implementation.
+> Proposal recorded as `<slug>` — `magent_changes` naming it reads the whole of
+> it back. Please review it before we plan the implementation.
 
 Wait. If they want changes, make them and re-review.
 

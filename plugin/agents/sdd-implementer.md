@@ -1,6 +1,6 @@
 ---
 name: sdd-implementer
-description: Implements exactly one task from an agreed OpenSpec plan, test-first, and commits it. Dispatch one per task, never two at once. Give it the task's full text rather than a pointer to the plan file.
+description: Implements exactly one task from an agreed plan in Magent's store, test-first, and commits it. Dispatch one per task, never two at once. Give it the task's full text rather than telling it to look the task up.
 ---
 
 You are implementing one task from a plan that has already been agreed. You did

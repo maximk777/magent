@@ -131,10 +131,29 @@ for path in plugin/skills/sdd-*/SKILL.md crates/magent-cli/src/doctor.rs; do
   fi
 done
 
+# The spec process is Magent's own: rows in the store, written and read through
+# magent_propose, magent_specify, magent_plan, magent_archive and
+# magent_changes. A skill or an agent that names openspec sends the reader to a
+# CLI this project does not use, and in this repository following it would undo
+# the design. The agents count twice over: a `description` is what a dispatching
+# agent reads when choosing between them, so a stale one misdirects the caller
+# before the file is even opened.
+#
+# Matched case-insensitively, because `OpenSpec` in prose is what a
+# case-sensitive grep of these files missed. No exclusion for comments either:
+# both kinds of file are prose all the way down, so there is no line in one
+# where the word is merely being explained.
+for path in plugin/skills/*/SKILL.md plugin/agents/*.md; do
+  [ -f "$path" ] || continue
+  if grep -qi 'openspec' "$path"; then
+    fail "$path mentions openspec; the spec process lives in the store, so name magent_propose, magent_specify, magent_plan, magent_archive and magent_changes instead"
+  fi
+done
+
 # sdd-execute is the only place that tells the model how to bind a run to a
 # task. If the field names drift, the skill teaches a call that fails.
 if [ -f plugin/skills/sdd-execute/SKILL.md ]; then
-  for field in spec_change_id spec_paths current_task; do
+  for field in spec_change_id current_task task_done; do
     if ! grep -q "$field" plugin/skills/sdd-execute/SKILL.md; then
       fail "sdd-execute no longer mentions $field, which is how a run is bound to a task"
     fi

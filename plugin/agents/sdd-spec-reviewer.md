@@ -32,9 +32,9 @@ nobody reviewed, and everybody now maintains.
 take, and is it the one the spec means? Say so explicitly; this is the failure
 that survives every other check.
 
-If the change has OpenSpec delta specs, read the GIVEN/WHEN/THEN scenarios and
-check each one against the code. A scenario is a test someone already wrote in
-prose.
+Where the change proposed requirement deltas, `magent_changes` naming the change
+returns each one with its text and its GIVEN/WHEN/THEN scenarios. Check every
+scenario against the code. A scenario is a test someone already wrote in prose.
 
 # Verdict
 
