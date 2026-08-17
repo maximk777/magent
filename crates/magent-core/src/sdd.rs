@@ -517,11 +517,11 @@ pub struct TaskClosed {
     pub expected_output_found: bool,
     /// Whether this tick left the change with no open task.
     ///
-    /// The store does not work this out yet and leaves it `false`, so a reader
-    /// cannot take it for an answer today. It is declared with the tick it
-    /// belongs to rather than bolted on beside it later, and it starts telling
-    /// the truth with the code that moves a finished change to `ready` —
-    /// `0009_tasks.sql` promises that status and nothing writes it.
+    /// True on the tick that closes the last open task of the plan, which is
+    /// also the tick that moves the change to `ready` — `0009_tasks.sql`
+    /// promises that status, and closing a task is the only thing that writes
+    /// it. `false` means a task of the plan is still open, so archiving would
+    /// be refused.
     pub change_ready: bool,
 }
 

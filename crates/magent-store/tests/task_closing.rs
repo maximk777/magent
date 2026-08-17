@@ -13,9 +13,10 @@
 //! work is done, so refusing a tick over it would stop correct work.
 
 use magent_core::{
-    ChangeId, CheckpointCommand, CheckpointOrigin, CheckpointResult, Classification, DeltaOp,
-    HarnessKind, OperationId, PlanCommand, ProposeCommand, RequirementDraft, RunId, ScenarioDraft,
-    SessionId, SpecBinding, SpecifyCommand, StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
+    ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, CheckpointResult,
+    Classification, DeltaOp, HarnessKind, OperationId, PlanCommand, ProposeCommand,
+    RequirementDraft, RunId, ScenarioDraft, SessionId, SpecBinding, SpecifyCommand,
+    StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
 };
 use magent_store::{FactContext, Store, StoreError};
 use rusqlite::Connection;
@@ -221,6 +222,19 @@ impl Fixture {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("task row")
+    }
+
+    /// Where the change now stands, read back the way a caller sees it.
+    ///
+    /// Through the store rather than off the column, so that a status the store
+    /// writes but cannot read back — `enum_from_sql` refuses one it does not
+    /// know — fails here rather than passing as a string comparison.
+    fn change_status(&self, change: ChangeId) -> ChangeStatus {
+        self.store
+            .change_detail(change, &self.context)
+            .expect("change detail")
+            .expect("the change is this workspace's")
+            .status
     }
 
     /// A second connection to the same file, for the assertions and the
@@ -669,4 +683,116 @@ fn a_tick_whose_slug_names_two_changes_is_refused() {
         status, "pending",
         "neither plan is closed while it is unclear which one this is"
     );
+}
+
+/// `ready` is the status `0009_tasks.sql` promises a change reaches when its
+/// tasks are all done, and the tick that closes the last one is the only thing
+/// that could write it. Both ticks are asserted, not just the second: a
+/// readiness worked out from the wrong set of tasks would move the change on the
+/// first tick, and a test that only looked after the last one could not tell
+/// that apart from the right answer.
+#[test]
+fn closing_the_last_task_makes_the_change_ready() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let first = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect("first checkpoint")
+        .task
+        .expect("the checkpoint closed a task");
+
+    assert!(
+        !first.change_ready,
+        "task 2 is still open, so this tick did not finish the plan"
+    );
+    assert_eq!(
+        fixture.change_status(change),
+        ChangeStatus::Planned,
+        "and the change stays where planning left it"
+    );
+
+    let last = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "2".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect("last checkpoint")
+        .task
+        .expect("the checkpoint closed a task");
+
+    assert!(
+        last.change_ready,
+        "nothing is open now, so this tick finished the plan"
+    );
+    assert_eq!(
+        fixture.change_status(change),
+        ChangeStatus::Ready,
+        "which is what moves the change to `ready`"
+    );
+}
+
+/// The end of the loop, from the tick that closes the last task to the deltas
+/// landing in the live base. Worth a test of its own because the two halves are
+/// checked against different columns — `change_ready` is worked out from
+/// `tasks.status`, and `require_tasks_closed` reads the same rows again — so a
+/// change reported ready that archiving still refuses is a state a caller has no
+/// way out of.
+#[test]
+fn an_archive_after_the_last_tick_folds_the_deltas() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    for number in ["1.3", "2"] {
+        fixture
+            .checkpoint(
+                run_id,
+                session_id,
+                OperationId::new(),
+                TaskDone {
+                    number: number.into(),
+                    verify_command: VERIFY.into(),
+                    output: format!("{EXPECTED}\n"),
+                },
+            )
+            .expect("checkpoint");
+    }
+
+    let report = fixture
+        .store
+        .archive(
+            &ArchiveCommand {
+                operation_id: OperationId::new(),
+                change,
+            },
+            &fixture.context,
+        )
+        .expect("a change whose every task is ticked can be archived");
+
+    assert_eq!(report.added, 1, "the one requirement this change proposed");
+    assert_eq!((report.modified, report.removed, report.renamed), (0, 0, 0));
+    assert_eq!(
+        report.capabilities_created,
+        vec![CAPABILITY.to_owned()],
+        "the capability the delta was filed under existed nowhere before this"
+    );
+    assert_eq!(report.status, ChangeStatus::Archived);
+    assert_eq!(fixture.change_status(change), ChangeStatus::Archived);
 }

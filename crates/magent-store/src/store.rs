@@ -6,11 +6,11 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use magent_core::{
-    CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
-    FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState, HarnessKind,
-    OperationId, RepositoryId, RepositoryRole, RunId, RunSnapshot, RunStatus, SessionId,
-    SpecBinding, StartRunCommand, StartRunResult, TaskClosed, TaskDone, Validate, WorkflowStage,
-    WorkspaceId,
+    ChangeStatus, CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult,
+    CheckpointSnapshot, FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState,
+    HarnessKind, OperationId, RepositoryId, RepositoryRole, RunId, RunSnapshot, RunStatus,
+    SessionId, SpecBinding, StartRunCommand, StartRunResult, TaskClosed, TaskDone, Validate,
+    WorkflowStage, WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Serialize, de::DeserializeOwned};
@@ -895,6 +895,10 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
 /// plan wrote that string before the work was done and refusing a tick over it
 /// would stop correct work.
 ///
+/// A tick that leaves no task open moves the change to `ready` in the same
+/// transaction: that is what `0009_tasks.sql` means by a change reaching `ready`
+/// when its tasks are all done, and it is what [`Store::archive`] waits for.
+///
 /// Every refusal below comes before the `UPDATE`, and they come in this order:
 /// the run's binding, then what the slug resolves to, then the number, then the
 /// command. Cheapest and most fundamental first, so a caller whose run is
@@ -970,12 +974,29 @@ fn close_task(
         rusqlite::params![&done.output, now, now, &change_id, &done.number],
     )?;
 
+    // Asked of `open_task_numbers`, which is the definition `require_tasks_closed`
+    // archives by: a second reading of "open" written here could report a change
+    // ready that archiving then refuses, and a caller told both has no way out.
+    let change_ready = sdd::open_task_numbers(tx, &change_id)?.is_empty();
+    if change_ready {
+        // The status `0009_tasks.sql` promises a change reaches when its tasks
+        // are all done, and this is the only place that writes it.
+        //
+        // No predicate on the change's own status: `change_by_slug` above
+        // resolved this id out of the live set, so an archived or abandoned
+        // change was already refused as a slug nothing answers to — the same
+        // refusal `require_archivable_change` words for the archive side — and a
+        // guard here could only ever be about a row that cannot arrive.
+        tx.execute(
+            "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![enum_to_sql(&ChangeStatus::Ready)?, now, &change_id],
+        )?;
+    }
+
     Ok(TaskClosed {
         number: done.number.clone(),
         expected_output_found,
-        // Whether the plan is finished is a question about the change's other
-        // tasks, and nothing here reads them.
-        change_ready: false,
+        change_ready,
     })
 }
 
