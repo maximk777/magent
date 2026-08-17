@@ -4,7 +4,7 @@
 //! is already in the database, so the checks that depend on existing rows —
 //! is this slug already live — belong here rather than there.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use magent_core::{
@@ -214,6 +214,76 @@ pub struct ChangeDetail {
     pub deltas: Vec<DeltaSummary>,
     /// Every task of its current plan, in task-number order.
     pub tasks: Vec<TaskSummary>,
+}
+
+/// One capability of the live specification, as [`Store::live_capabilities`]
+/// lists it.
+///
+/// Shaped here rather than in `magent-core` for the same reason
+/// [`ChangeSummary`] is: this is the shape of a query, no command carries it,
+/// and nothing outside this crate and `magent-mcp` reads one. (`TaskClosed`
+/// went to `magent-core` because it is a field of `CheckpointResult`, which
+/// that crate defines; nothing here is part of a command or its result.)
+///
+/// The requirements are left for [`Store::capability_detail`]: what this
+/// answers is "what does the specification cover", and an index that carried
+/// every requirement text would be the whole specification rather than a way
+/// in. The count comes back with it for the reason [`ChangeSummary`]'s counts
+/// do — otherwise a caller holding only the paths has to run a query per row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilitySummary {
+    pub path: String,
+    pub purpose: String,
+    /// How many of its requirements are `live`. A capability every one of whose
+    /// requirements has been retired keeps its row and reads as zero: nothing
+    /// deletes a capability, and `removed` requirements stay for the history
+    /// (`0007_sdd.sql`).
+    pub requirement_count: usize,
+}
+
+/// One scenario of a live requirement.
+///
+/// `given`, `when` and `then`, not the `given_text`/`when_text`/`then_text` the
+/// columns are called: those names exist because `when` and `then` are reserved
+/// words in SQL, and mapping them back is this layer's job, as
+/// [`magent_core::ScenarioDraft`] says. Not that type reused, though the fields
+/// match — a draft is what a change proposed, and this is what shipped.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LiveScenario {
+    pub name: String,
+    /// The precondition, where the scenario has one — `scenarios.given_text` is
+    /// the only nullable column of the three.
+    pub given: Option<String>,
+    pub when: String,
+    pub then: String,
+}
+
+/// One live requirement of a capability, with the scenarios that make it
+/// checkable rather than merely asserted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LiveRequirement {
+    pub name: String,
+    pub text: String,
+    /// In `seq` order, which is the order the change that last wrote them —
+    /// the addition, or the modification that replaced them — sent them:
+    /// `specify` numbers the drafts as they arrive and archiving copies the
+    /// numbers across (see `copy_scenarios`).
+    pub scenarios: Vec<LiveScenario>,
+}
+
+/// One capability with everything the specification currently says about it, as
+/// [`Store::capability_detail`] returns it.
+///
+/// This is what an agent reads before proposing anything: the deltas of a change
+/// only make sense against what is already true, and until this existed the only
+/// way to find that out was to read the source and guess.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CapabilityDetail {
+    pub path: String,
+    pub purpose: String,
+    /// Only the `live` ones. A retired requirement is kept as history for the
+    /// change that retired it, not shown as part of the product.
+    pub requirements: Vec<LiveRequirement>,
 }
 
 impl Store {
@@ -693,6 +763,116 @@ impl Store {
             impact: proposal.impact,
             deltas,
             tasks,
+        }))
+    }
+
+    /// Every capability of this workspace and namespace, by path.
+    ///
+    /// Scoped by namespace like [`Store::open_changes`], and for a stronger
+    /// reason than symmetry: `capabilities_path` (`0007_sdd.sql`) is unique on
+    /// `(workspace_id, namespace, path)`, so two repositories of one workspace
+    /// can each hold a `worker/retry`, and both `resolve_capability` and
+    /// `ensure_capability` look one up under the change's own namespace. An
+    /// index that ignored the namespace would list two rows a caller could not
+    /// tell apart, and offer requirements a `specify` from here cannot patch —
+    /// it would file its deltas against the other repository's capability, or
+    /// create a second one beside it.
+    ///
+    /// Ordered by `path`, which is a `TEXT` column, so the order is
+    /// lexicographic rather than anything to do with when a capability was
+    /// created. What it buys is that two calls read the same way, and that a
+    /// capability keeps its place in the list when a neighbour gains a
+    /// requirement.
+    ///
+    /// Read-only and outside `execute_operation`, like the two readers above:
+    /// nothing here mutates, so there is nothing for an `operation_id` to make
+    /// idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoWorkspace`] when the context names no
+    /// workspace, or a database error.
+    pub fn live_capabilities(
+        &self,
+        context: &FactContext,
+    ) -> Result<Vec<CapabilitySummary>, StoreError> {
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT path, purpose,
+                (SELECT COUNT(*) FROM requirements
+                  WHERE requirements.capability_id = capabilities.id
+                    AND requirements.status = 'live')
+             FROM capabilities
+             WHERE workspace_id = ?1 AND namespace IS ?2
+             ORDER BY path",
+        )?;
+        let capabilities = statement
+            .query_map(
+                rusqlite::params![workspace_id.to_string(), context.namespace.as_deref()],
+                |row| {
+                    Ok(CapabilitySummary {
+                        path: row.get(0)?,
+                        purpose: row.get(1)?,
+                        requirement_count: count_to_usize(row.get(2)?),
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(capabilities)
+    }
+
+    /// One capability of this workspace and namespace with its live
+    /// requirements, or `None` if there is no such capability.
+    ///
+    /// `None` rather than an error, the same courtesy [`Store::change_detail`]
+    /// extends: a caller asking what the specification says about a path is
+    /// asking a legitimate question, and "there is nothing under that path yet"
+    /// is an answer to it — the caller can offer [`Store::live_capabilities`]
+    /// instead. Scoped by namespace for the reason given there.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoWorkspace`] when the context names no
+    /// workspace, or a database error.
+    pub fn capability_detail(
+        &self,
+        path: &str,
+        context: &FactContext,
+    ) -> Result<Option<CapabilityDetail>, StoreError> {
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+
+        // Mirrors capabilities_path (0007_sdd.sql), NULL namespace folded the
+        // way `ensure_capability` folds it.
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT id, purpose FROM capabilities
+                 WHERE workspace_id = ?1 AND namespace IS ?2 AND path = ?3",
+                rusqlite::params![workspace_id.to_string(), context.namespace.as_deref(), path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let Some((capability_id, purpose)) = row else {
+            return Ok(None);
+        };
+        let requirements = load_live_requirements(&tx, &capability_id)?;
+        drop(tx);
+
+        Ok(Some(CapabilityDetail {
+            // The argument rather than the column, which holds the same bytes:
+            // `=` compares under SQLite's default BINARY collation, and reading
+            // `path` back beside `purpose` would put two adjacent TEXT columns
+            // in one positional tuple — the swap `ChangeSummaryRow` has named
+            // fields to avoid.
+            path: path.to_owned(),
+            purpose,
+            requirements,
         }))
     }
 }
@@ -1817,4 +1997,116 @@ fn load_task_summaries(
             verify_command: row.verify_command,
         })
         .collect())
+}
+
+/// One row of `requirements`, as [`Store::capability_detail`] shows it, plus
+/// the id its scenarios hang off.
+///
+/// Named fields rather than a positional tuple for the reason
+/// [`ChangeSummaryRow`] gives: `id`, `name` and `text` are three adjacent `TEXT`
+/// columns, and a reordered `SELECT` would put a requirement's text where its
+/// name belongs without anything failing to compile.
+struct LiveRequirementRow {
+    id: String,
+    name: String,
+    text: String,
+}
+
+/// The capability's live requirements, each with its scenarios.
+///
+/// `removed` requirements are left out of both this and the count
+/// [`Store::live_capabilities`] reports: they are kept so the change that
+/// retired them still reads as a record of that decision (`0007_sdd.sql`), not
+/// because they are still part of the product.
+///
+/// Two queries rather than one per requirement — the loop this module refuses
+/// to write elsewhere (see `load_deltas`): every scenario of the capability
+/// comes back in one pass and is handed to the requirement it belongs to.
+///
+/// The requirements are ordered by `created_at` and then `name`.
+/// [`Store::archive`] stamps one timestamp on everything a single call folds
+/// in, so requirements that arrived together tie and `name` separates them —
+/// lexicographically, which is not the order they were specified in. What the
+/// pair does give is a requirement keeping its place: `created_at` is not
+/// touched when a later `modified` or `renamed` delta patches the row.
+fn load_live_requirements(
+    tx: &Transaction<'_>,
+    capability_id: &str,
+) -> Result<Vec<LiveRequirement>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT id, name, text FROM requirements
+         WHERE capability_id = ?1 AND status = 'live'
+         ORDER BY created_at, name",
+    )?;
+    let rows = statement
+        .query_map([capability_id], |row| {
+            Ok(LiveRequirementRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                text: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut scenarios = load_live_scenarios(tx, capability_id)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| LiveRequirement {
+            name: row.name,
+            text: row.text,
+            // `unwrap_or_default` rather than a refusal: every delta
+            // `apply_delta` applies leaves a live requirement holding at least
+            // one scenario — `magent-core` demands one of every addition and
+            // modification, `removed` leaves the requirement not live, and
+            // `renamed` leaves the scenarios it already had — so an empty list
+            // is a row this crate's own deltas did not produce, and reading it
+            // as "no scenarios" reports what is there rather than refusing to
+            // show the rest of the capability.
+            scenarios: scenarios.remove(&row.id).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Every scenario of the capability's live requirements, by requirement id.
+///
+/// Ordered by `seq` alone: what a caller reads is one requirement's scenarios,
+/// so it is their order relative to each other that matters, and grouping rows
+/// that already arrive in ascending `seq` preserves it. `seq` is an `INTEGER`,
+/// so this really is the order the change wrote them in — `specify` numbers the
+/// drafts as they arrive and `copy_scenarios` carries the numbers over.
+fn load_live_scenarios(
+    tx: &Transaction<'_>,
+    capability_id: &str,
+) -> Result<HashMap<String, Vec<LiveScenario>>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT scenarios.requirement_id, scenarios.name, scenarios.given_text,
+                scenarios.when_text, scenarios.then_text
+         FROM scenarios
+         JOIN requirements ON requirements.id = scenarios.requirement_id
+         WHERE requirements.capability_id = ?1 AND requirements.status = 'live'
+         ORDER BY scenarios.seq",
+    )?;
+    let rows = statement.query_map([capability_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            LiveScenario {
+                name: row.get(1)?,
+                given: row.get(2)?,
+                when: row.get(3)?,
+                then: row.get(4)?,
+            },
+        ))
+    })?;
+
+    let mut by_requirement: HashMap<String, Vec<LiveScenario>> = HashMap::new();
+    for row in rows {
+        let (requirement_id, scenario) = row?;
+        by_requirement
+            .entry(requirement_id)
+            .or_default()
+            .push(scenario);
+    }
+
+    Ok(by_requirement)
 }
