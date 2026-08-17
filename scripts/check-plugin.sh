@@ -119,18 +119,6 @@ for skill in sdd-brainstorm sdd-plan sdd-execute; do
   grep -q '\$ARGUMENTS' "$path" || fail "$path never places \$ARGUMENTS, so an argument arrives unframed"
 done
 
-# A bare `openspec init` exits with a list of thirty editor names and creates
-# nothing. Any place that prints it as a suggestion has to print the working
-# form, or the person follows a hint that fails.
-# Comment lines are excluded: explaining why the bare form fails is not
-# suggesting it, and a check that cannot tell the difference gets disabled.
-for path in plugin/skills/sdd-*/SKILL.md crates/magent-cli/src/doctor.rs; do
-  [ -f "$path" ] || continue
-  if grep -v '^[[:space:]]*//' "$path" | grep 'openspec init' | grep -qv -- '--tools'; then
-    fail "$path suggests a bare 'openspec init', which fails; use 'openspec init --tools claude'"
-  fi
-done
-
 # The spec process is Magent's own: rows in the store, written and read through
 # magent_propose, magent_specify, magent_plan, magent_archive and
 # magent_changes. A skill or an agent that names openspec sends the reader to a

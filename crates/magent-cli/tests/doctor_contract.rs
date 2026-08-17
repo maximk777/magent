@@ -228,69 +228,33 @@ fn a_repository_that_declares_nothing_gets_no_toolchain_section() {
     assert!(!report.contains("toolchain"), "{report}");
 }
 
-// --- the workflow this plugin ships ----------------------------------------
+// --- the spec process, which it says nothing about --------------------------
 
-/// The SDD skills call the `openspec` CLI for every artifact they produce. A
-/// plugin that ships skills depending on a binary and never mentions it leaves
-/// the person to discover the dependency from a command that failed.
+/// The spec process lives in the store, reached through `magent_propose` and
+/// friends; the `openspec` CLI is gone. doctor used to have a section for it,
+/// and a section is the kind of thing that comes back by habit — so this greps
+/// the whole report rather than naming any one line of it.
+///
+/// Nothing replaces it: reporting on the spec process means deciding what
+/// healthy looks like for it — how many open changes is too many, whether a
+/// change parked at `planned` is a fault — and that is undecided.
 #[test]
-fn a_missing_openspec_is_named_with_how_to_install_it() {
+fn the_doctor_never_mentions_openspec() {
     let world = World::new();
 
-    let (ok, report) = world.doctor(&world.with_tools(&[]));
+    // Both PATHs, because the old section printed under either: an install hint
+    // when the binary was absent, a present line when it was there. The empty
+    // one goes first — `with_tools` adds to one directory and never clears it.
+    let absent = world.with_tools(&[]);
+    let (_, without) = world.doctor(&absent);
+    let present = world.with_tools(&["openspec"]);
+    let (_, with) = world.doctor(&present);
 
-    assert!(ok, "not having it is a finding, not a failure: {report}");
-    assert!(report.contains("openspec"), "{report}");
-    assert!(
-        report.contains("@fission-ai/openspec"),
-        "the package name is the useful half: {report}"
-    );
-}
-
-#[test]
-fn an_installed_openspec_is_not_nagged_about() {
-    let world = World::new();
-
-    let (_, report) = world.doctor(&world.with_tools(&["openspec"]));
-
-    assert!(
-        !report.contains("@fission-ai/openspec"),
-        "an install line for something installed is noise: {report}"
-    );
-}
-
-/// Having the CLI is not the same as this repository using it. Both are worth
-/// knowing and they fail differently: one is "install something", the other is
-/// "run openspec init here".
-#[test]
-fn a_repository_without_openspec_initialised_is_told_how_to_start() {
-    let world = World::new();
-
-    let (_, report) = world.doctor(&world.with_tools(&["openspec"]));
-
-    assert!(
-        report.contains("openspec init"),
-        "nothing said about starting one here: {report}"
-    );
-    // A bare `openspec init` fails with a wall of thirty tool names. A hint
-    // that does not work is worse than none, because it is followed.
-    assert!(
-        report.contains("--tools claude"),
-        "the hint as printed would fail: {report}"
-    );
-}
-
-#[test]
-fn an_initialised_repository_is_left_alone() {
-    let world = World::new();
-    std::fs::create_dir_all(world.project.join("openspec/changes")).expect("mkdir");
-    std::fs::write(
-        world.project.join("openspec/config.yaml"),
-        "schema: default\n",
-    )
-    .expect("write");
-
-    let (_, report) = world.doctor(&world.with_tools(&["openspec"]));
-
-    assert!(!report.contains("openspec init"), "{report}");
+    for report in [&without, &with] {
+        assert!(
+            !report.to_lowercase().contains("openspec"),
+            "the spec process is Magent's own; doctor has nothing to say about a \
+             CLI this project does not use: {report}"
+        );
+    }
 }
