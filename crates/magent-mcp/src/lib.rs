@@ -11,8 +11,8 @@ use std::{path::PathBuf, sync::Arc};
 use magent_core::{
     ArchiveCommand, ChangeId, CheckpointCommand, CheckpointOrigin, Classification, Fact,
     FinishAction, FinishRunCommand, HarnessKind, OperationId, PlanCommand, ProposeCommand,
-    RememberCommand, RequirementDraft, RunId, SessionId, SpecifyCommand, StartRunCommand,
-    TaskDraft, WorkflowStage,
+    RememberCommand, RequirementDraft, RunId, SessionId, SpecBinding, SpecifyCommand,
+    StartRunCommand, TaskDraft, WorkflowStage,
 };
 use magent_store::{
     ChangeDetail, ChangeSummary, Dependency, FactContext, FactQuery, GroupingCommand,
@@ -660,6 +660,17 @@ impl MagentMcp {
             .in_flight(input.run_id, input.session_id)
             .map_err(|error| render_error(&error))?;
 
+        // Carried on the command rather than bound in a second call, so that a
+        // checkpoint the store refuses cannot leave the run pointing at a task
+        // nobody recorded reaching. A binding with nothing in it is no binding:
+        // every field is optional, and all three omitted means the caller said
+        // nothing about the spec.
+        let binding = SpecBinding {
+            change_id: input.spec_change_id,
+            paths: input.spec_paths,
+            current_task: input.current_task,
+        };
+
         let command = CheckpointCommand {
             operation_id: input.operation_id,
             run_id,
@@ -677,31 +688,13 @@ impl MagentMcp {
             risks: input.risks,
             handoff_summary: input.handoff_summary,
             task_done: None,
-            binding: None,
+            binding: (binding != SpecBinding::default()).then_some(binding),
         };
 
         let saved = self
             .store
             .save_checkpoint(&command)
             .map_err(|error| render_error(&error))?;
-
-        // After the checkpoint, so a rejected checkpoint cannot leave the run
-        // pointing at a task nobody recorded reaching.
-        if input.spec_change_id.is_some()
-            || !input.spec_paths.is_empty()
-            || input.current_task.is_some()
-        {
-            self.store
-                .bind_spec(
-                    run_id,
-                    &magent_core::SpecBinding {
-                        change_id: input.spec_change_id,
-                        paths: input.spec_paths,
-                        current_task: input.current_task,
-                    },
-                )
-                .map_err(|error| render_error(&error))?;
-        }
 
         render(&saved)
     }

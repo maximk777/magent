@@ -188,6 +188,20 @@ impl Fixture {
         operation_id: OperationId,
         task_done: TaskDone,
     ) -> Result<CheckpointResult, StoreError> {
+        self.checkpoint_with_binding(run_id, session_id, operation_id, task_done, None)
+    }
+
+    /// The same, with the binding the tick is to be resolved against carried on
+    /// the checkpoint itself — the shape a first checkpoint of a task has, where
+    /// nothing has bound the run yet.
+    fn checkpoint_with_binding(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        operation_id: OperationId,
+        task_done: TaskDone,
+        binding: Option<SpecBinding>,
+    ) -> Result<CheckpointResult, StoreError> {
         self.store.save_checkpoint(&CheckpointCommand {
             operation_id,
             run_id,
@@ -203,7 +217,7 @@ impl Fixture {
             risks: vec![],
             handoff_summary: "The budget is read from config and spent per attempt.".into(),
             task_done: Some(task_done),
-            binding: None,
+            binding,
         })
     }
 
@@ -464,6 +478,58 @@ fn a_tick_on_an_unbound_run_is_refused() {
 
     let (status, _, _) = fixture.task_row(change, "1.3");
     assert_eq!(status, "pending", "and nothing was closed");
+}
+
+/// The first checkpoint of a task is one message: it names the change and the
+/// task in hand, and ticks off what it just proved. Nothing has bound the run
+/// before it, because until this task started there was nothing to bind it for.
+///
+/// So the binding has to land in this transaction and land before the tick,
+/// which resolves its slug off the run. A binding written after the tick, or in
+/// a call following the checkpoint, refuses this with `run_not_bound`.
+#[test]
+fn one_message_binds_the_run_and_closes_its_first_task() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.unbound_run();
+
+    let result = fixture
+        .checkpoint_with_binding(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+            Some(SpecBinding {
+                change_id: Some(SLUG.into()),
+                paths: Vec::new(),
+                current_task: Some("1.3: cap the loop".into()),
+            }),
+        )
+        .expect("a checkpoint carrying its own binding closes its first task");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert_eq!(closed.number, "1.3");
+
+    let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
+    assert_eq!(status, "done");
+    assert!(evidence.is_some() && verified_at.is_some());
+
+    let spec = fixture
+        .store
+        .snapshot(run_id)
+        .expect("snapshot")
+        .spec
+        .expect("the binding this checkpoint carried");
+    assert_eq!(spec.change_id.as_deref(), Some(SLUG));
+    assert_eq!(
+        spec.current_task.as_deref(),
+        Some("1.3: cap the loop"),
+        "the run is left pointing at the task the tick was for"
+    );
 }
 
 /// The numbers still open travel with the refusal, the way

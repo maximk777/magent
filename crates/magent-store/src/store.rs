@@ -273,6 +273,11 @@ impl Store {
 
     /// Persists a checkpoint and advances the run's stage.
     ///
+    /// A `binding` on the command is applied here, in the checkpoint's own
+    /// transaction and before its `task_done` is resolved, so one message can
+    /// bind a run and close its first task. It binds exactly as
+    /// [`Store::bind_spec`] does — a field it does not name is left as it is.
+    ///
     /// # Errors
     ///
     /// Returns [`StoreError::RunClosed`] for a completed run and
@@ -322,17 +327,30 @@ impl Store {
                 ),
             )?;
 
+            // In this transaction rather than in a call after it, for the same
+            // reason as the tick below: a checkpoint recorded whose binding was
+            // lost leaves the run pointing where it already was, while the
+            // checkpoint that said otherwise is on the record.
+            //
+            // Before the tick, and the row re-read afterwards, because
+            // `close_task` resolves the change through the run's own binding: a
+            // single message that binds the run and ticks its first task, which
+            // is exactly what the first checkpoint of a task looks like, would
+            // otherwise be refused for a binding this very call supplied. Read
+            // back rather than patched in memory, so that `write_binding`'s
+            // `COALESCE` stays the only statement of what a binding leaves
+            // alone.
+            let run = match command.binding.as_ref() {
+                Some(binding) => {
+                    write_binding(tx, command.run_id, binding, &now)?;
+                    load_run_row(tx, command.run_id)?
+                }
+                None => run,
+            };
+
             // In this transaction rather than in a call after it: a checkpoint
             // recorded whose tick was lost is a plan that has the evidence of
             // finished work and no sign the work finished.
-            //
-            // Anything this transaction learns to write to `runs` — the binding
-            // a checkpoint carries, above all — has to be written *before* this
-            // line. `close_task` finds the change through the `run` row loaded
-            // at the top of the closure, so a single message that binds the run
-            // and ticks its first task, which is exactly what a first
-            // checkpoint of a task looks like, would otherwise be refused for a
-            // binding this very call supplied.
             let task = command
                 .task_done
                 .as_ref()
@@ -425,34 +443,17 @@ impl Store {
     /// branch this checkout does not have is still correctly bound. Refusing it
     /// would make the reference useless exactly where it is most wanted.
     ///
+    /// This is the binding on its own, in a transaction of its own. A checkpoint
+    /// that carries one writes it through the same `write_binding`, inside the
+    /// checkpoint's transaction — see [`Store::save_checkpoint`].
+    ///
     /// # Errors
     /// Fails on a database error, or if the run does not exist.
     pub fn bind_spec(&self, run_id: RunId, binding: &SpecBinding) -> Result<(), StoreError> {
-        let connection = self.lock()?;
-
-        // Stored newline-joined rather than as JSON: these are read by hand in
-        // sqlite3 as often as by this code, and a path never contains one.
-        let paths = (!binding.paths.is_empty()).then(|| binding.paths.join("\n"));
-
-        let changed = connection.execute(
-            "UPDATE runs SET
-                 spec_change_id = COALESCE(?1, spec_change_id),
-                 spec_paths     = COALESCE(?2, spec_paths),
-                 current_task   = COALESCE(?3, current_task),
-                 updated_at     = ?4
-             WHERE id = ?5",
-            (
-                &binding.change_id,
-                &paths,
-                &binding.current_task,
-                Utc::now().to_rfc3339(),
-                run_id.to_string(),
-            ),
-        )?;
-
-        if changed == 0 {
-            return Err(StoreError::RunNotFound(run_id));
-        }
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        write_binding(&tx, run_id, binding, &Utc::now().to_rfc3339())?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -877,6 +878,44 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
         stage: enum_from_sql(&row.3)?,
         spec,
     })
+}
+
+/// Writes a binding onto a run, leaving alone whatever it does not name.
+///
+/// Takes the transaction rather than opening one, because the two callers differ
+/// in exactly that: [`Store::bind_spec`] binds a run on its own, while a
+/// checkpoint's binding has to land in the checkpoint's own transaction or it is
+/// a write that can be lost while the checkpoint survives.
+fn write_binding(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    binding: &SpecBinding,
+    now: &str,
+) -> Result<(), StoreError> {
+    // Stored newline-joined rather than as JSON: these are read by hand in
+    // sqlite3 as often as by this code, and a path never contains one.
+    let paths = (!binding.paths.is_empty()).then(|| binding.paths.join("\n"));
+
+    let changed = tx.execute(
+        "UPDATE runs SET
+             spec_change_id = COALESCE(?1, spec_change_id),
+             spec_paths     = COALESCE(?2, spec_paths),
+             current_task   = COALESCE(?3, current_task),
+             updated_at     = ?4
+         WHERE id = ?5",
+        (
+            &binding.change_id,
+            &paths,
+            &binding.current_task,
+            now,
+            run_id.to_string(),
+        ),
+    )?;
+
+    if changed == 0 {
+        return Err(StoreError::RunNotFound(run_id));
+    }
+    Ok(())
 }
 
 /// Closes the task a checkpoint ticks off, and says what the tick did.

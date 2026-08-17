@@ -10,15 +10,20 @@
 //! two disagree the wrong one is the one the agent trusts.
 
 use magent_core::{
-    CheckpointCommand, CheckpointOrigin, HarnessKind, OperationId, SpecBinding, StartRunCommand,
-    WorkflowStage,
+    CheckpointCommand, CheckpointOrigin, Classification, HarnessKind, OperationId, PlanCommand,
+    ProposeCommand, SpecBinding, StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
 };
-use magent_store::Store;
+use magent_store::{FactContext, Store, StoreError};
+
+/// The command the planned task below is verified by, quoted exactly where a
+/// tick has to match it.
+const VERIFY: &str = "cargo test -p worker retry";
 
 struct Fixture {
     dir: tempfile::TempDir,
     store: Store,
     root: std::path::PathBuf,
+    context: FactContext,
 }
 
 impl Fixture {
@@ -27,8 +32,65 @@ impl Fixture {
         let store = Store::open(&dir.path().join("magent.db")).expect("open");
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).expect("mkdir");
+        let resolved = store.resolve_workspace_for(&root).expect("resolve");
 
-        Self { dir, store, root }
+        Self {
+            dir,
+            store,
+            root,
+            context: FactContext {
+                workspace_id: Some(resolved.workspace_id),
+                namespace: None,
+                ..FactContext::default()
+            },
+        }
+    }
+
+    /// A change with one task on it, for the tick a refusal is provoked from.
+    ///
+    /// Proposed with `skip_specs`, which is what lets a change be planned
+    /// straight out of `drafting`: nothing here is about the requirements, only
+    /// about what a refused tick does to the run's binding.
+    fn planned_change(&self, slug: &str) {
+        let change = self
+            .store
+            .propose(
+                &ProposeCommand {
+                    operation_id: OperationId::new(),
+                    slug: slug.into(),
+                    title: "Add a retry budget".into(),
+                    classification: Classification::Bounded,
+                    why: "Retries currently have no ceiling and can loop forever.".into(),
+                    what_changes: vec!["Add a configurable retry budget".into()],
+                    capabilities: vec![],
+                    impact: None,
+                    skip_specs: true,
+                },
+                &self.context,
+            )
+            .expect("propose")
+            .id;
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![TaskDraft {
+                        number: "1".into(),
+                        title: "Cap the retry loop".into(),
+                        body: None,
+                        files: vec!["crates/worker/src/retry.rs".into()],
+                        consumes: None,
+                        produces: None,
+                        verify_command: VERIFY.into(),
+                        expected_output: "test result: ok".into(),
+                        covers: vec![],
+                    }],
+                },
+                &self.context,
+            )
+            .expect("plan");
     }
 
     fn start(&self, task: &str) -> (magent_core::RunId, magent_core::SessionId) {
@@ -54,25 +116,38 @@ impl Fixture {
         session_id: magent_core::SessionId,
         summary: &str,
     ) {
-        self.store
-            .save_checkpoint(&CheckpointCommand {
-                operation_id: OperationId::new(),
-                run_id,
-                session_id,
-                stage: WorkflowStage::Executing,
-                origin: CheckpointOrigin::Enriched,
-                completed_steps: vec![],
-                next_steps: vec![],
-                decisions: vec![],
-                rejected: vec![],
-                changed_files: vec![],
-                verification: vec![],
-                risks: vec![],
-                handoff_summary: summary.into(),
-                task_done: None,
-                binding: None,
-            })
+        self.send(run_id, session_id, summary, None, None)
             .expect("checkpoint");
+    }
+
+    /// A checkpoint with whatever a caller wants to hang on it, and the refusal
+    /// handed back rather than unwrapped: what a refused checkpoint leaves
+    /// behind is the thing under test below.
+    fn send(
+        &self,
+        run_id: magent_core::RunId,
+        session_id: magent_core::SessionId,
+        summary: &str,
+        task_done: Option<TaskDone>,
+        binding: Option<SpecBinding>,
+    ) -> Result<magent_core::CheckpointResult, StoreError> {
+        self.store.save_checkpoint(&CheckpointCommand {
+            operation_id: OperationId::new(),
+            run_id,
+            session_id,
+            stage: WorkflowStage::Executing,
+            origin: CheckpointOrigin::Enriched,
+            completed_steps: vec![],
+            next_steps: vec![],
+            decisions: vec![],
+            rejected: vec![],
+            changed_files: vec![],
+            verification: vec![],
+            risks: vec![],
+            handoff_summary: summary.into(),
+            task_done,
+            binding,
+        })
     }
 }
 
@@ -206,6 +281,111 @@ fn a_run_can_be_bound_after_it_has_already_started() {
             .handoff_summary,
         "traced it to the retry loop",
         "binding a spec is not a reason to lose what was already recorded"
+    );
+}
+
+/// A binding a checkpoint carries belongs to that checkpoint's operation, so a
+/// checkpoint the store refuses leaves the binding exactly where it was.
+///
+/// Three refused messages: one carrying no binding, one whose binding would have
+/// moved the run to another task, and one whose binding would have moved it to
+/// another change. The last two are what tell "inside the operation" apart from
+/// "merely earlier in it" — a run left pointing somewhere by a message that was
+/// rejected would send the next session to the wrong task, with nothing recorded
+/// to explain why.
+#[test]
+fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
+    let fixture = Fixture::new();
+    fixture.planned_change("add-retry-budget");
+    let (run_id, session_id) = fixture.start("cap the retry loop");
+    fixture
+        .store
+        .bind_spec(
+            run_id,
+            &binding("add-retry-budget", Some("1: cap the loop")),
+        )
+        .expect("bind");
+
+    // A command the plan did not name, which `close_task` refuses once it has
+    // found the task — the refusal a correctly numbered tick still meets.
+    let wrong_command = || TaskDone {
+        number: "1".into(),
+        verify_command: "cargo test -p worker".into(),
+        output: "test result: ok\n".into(),
+    };
+
+    let refused = fixture
+        .send(
+            run_id,
+            session_id,
+            "capped the loop",
+            Some(wrong_command()),
+            None,
+        )
+        .expect_err("expected the tick's command to be refused");
+    assert_eq!(refused.code(), "verify_command_mismatch");
+
+    let refused = fixture
+        .send(
+            run_id,
+            session_id,
+            "capped the loop",
+            Some(wrong_command()),
+            Some(SpecBinding {
+                change_id: None,
+                paths: vec!["openspec/changes/add-retry-budget/proposal.md".into()],
+                current_task: Some("4: something else entirely".into()),
+            }),
+        )
+        .expect_err("expected the tick's command to be refused here too");
+    assert_eq!(
+        refused.code(),
+        "verify_command_mismatch",
+        "the binding this message carried named no other change, so the tick was read \
+         against the same plan"
+    );
+
+    // The third names another change entirely, and meets a different refusal:
+    // the tick resolves against the binding this very message supplied, which is
+    // the ordering `one_message_binds_the_run_and_closes_its_first_task` is
+    // about — and the slug still has to go back with it.
+    let refused = fixture
+        .send(
+            run_id,
+            session_id,
+            "capped the loop",
+            Some(wrong_command()),
+            Some(binding("some-other-change", Some("4: something else"))),
+        )
+        .expect_err("expected a tick against a change that does not exist to be refused");
+    assert_eq!(refused.code(), "change_slug_not_found");
+
+    assert_eq!(
+        fixture.store.checkpoint_count(run_id).expect("count"),
+        0,
+        "none of the refused checkpoints was recorded"
+    );
+
+    let spec = fixture
+        .store
+        .snapshot(run_id)
+        .expect("snapshot")
+        .spec
+        .expect("the binding it had before");
+    assert_eq!(
+        spec.change_id.as_deref(),
+        Some("add-retry-budget"),
+        "the change the third message named went back with it"
+    );
+    assert_eq!(
+        spec.current_task.as_deref(),
+        Some("1: cap the loop"),
+        "and so did the task the second named"
+    );
+    assert_eq!(
+        spec.paths,
+        ["openspec/changes/add-retry-budget/tasks.md"],
+        "and the path it added"
     );
 }
 
