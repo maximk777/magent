@@ -100,6 +100,12 @@ pub enum DomainError {
     #[error("a task's expected_output must not be blank")]
     InvalidExpectedOutput,
 
+    /// The output is the whole point of a tick. A task closed with no record
+    /// of what its command printed is a task closed on nothing, and reads
+    /// afterwards exactly like one that was checked.
+    #[error("closing a task needs the output its command printed")]
+    InvalidTaskOutput,
+
     /// A plan with a stub in its text looks finished, and falls apart on the
     /// agent that executes the one task carrying it: it sees only that task,
     /// never the surrounding plan, and has no way to guess what the stub was
@@ -150,6 +156,7 @@ impl DomainError {
             Self::InvalidTaskTitle => "invalid_task_title",
             Self::InvalidVerifyCommand => "invalid_verify_command",
             Self::InvalidExpectedOutput => "invalid_expected_output",
+            Self::InvalidTaskOutput => "invalid_task_output",
             Self::PlaceholderTextInTask { .. } => "placeholder_text_in_task",
         }
     }

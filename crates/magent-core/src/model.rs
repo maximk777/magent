@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{DomainError, Validate};
+use crate::{
+    error::{DomainError, Validate},
+    sdd::TaskDone,
+};
 
 /// Declares a UUID newtype that is a bare string on the wire.
 ///
@@ -227,6 +230,18 @@ pub struct CheckpointCommand {
     pub verification: Vec<String>,
     pub risks: Vec<String>,
     pub handoff_summary: String,
+    /// The task this checkpoint closes, if it closes one. A checkpoint is
+    /// where the agent has just finished something and knows what proved it,
+    /// so it is the one moment a tick can carry its evidence without being
+    /// asked for it separately.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_done: Option<TaskDone>,
+    /// What the run is executing, when the caller knows. Same meaning as
+    /// [`RunSnapshot::spec`], and `None` means "leave the binding as it is"
+    /// rather than "unbind" — the store decides that, because only the store
+    /// has the binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<SpecBinding>,
 }
 
 impl Validate for CheckpointCommand {
@@ -236,6 +251,9 @@ impl Validate for CheckpointCommand {
         }
         if self.stage == WorkflowStage::Completed {
             return Err(DomainError::InvalidCheckpointStage);
+        }
+        if let Some(task_done) = &self.task_done {
+            task_done.validate()?;
         }
         Ok(())
     }

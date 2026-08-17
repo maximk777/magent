@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use magent_core::{
     CheckpointCommand, CheckpointOrigin, FinishAction, FinishRunCommand, OperationId, RunId,
-    SessionId, StartRunCommand, Validate, WorkflowStage,
+    SessionId, StartRunCommand, TaskDone, Validate, WorkflowStage,
 };
 
 fn workspace_roots() -> Vec<PathBuf> {
@@ -39,6 +39,16 @@ fn valid_checkpoint(run_id: RunId, session_id: SessionId) -> CheckpointCommand {
         verification: vec!["targeted test is red".into()],
         risks: vec![],
         handoff_summary: "Owner traced; regression test is next.".into(),
+        task_done: None,
+        binding: None,
+    }
+}
+
+fn valid_tick() -> TaskDone {
+    TaskDone {
+        number: "1.2".into(),
+        verify_command: "cargo test -p worker retry_budget".into(),
+        output: "test retry_budget ... ok".into(),
     }
 }
 
@@ -106,6 +116,62 @@ fn checkpoint_accepts_a_well_formed_command() {
         valid_checkpoint(RunId::new(), SessionId::new())
             .validate()
             .is_ok()
+    );
+}
+
+/// A tick with no output is the whole failure mode this evidence exists to
+/// prevent: a task marked done on the word of the agent that did it, with
+/// nothing anyone can read to see the verification ran.
+#[test]
+fn a_tick_without_output_is_refused() {
+    let command = CheckpointCommand {
+        task_done: Some(TaskDone {
+            output: "  ".into(),
+            ..valid_tick()
+        }),
+        ..valid_checkpoint(RunId::new(), SessionId::new())
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_task_output"
+    );
+}
+
+/// Its own variant rather than the output's: the caller sees only the code, so
+/// one that covered both fields would leave it guessing which it left blank.
+#[test]
+fn a_tick_without_a_command_is_refused() {
+    let command = CheckpointCommand {
+        task_done: Some(TaskDone {
+            verify_command: "\t".into(),
+            ..valid_tick()
+        }),
+        ..valid_checkpoint(RunId::new(), SessionId::new())
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_verify_command"
+    );
+}
+
+/// The number addresses a task the plan already wrote down, so it is held to
+/// the same shape `magent_plan` accepted it in — otherwise a tick can name a
+/// task that could never have existed.
+#[test]
+fn a_tick_numbered_like_a_path_is_refused() {
+    let command = CheckpointCommand {
+        task_done: Some(TaskDone {
+            number: "1..2".into(),
+            ..valid_tick()
+        }),
+        ..valid_checkpoint(RunId::new(), SessionId::new())
+    };
+
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_task_number"
     );
 }
 

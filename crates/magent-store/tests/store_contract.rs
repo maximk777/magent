@@ -55,6 +55,8 @@ fn checkpoint_command(run_id: RunId, session_id: SessionId, summary: &str) -> Ch
         verification: vec!["targeted test is red".into()],
         risks: vec![],
         handoff_summary: summary.into(),
+        task_done: None,
+        binding: None,
     }
 }
 

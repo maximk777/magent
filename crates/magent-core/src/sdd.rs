@@ -390,9 +390,7 @@ fn placeholder_in(text: &str) -> Option<&'static str> {
 
 impl Validate for TaskDraft {
     fn validate(&self) -> Result<(), DomainError> {
-        if !is_hierarchical_number(&self.number) {
-            return Err(DomainError::InvalidTaskNumber);
-        }
+        check_task_number(&self.number)?;
         if self.title.trim().is_empty() {
             return Err(DomainError::InvalidTaskTitle);
         }
@@ -459,6 +457,47 @@ impl Validate for PlanCommand {
     }
 }
 
+/// What closes one task: the command that proved it, and what that printed.
+///
+/// Every field is required, and none of them defaults. A tick that carries no
+/// evidence is the one thing this change exists to rule out — a task marked
+/// done on the word of the agent that did it, with nothing a later reader can
+/// check it against. Left optional, the rule would be a matter of discipline;
+/// stated in the schema, it is a shape the caller cannot even express.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskDone {
+    /// The task this closes, as the plan numbered it.
+    pub number: String,
+    /// The command that was run to prove the task done. Held against the
+    /// `verify_command` the plan recorded for that task, so a command chosen
+    /// after the fact — an easier one, a narrower one — is refused rather
+    /// than accepted as evidence of something else. That comparison is the
+    /// store's, because only the store has the plan's row.
+    pub verify_command: String,
+    /// What that command printed, quoted rather than characterised: the point
+    /// of keeping it is that someone other than its author can read it. The
+    /// lines that show the result, not the whole run — this text is carried in
+    /// the checkpoint's payload, which is parsed on every snapshot read.
+    pub output: String,
+}
+
+impl Validate for TaskDone {
+    fn validate(&self) -> Result<(), DomainError> {
+        check_task_number(&self.number)?;
+        // A variant per field, as `TaskDraft` does above and for the reason
+        // given there: the caller reads a code back over MCP with none of its
+        // own input in front of it, so "one of these is blank" is a round trip
+        // spent guessing which.
+        if self.verify_command.trim().is_empty() {
+            return Err(DomainError::InvalidVerifyCommand);
+        }
+        if self.output.trim().is_empty() {
+            return Err(DomainError::InvalidTaskOutput);
+        }
+        Ok(())
+    }
+}
+
 /// A request to close out a change once every task on it is done.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ArchiveCommand {
@@ -496,9 +535,19 @@ fn is_kebab_case(value: &str) -> bool {
 /// digits, hierarchical rather than sequential ("1.2", "3.10.4"), with no
 /// leading, trailing or doubled dot to keep every representation of one
 /// number unambiguous.
-fn is_hierarchical_number(value: &str) -> bool {
-    !value.is_empty()
+///
+/// Shared by the task a plan writes and the tick that closes it. Two copies of
+/// the rule could disagree, and then a number a plan accepted would be a number
+/// no tick could name.
+fn check_task_number(value: &str) -> Result<(), DomainError> {
+    let well_formed = !value.is_empty()
         && value.split('.').all(|part| {
             !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
-        })
+        });
+
+    if well_formed {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidTaskNumber)
+    }
 }

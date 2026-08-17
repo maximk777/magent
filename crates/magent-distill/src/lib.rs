@@ -186,6 +186,8 @@ fn process(store: &Store, distiller: &dyn Distiller, payload_json: &str) -> anyh
         verification: distillation.verification,
         risks: distillation.risks,
         handoff_summary: summary,
+        task_done: None,
+        binding: None,
     })?;
 
     Ok(payload.run_id)

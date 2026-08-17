@@ -425,6 +425,8 @@ impl Store {
             verification,
             risks,
             handoff_summary: summary,
+            task_done: None,
+            binding: None,
         })?;
 
         Ok(())

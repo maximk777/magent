@@ -69,6 +69,8 @@ impl Fixture {
                 verification: vec![],
                 risks: vec![],
                 handoff_summary: summary.into(),
+                task_done: None,
+                binding: None,
             })
             .expect("checkpoint");
     }

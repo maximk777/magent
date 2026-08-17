@@ -676,6 +676,8 @@ impl MagentMcp {
             verification: input.verification,
             risks: input.risks,
             handoff_summary: input.handoff_summary,
+            task_done: None,
+            binding: None,
         };
 
         let saved = self
