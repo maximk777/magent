@@ -12,7 +12,7 @@ use magent_core::{
     ArchiveCommand, ChangeId, CheckpointCommand, CheckpointOrigin, Classification, Fact,
     FinishAction, FinishRunCommand, HarnessKind, OperationId, PlanCommand, ProposeCommand,
     RememberCommand, RequirementDraft, RunId, SessionId, SpecBinding, SpecifyCommand,
-    StartRunCommand, TaskDraft, WorkflowStage,
+    StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
 };
 use magent_store::{
     ChangeDetail, ChangeSummary, Dependency, FactContext, FactQuery, GroupingCommand,
@@ -33,7 +33,11 @@ use serde::{Deserialize, Serialize};
 /// it at 2 KB, so the operative instructions come first and the caveats last.
 /// It says when to call, not what Magent is: the model does not need the
 /// architecture, only the protocol.
-const INSTRUCTIONS: &str = "\
+///
+/// Public so that the limit can be asserted against the constant itself. Every
+/// sentence here is rewritten by hand under a budget nobody can count by eye,
+/// and a test that names the constant says what to shorten.
+pub const INSTRUCTIONS: &str = "\
 Magent gives this session durable task memory that survives context compaction, \
 /clear, and handoff to another agent.
 
@@ -64,7 +68,7 @@ library's behaviour.
 Spec-driven work: magent_propose a change, magent_specify its requirements, \
 magent_plan its tasks, magent_archive when done; magent_changes reads any of \
 it back. Executing one, pass spec_change_id and current_task to \
-magent_checkpoint, and restored context names the task in hand.
+magent_checkpoint, and task_done to close a task with the command that proved it.
 
 Every mutating call takes an operation_id. Generate a fresh UUID per call, and \
 reuse the same one when retrying, so a retry cannot duplicate state.
@@ -193,6 +197,18 @@ pub struct CheckpointToolInput {
     /// The task now in hand, as it reads in the list: `2: wire the budget`.
     #[serde(default)]
     pub current_task: Option<String>,
+    /// The task this checkpoint closes: its number as the plan gave it, the
+    /// command that proved it, and what that command printed. All three
+    /// together, because [`TaskDone`] admits no tick without its evidence.
+    /// Whether the command is the one the plan recorded is checked by the
+    /// store, which holds the plan's row; whether the output is really what
+    /// that command printed is the caller's to answer.
+    ///
+    /// Defaulted like every optional field above, and for that reason: the
+    /// attribute states in the source which fields a call may leave out, rather
+    /// than leaving a reader to derive it from how serde treats `Option`.
+    #[serde(default)]
+    pub task_done: Option<TaskDone>,
 }
 
 /// What the client may supply when finishing.
@@ -650,7 +666,7 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Persist what only you know about this run: decisions, alternatives rejected, what was verified, open risks. Call at stage boundaries and before handing work over. Only stage and handoff_summary are needed; the server knows which run and session this is."
+        description = "Persist what only you know about this run: decisions, alternatives rejected, what was verified, open risks. Call at stage boundaries and before handing work over. Only stage and handoff_summary are needed; the server knows which run and session this is. A task of a plan is closed by carrying task_done: the number the plan gave it, the command the plan named, and what that command printed."
     )]
     async fn magent_checkpoint(
         &self,
@@ -687,7 +703,7 @@ impl MagentMcp {
             verification: input.verification,
             risks: input.risks,
             handoff_summary: input.handoff_summary,
-            task_done: None,
+            task_done: input.task_done,
             binding: (binding != SpecBinding::default()).then_some(binding),
         };
 

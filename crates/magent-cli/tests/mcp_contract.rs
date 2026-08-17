@@ -242,6 +242,19 @@ async fn server_instructions_fit_the_two_kilobyte_limit() {
     client.cancel().await.expect("shutdown");
 }
 
+/// The same limit, asserted where it is spent. The test above measures what one
+/// connection sent, which is the constant plus whatever that workspace made the
+/// server append; this one measures the sentences an author edits, so a rewrite
+/// that overruns names the thing to shorten and does so without a server.
+#[test]
+fn the_bootstrap_instructions_still_fit() {
+    assert!(
+        magent_mcp::INSTRUCTIONS.len() <= INSTRUCTIONS_LIMIT,
+        "the bootstrap contract is {} bytes, limit is {INSTRUCTIONS_LIMIT}",
+        magent_mcp::INSTRUCTIONS.len()
+    );
+}
+
 /// Five of the fourteen tools are one process, and a model that never hears
 /// the process exists has no reason to go and read their descriptions. The
 /// bootstrap contract is the only place it reads before deciding what to do.
@@ -1506,6 +1519,70 @@ async fn the_spec_fields_are_all_optional() {
     client.cancel().await.expect("shutdown");
 }
 
+/// What a property really says, with a `$ref` followed into `$defs` and the
+/// `null` alternative of an optional field stepped over: a nested type reaches
+/// the wire as a reference beside `{"type": "null"}`, and the object on the
+/// other side of that is where a client reads what the type demands.
+fn resolve_schema<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        let name = reference
+            .rsplit('/')
+            .next()
+            .unwrap_or_else(|| panic!("a $ref names nothing: {reference}"));
+        return resolve_schema(root, &root["$defs"][name]);
+    }
+
+    if let Some(branches) = schema.get("anyOf").and_then(Value::as_array) {
+        let branch = branches
+            .iter()
+            .find(|branch| branch.get("type").and_then(Value::as_str) != Some("null"))
+            .unwrap_or_else(|| panic!("an anyOf of nothing but null: {schema}"));
+        return resolve_schema(root, branch);
+    }
+
+    schema
+}
+
+/// A tick cannot omit its evidence, and the schema is where a client learns
+/// that, so the property's own required list is what this asserts: settling for
+/// "the property exists" would leave a caller free to send a number alone and
+/// discover the rest from a refusal. The three go together because a task
+/// recorded as done with nothing to check it against reads afterwards exactly
+/// like one that was checked.
+#[tokio::test]
+async fn the_checkpoint_tool_takes_a_tick() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let tools = client.list_all_tools().await.expect("tools");
+    let checkpoint = tools
+        .iter()
+        .find(|tool| tool.name == "magent_checkpoint")
+        .expect("magent_checkpoint");
+    let root = Value::Object(checkpoint.input_schema.as_ref().clone());
+
+    let property = &root["properties"]["task_done"];
+    assert!(
+        !property.is_null(),
+        "a checkpoint cannot close a task: {root}"
+    );
+
+    let mut required: Vec<&str> = resolve_schema(&root, property)["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("task_done requires nothing: {property}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    required.sort_unstable();
+
+    assert_eq!(
+        required,
+        ["number", "output", "verify_command"],
+        "a tick that can leave out its evidence: {root}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
 // --- propose and specify ----------------------------------------------------
 
 /// Sorted required-field names for one tool's input schema.
@@ -1707,9 +1784,11 @@ fn tasks(change: &str) -> Value {
 /// Closes every task of the fixture's database, the way executing a plan would
 /// leave them.
 ///
-/// Marking a task done is not a verb the server has yet, so the rows are set
-/// directly — the same thing `magent-store`'s own archive tests do, and the
-/// only way to reach `magent_archive` from here at all.
+/// The rows are set directly, as `magent-store`'s own archive tests do, rather
+/// than ticked through `magent_checkpoint`: a tick needs a run bound to the
+/// change and a plan whose commands it can quote, which is what
+/// `a_tick_over_mcp_closes_the_task` exists to exercise. A test about archiving
+/// only needs the tasks out of its way.
 fn finish_tasks(fixture: &Fixture) {
     let connection =
         rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open the store");
@@ -1911,6 +1990,65 @@ async fn proposing_the_same_slug_again_reports_a_rewrite() {
         again["id"].as_str(),
         first["id"].as_str(),
         "a rewrite keeps the change it rewrote: {again}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+// --- closing a task ----------------------------------------------------------
+
+/// The loop, over the wire: a plan is written, a run is opened on it, and one
+/// checkpoint both binds the run to the change and closes the first task with
+/// the command the plan named. One message, because the binding is applied
+/// before the tick in the same transaction — an agent that has just finished
+/// task 1 has nothing else to send first.
+#[tokio::test]
+async fn a_tick_over_mcp_closes_the_task() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    call(&client, "magent_specify", deltas("add-retry-budget")).await;
+    call(&client, "magent_plan", tasks("add-retry-budget")).await;
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "add a retry budget" }),
+    )
+    .await;
+
+    let saved = call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "the worker stops once the budget is spent",
+            "spec_change_id": "add-retry-budget",
+            "current_task": "1: cap the attempts in the worker",
+            "task_done": {
+                "number": "1",
+                "verify_command": "cargo test -p worker budget",
+                "output": "running 1 test\ntest budget_caps_retries ... ok\n"
+            }
+        }),
+    )
+    .await;
+
+    let task = &saved["task"];
+    assert_eq!(
+        task["number"].as_str(),
+        Some("1"),
+        "the tick closed nothing: {saved}"
+    );
+    assert_eq!(
+        task["expected_output_found"].as_bool(),
+        Some(true),
+        "the plan expected that line and the output carries it: {saved}"
+    );
+    assert_eq!(
+        task["change_ready"].as_bool(),
+        Some(true),
+        "this plan has one task, so closing it leaves none open: {saved}"
     );
     client.cancel().await.expect("shutdown");
 }
