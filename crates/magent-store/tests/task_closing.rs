@@ -66,6 +66,11 @@ impl Fixture {
 
     /// A change carried all the way to `planned`, with two tasks on it — so a
     /// tick closing one leaves the plan unfinished.
+    ///
+    /// The task under test is numbered "1.3" rather than "1": plans are
+    /// numbered hierarchically, which is why `tasks.number` is `TEXT`
+    /// (`0009_tasks.sql`), and a fixture whose numbers are all single digits
+    /// would pass whether or not the number is carried as written.
     fn planned_change(&self) -> ChangeId {
         let change = self
             .store
@@ -120,7 +125,7 @@ impl Fixture {
                 &PlanCommand {
                     operation_id: OperationId::new(),
                     change,
-                    tasks: vec![task("1", &[REQUIREMENT]), task("2", &[])],
+                    tasks: vec![task("1.3", &[REQUIREMENT]), task("2", &[])],
                 },
                 &self.context,
             )
@@ -129,9 +134,10 @@ impl Fixture {
         change
     }
 
-    /// A run of this workspace, bound to the change by its slug — which is
-    /// what `runs.spec_change_id` holds.
-    fn bound_run(&self) -> (RunId, SessionId) {
+    /// A run of this workspace that names no change: the shape a run has
+    /// before anything binds it, and the one a tick has nothing to resolve
+    /// against.
+    fn unbound_run(&self) -> (RunId, SessionId) {
         let started = self
             .store
             .start_run(
@@ -146,18 +152,26 @@ impl Fixture {
             )
             .expect("start");
 
+        (started.run_id, started.session_id)
+    }
+
+    /// A run of this workspace, bound to the change by its slug — which is
+    /// what `runs.spec_change_id` holds.
+    fn bound_run(&self) -> (RunId, SessionId) {
+        let (run_id, session_id) = self.unbound_run();
+
         self.store
             .bind_spec(
-                started.run_id,
+                run_id,
                 &SpecBinding {
                     change_id: Some(SLUG.into()),
                     paths: Vec::new(),
-                    current_task: Some("1: cap the loop".into()),
+                    current_task: Some("1.3: cap the loop".into()),
                 },
             )
             .expect("bind");
 
-        (started.run_id, started.session_id)
+        (run_id, session_id)
     }
 
     /// A checkpoint carrying a tick, under an `operation_id` the caller picks.
@@ -251,7 +265,7 @@ fn task_closes_with_its_evidence() {
             session_id,
             OperationId::new(),
             TaskDone {
-                number: "1".into(),
+                number: "1.3".into(),
                 verify_command: VERIFY.into(),
                 output: output.clone(),
             },
@@ -259,7 +273,7 @@ fn task_closes_with_its_evidence() {
         .expect("checkpoint");
 
     let closed = result.task.expect("the checkpoint closed a task");
-    assert_eq!(closed.number, "1");
+    assert_eq!(closed.number, "1.3");
     assert!(
         closed.expected_output_found,
         "the plan's expected_output is in this output"
@@ -269,7 +283,7 @@ fn task_closes_with_its_evidence() {
         "task 2 of the plan is still open, so the change is not ready"
     );
 
-    let (status, evidence, verified_at) = fixture.task_row(change, "1");
+    let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
     assert_eq!(status, "done");
     assert_eq!(
         evidence.as_deref(),
@@ -299,7 +313,7 @@ fn evidence_is_recorded_even_when_the_output_differs() {
             session_id,
             OperationId::new(),
             TaskDone {
-                number: "1".into(),
+                number: "1.3".into(),
                 verify_command: VERIFY.into(),
                 output: output.into(),
             },
@@ -312,7 +326,7 @@ fn evidence_is_recorded_even_when_the_output_differs() {
         "{EXPECTED:?} does not appear in {output:?}"
     );
 
-    let (status, evidence, verified_at) = fixture.task_row(change, "1");
+    let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
     assert_eq!(status, "done", "the task closes either way");
     assert_eq!(evidence.as_deref(), Some(output));
     assert!(verified_at.is_some());
@@ -341,7 +355,7 @@ fn a_tick_that_cannot_be_written_takes_the_checkpoint_with_it() {
             session_id,
             OperationId::new(),
             TaskDone {
-                number: "1".into(),
+                number: "1.3".into(),
                 verify_command: VERIFY.into(),
                 output: format!("{EXPECTED}\n"),
             },
@@ -359,7 +373,7 @@ fn a_tick_that_cannot_be_written_takes_the_checkpoint_with_it() {
         0,
         "a checkpoint whose tick could not be written must not survive it"
     );
-    let (status, evidence, verified_at) = fixture.task_row(change, "1");
+    let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
     assert_eq!(status, "pending", "and the task is left as it was");
     assert_eq!(evidence, None);
     assert_eq!(verified_at, None);
@@ -378,7 +392,7 @@ fn a_repeated_checkpoint_answers_with_the_same_tick() {
 
     let operation_id = OperationId::new();
     let done = TaskDone {
-        number: "1".into(),
+        number: "1.3".into(),
         verify_command: VERIFY.into(),
         output: format!("{EXPECTED}\n"),
     };
@@ -402,6 +416,257 @@ fn a_repeated_checkpoint_answers_with_the_same_tick() {
         1,
         "the replay must not have recorded a second checkpoint"
     );
-    let (status, _, _) = fixture.task_row(change, "1");
+    let (status, _, _) = fixture.task_row(change, "1.3");
     assert_eq!(status, "done");
+}
+
+/// The cheapest and most fundamental refusal, so it comes first: the slug a
+/// task number is looked up in comes off the run, and a run bound to nothing
+/// leaves no plan for any of the later checks to be about.
+#[test]
+fn a_tick_on_an_unbound_run_is_refused() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.unbound_run();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected a tick on an unbound run to be refused");
+
+    assert!(
+        matches!(&error, StoreError::RunNotBoundToChange { run } if *run == run_id),
+        "expected the unbound run to be named, got {error:?}"
+    );
+    assert_eq!(error.code(), "run_not_bound");
+
+    let (status, _, _) = fixture.task_row(change, "1.3");
+    assert_eq!(status, "pending", "and nothing was closed");
+}
+
+/// The numbers still open travel with the refusal, the way
+/// `ChangeNotExecuted` and `CapabilityNotProposed` carry their lists: a caller
+/// told only that its number is wrong has to go and read the plan out of the
+/// database to find out which one is right.
+#[test]
+fn a_tick_for_an_unknown_number_lists_the_open_ones() {
+    let fixture = Fixture::new();
+    fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected a number no task has to be refused");
+
+    let StoreError::TaskNotFound { slug, number, open } = &error else {
+        panic!("expected the number to be reported as unknown, got {error:?}");
+    };
+    assert_eq!(number, "3");
+    assert_eq!(
+        slug, SLUG,
+        "the plan is named, so a caller holding a stale binding can see it is the wrong plan"
+    );
+    assert_eq!(
+        open,
+        &["1.3".to_owned(), "2".to_owned()],
+        "both tasks of this plan are still open, in `open_task_numbers`' lexicographic \
+         order on the number, which for these two coincides with the plan's"
+    );
+    assert_eq!(error.code(), "task_not_found");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("1.3") && message.contains('2'),
+        "the open numbers belong in the message, not only in the variant: {message}"
+    );
+    assert!(
+        message.contains(SLUG),
+        "and so does the plan they belong to: {message}"
+    );
+}
+
+/// The one check that makes "run the command the plan named" enforceable
+/// rather than advisory. The command sent here is a prefix of the planned one —
+/// what a fuzzy comparison would wave through, and waving it through would put
+/// back the hole this closes, since the evidence would then be of some other
+/// command's output.
+#[test]
+fn a_tick_with_another_command_is_refused_and_leaves_the_task_open() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: "cargo test -p worker".into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected another command to be refused");
+
+    assert!(
+        matches!(&error, StoreError::VerifyCommandMismatch { number, expected }
+            if number == "1.3" && expected == VERIFY),
+        "expected the planned command to be carried, got {error:?}"
+    );
+    assert_eq!(error.code(), "verify_command_mismatch");
+    assert!(
+        error.to_string().contains(VERIFY),
+        "the refusal names the command to run instead: {error}"
+    );
+
+    let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
+    assert_eq!(status, "pending", "the task is left open for the real run");
+    assert_eq!(evidence, None);
+    assert_eq!(verified_at, None);
+}
+
+/// The likeliest of these refusals to fire for real: a run outlives the change
+/// it was bound to, because archiving drops the slug out of the live set. The
+/// binding is what has to be corrected, so the refusal names the slug rather
+/// than the number — a caller told only "no task found" would go looking through
+/// a plan that is not the one it is bound to.
+#[test]
+fn a_tick_whose_slug_names_no_open_change_is_refused() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    // `bind_spec` COALESCEs, so a non-null slug overwrites the one that is
+    // there: this is the shape a run has after the change under it went away.
+    fixture
+        .store
+        .bind_spec(
+            run_id,
+            &SpecBinding {
+                change_id: Some("a-change-that-is-gone".into()),
+                paths: Vec::new(),
+                current_task: None,
+            },
+        )
+        .expect("rebind");
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected a slug no open change answers to be refused");
+
+    assert!(
+        matches!(&error, StoreError::ChangeSlugNotFound(slug)
+            if slug == "a-change-that-is-gone"),
+        "expected the slug to be named, got {error:?}"
+    );
+    assert_eq!(error.code(), "change_slug_not_found");
+    assert!(
+        error.to_string().contains("re-bind"),
+        "the refusal says what to do about it: {error}"
+    );
+
+    let (status, _, _) = fixture.task_row(change, "1.3");
+    assert_eq!(
+        status, "pending",
+        "the plan that does exist is left untouched"
+    );
+}
+
+/// The one branch of the five with real work in it — the `len() > 1` guard and
+/// the namespace mapping — and the one where getting it wrong is invisible:
+/// resolving to whichever change sorted first would close a task on a plan
+/// nobody did this work for, and report success.
+#[test]
+fn a_tick_whose_slug_names_two_changes_is_refused() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    // The live-slug index is per namespace, so the same slug can be proposed
+    // again under another one. Neither specify nor plan is needed: this refusal
+    // fires before any task is looked up.
+    let elsewhere = FactContext {
+        namespace: Some("infra".into()),
+        ..fixture.context.clone()
+    };
+    fixture
+        .store
+        .propose(
+            &ProposeCommand {
+                operation_id: OperationId::new(),
+                slug: SLUG.into(),
+                title: "Add a retry budget, over there".into(),
+                classification: Classification::Bounded,
+                why: "The same slug, proposed under another namespace.".into(),
+                what_changes: vec!["Add a configurable retry budget".into()],
+                capabilities: vec![CAPABILITY.into()],
+                impact: None,
+                skip_specs: false,
+            },
+            &elsewhere,
+        )
+        .expect("propose elsewhere");
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected a slug two open changes answer to be refused");
+
+    let StoreError::ChangeSlugAmbiguous { slug, namespaces } = &error else {
+        panic!("expected the slug to be reported as ambiguous, got {error:?}");
+    };
+    assert_eq!(slug, SLUG);
+    assert_eq!(
+        namespaces,
+        &["(no namespace)".to_owned(), "infra".to_owned()],
+        "both namespaces, the one filed under none named rather than blank, ordered by \
+         `change_by_slug`'s `IFNULL(namespace, '')` — a reordering here is that query's, \
+         not this refusal's"
+    );
+    assert_eq!(error.code(), "change_slug_ambiguous");
+    assert!(
+        error.to_string().contains("infra"),
+        "the namespaces that tell the two apart belong in the message: {error}"
+    );
+
+    let (status, _, _) = fixture.task_row(change, "1.3");
+    assert_eq!(
+        status, "pending",
+        "neither plan is closed while it is unclear which one this is"
+    );
 }

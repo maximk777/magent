@@ -202,15 +202,89 @@ pub enum StoreError {
     )]
     NothingToArchive(ChangeId),
 
-    /// A checkpoint carried a tick that reaches no task row, and every way
-    /// that happens is a different thing for the caller to fix: a run bound to
-    /// no change, a slug that names none, a slug that names several, a number
-    /// belonging to no task of the plan. The situation travels in the message
-    /// because the caller cannot see any of it — least of all two changes
-    /// answering to one slug, where closing whichever sorted first would file
-    /// the evidence against the wrong plan.
-    #[error("this checkpoint's task_done reaches no task: {0}")]
-    TaskNotPlaced(String),
+    /// A checkpoint carried a tick, and the run it came on names no change.
+    /// The slug a task number is looked up in comes off the run rather than off
+    /// the tick — a checkpoint late in a task carries the number and nothing
+    /// else — so a run bound to nothing leaves no plan the number could belong
+    /// to. Refused first, because every refusal after it is a statement about a
+    /// plan.
+    #[error(
+        "run {run} is bound to no change, so there is no plan to look a task number up in; \
+         bind it to the change being executed and send the tick again"
+    )]
+    RunNotBoundToChange { run: RunId },
+
+    /// The slug the run is bound to names an open change in more than one
+    /// namespace. `sdd::change_by_slug` hands back every match and refuses
+    /// nothing, because only its caller knows what was being resolved; here it
+    /// was a tick, and closing whichever change sorted first would file the
+    /// evidence of finished work against a plan nobody did it for.
+    ///
+    /// The namespaces rather than the ids: the ids are UUIDs the caller has
+    /// never seen, and the namespace is the one part of this a person can act
+    /// on.
+    #[error(
+        "the slug {slug:?} this run is bound to names an open change in each of {}; \
+         nothing can tell which of those plans the tick belongs to",
+        .namespaces.join(", ")
+    )]
+    ChangeSlugAmbiguous {
+        slug: String,
+        namespaces: Vec<String>,
+    },
+
+    /// The run is bound to a slug that no open change here answers to — the
+    /// change has been archived or abandoned since, or the binding names a
+    /// change of another workspace. Distinct from
+    /// [`StoreError::ChangeNotFound`], which carries a `ChangeId`: a run row
+    /// holds a slug, and telling a caller that some uuid is missing would name
+    /// something it never supplied.
+    ///
+    /// The two causes have different repairs, so the message carries them the
+    /// way [`StoreError::ChangeNotSpecified`] does rather than leaving them in a
+    /// doc comment nothing reads at the moment of the refusal.
+    #[error(
+        "no open change in this workspace is called {0:?}; a slug leaves this list once its \
+         change is archived or abandoned, so re-bind the run to the change being executed — \
+         or, if that change is the archived one, its work is already signed off"
+    )]
+    ChangeSlugNotFound(String),
+
+    /// A tick named a number this plan has no task for. The numbers still open
+    /// travel with it for the reason [`StoreError::ChangeNotExecuted`] and
+    /// [`StoreError::CapabilityNotProposed`] carry their lists: they are the
+    /// part of the answer the caller cannot derive from the command it just
+    /// sent, and without them the only way on is a query against a plan the
+    /// caller has been told nothing about except that its number is wrong.
+    ///
+    /// The plan is named for a fault the numbers alone would misdiagnose: a run
+    /// left bound to one change while its session executes another reaches here
+    /// with a perfectly good number, and a message that named no plan would send
+    /// the caller to correct the number instead of the binding.
+    #[error(
+        "the plan of {slug:?} has no task numbered {number:?}; {}",
+        open_detail(.slug, .open)
+    )]
+    TaskNotFound {
+        slug: String,
+        number: String,
+        open: Vec<String>,
+    },
+
+    /// The tick carried a different command from the one the plan named for
+    /// this task. Compared on the trimmed text and nothing looser: a plan
+    /// states its verification precisely so that the box cannot be ticked by
+    /// running something else, and a comparison that accepted a near miss would
+    /// hand back the hole it closes — the evidence would be of some other
+    /// command's output.
+    ///
+    /// The planned command travels because it is the thing to do instead, and
+    /// the caller would otherwise have to read the plan to find it.
+    #[error(
+        "task {number} is verified by {expected:?}; a tick carrying another command \
+         proves nothing about it"
+    )]
+    VerifyCommandMismatch { number: String, expected: String },
 }
 
 /// The tail of [`StoreError::ChangeNotExecuted`]'s message.
@@ -229,6 +303,27 @@ fn declared_detail(declared: &[String]) -> String {
         "its proposal declares no capabilities at all".to_owned()
     } else {
         format!("its proposal declares: {}", declared.join(", "))
+    }
+}
+
+/// The tail of [`StoreError::TaskNotFound`]'s message.
+///
+/// Two shapes, as `unexecuted_detail` has: an empty list means every task of
+/// the plan is already closed, so "the numbers still open are: " trailing off
+/// into nothing would read as a bug in the message rather than as the answer —
+/// which here is that the mistake is in the number, not in the plan's progress.
+///
+/// The plan is named in both, never left as "it": a caller holding a stale
+/// binding is reading this message about a plan other than the one it is
+/// working on, which is precisely the case an anonymous pronoun hides.
+fn open_detail(slug: &str, open: &[String]) -> String {
+    if open.is_empty() {
+        format!("every task of {slug:?} is already closed")
+    } else {
+        format!(
+            "the numbers still open in {slug:?} are: {}",
+            open.join(", ")
+        )
     }
 }
 
@@ -269,7 +364,11 @@ impl StoreError {
             Self::RequirementsUncovered(_) => "requirements_uncovered",
             Self::ChangeNotExecuted { .. } => "change_not_executed",
             Self::NothingToArchive(_) => "nothing_to_archive",
-            Self::TaskNotPlaced(_) => "task_not_placed",
+            Self::RunNotBoundToChange { .. } => "run_not_bound",
+            Self::ChangeSlugAmbiguous { .. } => "change_slug_ambiguous",
+            Self::ChangeSlugNotFound(_) => "change_slug_not_found",
+            Self::TaskNotFound { .. } => "task_not_found",
+            Self::VerifyCommandMismatch { .. } => "verify_command_mismatch",
         }
     }
 }

@@ -276,7 +276,11 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`StoreError::RunClosed`] for a completed run and
-    /// [`StoreError::SessionNotFound`] for an unknown session.
+    /// [`StoreError::SessionNotFound`] for an unknown session. A `task_done`
+    /// that reaches no task of the run's plan is refused by `close_task`, one
+    /// variant per way it can miss, as is one that reaches its task and names a
+    /// command the plan did not — the only refusal a correctly numbered tick can
+    /// still meet. Either takes the whole checkpoint with it.
     pub fn save_checkpoint(
         &self,
         command: &CheckpointCommand,
@@ -332,7 +336,7 @@ impl Store {
             let task = command
                 .task_done
                 .as_ref()
-                .map(|done| close_task(tx, &run, done, &now))
+                .map(|done| close_task(tx, command.run_id, &run, done, &now))
                 .transpose()?;
 
             Ok(CheckpointResult {
@@ -890,8 +894,15 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
 /// `expected_output` is compared only to report the comparison, because the
 /// plan wrote that string before the work was done and refusing a tick over it
 /// would stop correct work.
+///
+/// Every refusal below comes before the `UPDATE`, and they come in this order:
+/// the run's binding, then what the slug resolves to, then the number, then the
+/// command. Cheapest and most fundamental first, so a caller whose run is
+/// unbound is told that rather than told its number is unknown — which would be
+/// true, and would send it to fix the wrong thing.
 fn close_task(
     tx: &Transaction<'_>,
+    run_id: RunId,
     run: &RunRow,
     done: &TaskDone,
     now: &str,
@@ -900,46 +911,52 @@ fn close_task(
         .spec
         .as_ref()
         .and_then(|spec| spec.change_id.as_deref())
-        .ok_or_else(|| {
-            StoreError::TaskNotPlaced(
-                "this run is bound to no change, so there is no plan to look a task number up in"
-                    .to_owned(),
-            )
-        })?;
+        .ok_or(StoreError::RunNotBoundToChange { run: run_id })?;
 
     let mut found = sdd::change_by_slug(tx, &run.workspace_id.to_string(), slug)?;
     if found.len() > 1 {
-        // The namespaces rather than the ids: the ids are UUIDs the caller has
-        // never seen, and the namespace is the one part of this a person can
-        // act on. Picking the first would file the evidence of finished work
-        // against a plan nobody did it for.
-        let namespaces: Vec<&str> = found
-            .iter()
-            .map(|(_, namespace)| namespace.as_deref().unwrap_or("(no namespace)"))
-            .collect();
-        return Err(StoreError::TaskNotPlaced(format!(
-            "the slug {slug:?} this run is bound to names an open change in each of {}; \
-             nothing can tell which of those plans the tick belongs to",
-            namespaces.join(", ")
-        )));
+        return Err(StoreError::ChangeSlugAmbiguous {
+            slug: slug.to_owned(),
+            namespaces: found
+                .into_iter()
+                // Named rather than left blank: a change filed under no
+                // namespace is one of the two the caller has to tell apart, and
+                // an empty entry in that list reads as a formatting fault.
+                .map(|(_, namespace)| namespace.unwrap_or_else(|| "(no namespace)".to_owned()))
+                .collect(),
+        });
     }
-    let (change_id, _) = found.pop().ok_or_else(|| {
-        StoreError::TaskNotPlaced(format!("no open change here is called {slug:?}"))
-    })?;
+    let (change_id, _) = found
+        .pop()
+        .ok_or_else(|| StoreError::ChangeSlugNotFound(slug.to_owned()))?;
 
-    let expected: String = tx
+    let planned: Option<(String, String)> = tx
         .query_row(
-            "SELECT expected_output FROM tasks WHERE change_id = ?1 AND number = ?2",
+            "SELECT verify_command, expected_output FROM tasks
+             WHERE change_id = ?1 AND number = ?2",
             rusqlite::params![&change_id, &done.number],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .optional()?
-        .ok_or_else(|| {
-            StoreError::TaskNotPlaced(format!(
-                "the plan of {slug:?} has no task numbered {}",
-                done.number
-            ))
-        })?;
+        .optional()?;
+    let Some((verify_command, expected)) = planned else {
+        return Err(StoreError::TaskNotFound {
+            slug: slug.to_owned(),
+            number: done.number.clone(),
+            open: sdd::open_task_numbers(tx, &change_id)?,
+        });
+    };
+
+    // Trimmed on both sides and then exact. This is the check that makes "run
+    // the command the plan stated" a rule rather than a suggestion, and a looser
+    // comparison would file the output of some neighbouring command as the proof
+    // this task was done. Whitespace around either is how the string was written
+    // and not part of what it says, which is the one difference worth forgiving.
+    if verify_command.trim() != done.verify_command.trim() {
+        return Err(StoreError::VerifyCommandMismatch {
+            number: done.number.clone(),
+            expected: verify_command,
+        });
+    }
 
     // Trimmed on the plan's side only. A plan states the line it expects to
     // see, and the whitespace around that line is how the plan was written

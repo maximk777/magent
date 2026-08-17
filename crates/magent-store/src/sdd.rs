@@ -697,6 +697,39 @@ impl Store {
     }
 }
 
+/// The numbers of the tasks of this change that are not finished with, sorted
+/// lexicographically by number.
+///
+/// `skipped` counts as closed alongside `done`: skipping is a decision somebody
+/// took, unlike a task still `pending` or `running`. One definition, because two
+/// refusals list this: archiving refuses while anything is open, and a tick
+/// naming a number no task has says what the open numbers are — and a caller
+/// reading "these are still open" from one and being refused by the other for a
+/// task it had been told was closed would have no way to tell which was lying.
+///
+/// The sort is on the text, not on the numbering: `tasks.number` is `TEXT`
+/// (`0009_tasks.sql`), so a plan of ten or more tasks lists `10, 11, 2`, and a
+/// dotted plan sorts `1.10` before `1.2`. Left as it is deliberately —
+/// `load_task_summaries` reads the plan back to the agent through the same
+/// `ORDER BY`, so a natural sort belongs in both at once or in neither. What the
+/// ordering does guarantee is stability: re-reading a refusal after closing one
+/// task lists the rest as it did before, rather than reshuffled.
+pub(crate) fn open_task_numbers(
+    tx: &Transaction<'_>,
+    change_id: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT number FROM tasks
+         WHERE change_id = ?1 AND status NOT IN ('done', 'skipped')
+         ORDER BY number",
+    )?;
+    let open = statement
+        .query_map([change_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(open)
+}
+
 /// Every open change of this workspace that answers to `slug`, as its id and
 /// the namespace it is filed under.
 ///
@@ -962,16 +995,7 @@ fn require_tasks_closed(
     change_id: &str,
     skip_specs: bool,
 ) -> Result<(), StoreError> {
-    // Ordered so that a caller re-reading the refusal after finishing one task
-    // sees the rest in the same order rather than a reshuffled list.
-    let mut statement = tx.prepare(
-        "SELECT number FROM tasks
-         WHERE change_id = ?1 AND status NOT IN ('done', 'skipped')
-         ORDER BY number",
-    )?;
-    let open = statement
-        .query_map([change_id], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let open = open_task_numbers(tx, change_id)?;
 
     if !open.is_empty() {
         return Err(StoreError::ChangeNotExecuted {
@@ -1762,8 +1786,9 @@ struct TaskSummaryRow {
     verify_command: String,
 }
 
-/// The change's tasks, in task-number order — the same ordering
-/// `require_tasks_closed` reads them in.
+/// The change's tasks, sorted lexicographically by number — the same `ORDER BY`
+/// `open_task_numbers` reads them in, and lexicographic there for the reason
+/// given there.
 fn load_task_summaries(
     tx: &Transaction<'_>,
     change_id: &str,
