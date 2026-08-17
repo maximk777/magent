@@ -46,19 +46,22 @@ impl Fixture {
         }
     }
 
-    /// A change with one task on it, for the tick a refusal is provoked from.
+    /// A change whose plan holds the given task numbers, for the ticks a refusal
+    /// is provoked from. The numbers are the caller's because what a tick misses
+    /// by is the point: a plan that has no task "1" refuses one differently from
+    /// a plan that has.
     ///
     /// Proposed with `skip_specs`, which is what lets a change be planned
     /// straight out of `drafting`: nothing here is about the requirements, only
     /// about what a refused tick does to the run's binding.
-    fn planned_change(&self, slug: &str) {
+    fn planned_change(&self, slug: &str, numbers: &[&str]) {
         let change = self
             .store
             .propose(
                 &ProposeCommand {
                     operation_id: OperationId::new(),
                     slug: slug.into(),
-                    title: "Add a retry budget".into(),
+                    title: format!("The change filed as {slug}"),
                     classification: Classification::Bounded,
                     why: "Retries currently have no ceiling and can loop forever.".into(),
                     what_changes: vec!["Add a configurable retry budget".into()],
@@ -76,17 +79,20 @@ impl Fixture {
                 &PlanCommand {
                     operation_id: OperationId::new(),
                     change,
-                    tasks: vec![TaskDraft {
-                        number: "1".into(),
-                        title: "Cap the retry loop".into(),
-                        body: None,
-                        files: vec!["crates/worker/src/retry.rs".into()],
-                        consumes: None,
-                        produces: None,
-                        verify_command: VERIFY.into(),
-                        expected_output: "test result: ok".into(),
-                        covers: vec![],
-                    }],
+                    tasks: numbers
+                        .iter()
+                        .map(|number| TaskDraft {
+                            number: (*number).to_owned(),
+                            title: format!("Cap the retry loop, step {number}"),
+                            body: None,
+                            files: vec!["crates/worker/src/retry.rs".into()],
+                            consumes: None,
+                            produces: None,
+                            verify_command: VERIFY.into(),
+                            expected_output: "test result: ok".into(),
+                            covers: vec![],
+                        })
+                        .collect(),
                 },
                 &self.context,
             )
@@ -116,23 +122,27 @@ impl Fixture {
         session_id: magent_core::SessionId,
         summary: &str,
     ) {
-        self.send(run_id, session_id, summary, None, None)
+        self.send(run_id, session_id, OperationId::new(), summary, None, None)
             .expect("checkpoint");
     }
 
     /// A checkpoint with whatever a caller wants to hang on it, and the refusal
     /// handed back rather than unwrapped: what a refused checkpoint leaves
     /// behind is the thing under test below.
+    ///
+    /// The `operation_id` is the caller's, because a replay is the same command
+    /// sent twice and a test has to be able to repeat one.
     fn send(
         &self,
         run_id: magent_core::RunId,
         session_id: magent_core::SessionId,
+        operation_id: OperationId,
         summary: &str,
         task_done: Option<TaskDone>,
         binding: Option<SpecBinding>,
     ) -> Result<magent_core::CheckpointResult, StoreError> {
         self.store.save_checkpoint(&CheckpointCommand {
-            operation_id: OperationId::new(),
+            operation_id,
             run_id,
             session_id,
             stage: WorkflowStage::Executing,
@@ -288,15 +298,19 @@ fn a_run_can_be_bound_after_it_has_already_started() {
 /// checkpoint the store refuses leaves the binding exactly where it was.
 ///
 /// Three refused messages: one carrying no binding, one whose binding would have
-/// moved the run to another task, and one whose binding would have moved it to
-/// another change. The last two are what tell "inside the operation" apart from
-/// "merely earlier in it" — a run left pointing somewhere by a message that was
-/// rejected would send the next session to the wrong task, with nothing recorded
-/// to explain why.
+/// moved the run to another task, and one whose binding would have rebound it to
+/// a second live change. The last two are what tell "inside the operation" apart
+/// from "merely earlier in it" — a run left pointing somewhere by a message that
+/// was rejected would send the next session to the wrong task, with nothing
+/// recorded to explain why.
 #[test]
 fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
     let fixture = Fixture::new();
-    fixture.planned_change("add-retry-budget");
+    fixture.planned_change("add-retry-budget", &["1"]);
+    // A real second change, whose plan has no task "1" — so a message that
+    // rebinds to it and ticks "1" is refused for the number rather than for the
+    // slug, which is what a run rebound to a live change actually meets.
+    fixture.planned_change("spend-the-budget", &["7", "8"]);
     let (run_id, session_id) = fixture.start("cap the retry loop");
     fixture
         .store
@@ -318,6 +332,7 @@ fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
         .send(
             run_id,
             session_id,
+            OperationId::new(),
             "capped the loop",
             Some(wrong_command()),
             None,
@@ -329,6 +344,7 @@ fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
         .send(
             run_id,
             session_id,
+            OperationId::new(),
             "capped the loop",
             Some(wrong_command()),
             Some(SpecBinding {
@@ -345,20 +361,33 @@ fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
          against the same plan"
     );
 
-    // The third names another change entirely, and meets a different refusal:
-    // the tick resolves against the binding this very message supplied, which is
-    // the ordering `one_message_binds_the_run_and_closes_its_first_task` is
-    // about — and the slug still has to go back with it.
+    // The third names the other change, and meets a different refusal: the tick
+    // resolves against the binding this very message supplied, which is the
+    // ordering `one_message_binds_the_run_and_closes_its_first_task` is about —
+    // and the slug still has to go back with it.
     let refused = fixture
         .send(
             run_id,
             session_id,
+            OperationId::new(),
             "capped the loop",
             Some(wrong_command()),
-            Some(binding("some-other-change", Some("4: something else"))),
+            Some(binding("spend-the-budget", Some("7: spend it"))),
         )
-        .expect_err("expected a tick against a change that does not exist to be refused");
-    assert_eq!(refused.code(), "change_slug_not_found");
+        .expect_err("expected a tick on a number the rebound plan has not to be refused");
+    let StoreError::TaskNotFound { slug, number, open } = &refused else {
+        panic!("expected the number to be reported as unknown, got {refused:?}");
+    };
+    assert_eq!(
+        (slug.as_str(), number.as_str()),
+        ("spend-the-budget", "1"),
+        "the tick was read against the plan this message bound the run to"
+    );
+    assert_eq!(
+        open,
+        &["7".to_owned(), "8".to_owned()],
+        "and the numbers it does have came back with the refusal"
+    );
 
     assert_eq!(
         fixture.store.checkpoint_count(run_id).expect("count"),
@@ -387,6 +416,81 @@ fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
         ["openspec/changes/add-retry-budget/tasks.md"],
         "and the path it added"
     );
+}
+
+/// A retry reaches the store as the same command under the same `operation_id`,
+/// and is answered from the recorded response rather than run again — the binding
+/// included, because it is now part of that operation rather than a write that
+/// followed it.
+///
+/// What it costs to get this wrong is not a duplicate row but a wrong one: the
+/// run has moved on since, so a binding re-applied on the replay would drag it
+/// back to the task the retried message named, and the session that resumes from
+/// it would pick up the task before the one in hand.
+#[test]
+fn a_replayed_checkpoint_does_not_re_apply_its_binding() {
+    let fixture = Fixture::new();
+    let (run_id, session_id) = fixture.start("add a retry budget");
+
+    let operation_id = OperationId::new();
+    let first = fixture
+        .send(
+            run_id,
+            session_id,
+            operation_id,
+            "started on the first task",
+            None,
+            Some(binding("add-retry-budget", Some("1: cap the loop"))),
+        )
+        .expect("checkpoint");
+
+    // Whatever happened in between: this agent finished the task and moved on,
+    // or another one did, while the first call's answer was still in flight.
+    fixture
+        .store
+        .bind_spec(
+            run_id,
+            &SpecBinding {
+                change_id: None,
+                paths: vec![],
+                current_task: Some("2: spend the budget".into()),
+            },
+        )
+        .expect("advance");
+
+    let replayed = fixture
+        .send(
+            run_id,
+            session_id,
+            operation_id,
+            "started on the first task",
+            None,
+            Some(binding("add-retry-budget", Some("1: cap the loop"))),
+        )
+        .expect("replay");
+
+    assert_eq!(
+        first, replayed,
+        "the replay answers what the first call did"
+    );
+    assert_eq!(
+        fixture.store.checkpoint_count(run_id).expect("count"),
+        1,
+        "and records nothing a second time"
+    );
+
+    let spec = fixture
+        .store
+        .snapshot(run_id)
+        .expect("snapshot")
+        .spec
+        .expect("binding");
+    assert_eq!(
+        spec.current_task.as_deref(),
+        Some("2: spend the budget"),
+        "the replay must not have put the run back on the task it named"
+    );
+    assert_eq!(spec.change_id.as_deref(), Some("add-retry-budget"));
 }
 
 /// Nothing here validates that the file exists. The spec lives in git and this
