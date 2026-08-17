@@ -5,6 +5,7 @@
 //! 100 ms budget. That is why this is a native binary with no async runtime
 //! rather than a script.
 
+pub mod changes;
 pub mod doctor;
 pub mod export;
 pub mod hook;

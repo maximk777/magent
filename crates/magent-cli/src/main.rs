@@ -162,6 +162,19 @@ enum Command {
         no_build: bool,
     },
 
+    /// Print the spec-driven changes in flight here.
+    ///
+    /// Read-only, and run by the spec-driven skills before the model starts
+    /// thinking, so what it prints is laid out to be read rather than parsed.
+    Changes {
+        /// A change to open, by slug or identifier. Omit to list what is open.
+        change: Option<String>,
+
+        /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
+        #[arg(long)]
+        state_dir: Option<std::path::PathBuf>,
+    },
+
     /// Report what is wrong, and what to do about it.
     Doctor {
         /// State directory. Defaults to `$MAGENT_STATE_DIR`, then `~/.magent`.
@@ -198,6 +211,7 @@ fn main() {
         } => run_import(memory_dir, codex_rollouts, state_dir),
         Command::Deps { action, state_dir } => run_deps(action, state_dir),
         Command::Update { from, no_build } => run_update(from, !no_build),
+        Command::Changes { change, state_dir } => run_changes(change.as_deref(), state_dir),
         Command::Doctor { state_dir } => run_doctor(state_dir),
         Command::Mcp { state_dir } => run_mcp(state_dir),
     }
@@ -761,6 +775,24 @@ fn run_update(from: Option<std::path::PathBuf>, build: bool) {
 
 /// Prints the diagnostic, exiting non-zero only when something is genuinely
 /// broken. A missing language server is a finding, not a failure.
+/// Prints what is in flight, and exits non-zero only when it could not answer.
+///
+/// An empty profile exits 0: the skills run this in a `!` line at the top of a
+/// turn, and a non-zero exit there reads as a broken install rather than as the
+/// ordinary state of a workspace with nothing proposed yet.
+fn run_changes(change: Option<&str>, state_dir: Option<std::path::PathBuf>) {
+    let state_dir = state_dir.unwrap_or_else(paths::state_dir);
+    let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    let mut out = String::new();
+    let answered = magent_cli::changes::report(&state_dir, &here, change, &mut out);
+    print!("{out}");
+
+    if !answered {
+        std::process::exit(1);
+    }
+}
+
 fn run_doctor(state_dir: Option<std::path::PathBuf>) {
     let state_dir = state_dir.unwrap_or_else(paths::state_dir);
     let here = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
