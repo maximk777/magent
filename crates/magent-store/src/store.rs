@@ -982,11 +982,20 @@ fn close_task(
         // The status `0009_tasks.sql` promises a change reaches when its tasks
         // are all done, and this is the only place that writes it.
         //
-        // No predicate on the change's own status: `change_by_slug` above
-        // resolved this id out of the live set, so an archived or abandoned
-        // change was already refused as a slug nothing answers to — the same
-        // refusal `require_archivable_change` words for the archive side — and a
-        // guard here could only ever be about a row that cannot arrive.
+        // No predicate on the change's own status. An archived or abandoned one
+        // cannot arrive: `change_by_slug` above resolved this id out of the live
+        // set, so it was already refused as a slug nothing answers to — the same
+        // refusal `require_archivable_change` words for the archive side.
+        //
+        // A `specified` one can, and does not get a guard. `specify` pulls a
+        // planned change back to `specified` without deleting its tasks, so
+        // ticking the rest of an old plan lands here on a change whose newest
+        // delta no task covers, and it reads `ready`. Guarding the row instead
+        // would leave `change_ready` — computed from the tasks, above — saying
+        // ready while the row says otherwise, and a caller told both has no way
+        // out. The disagreement worth fixing is upstream, between `specify`
+        // leaving a stale plan in place and archiving never checking that every
+        // delta is covered; both belong to a change of their own.
         tx.execute(
             "UPDATE sdd_changes SET status = ?1, updated_at = ?2 WHERE id = ?3",
             rusqlite::params![enum_to_sql(&ChangeStatus::Ready)?, now, &change_id],

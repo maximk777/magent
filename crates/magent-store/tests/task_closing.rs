@@ -749,11 +749,15 @@ fn closing_the_last_task_makes_the_change_ready() {
 }
 
 /// The end of the loop, from the tick that closes the last task to the deltas
-/// landing in the live base. Worth a test of its own because the two halves are
-/// checked against different columns — `change_ready` is worked out from
-/// `tasks.status`, and `require_tasks_closed` reads the same rows again — so a
-/// change reported ready that archiving still refuses is a state a caller has no
-/// way out of.
+/// landing in the live base.
+///
+/// It pins the requirement's scenario rather than this commit's write: both
+/// halves read `tasks.status`, so archiving became reachable with the tick
+/// itself and not with the `ready` status, and no mutation of the readiness
+/// write can fail this test. What it does hold is that `ready` is a status
+/// archiving accepts — a future `require_archivable_change` whitelisting only
+/// `planned` would leave a change reported ready that archiving refuses, which
+/// is a state a caller has no way out of.
 #[test]
 fn an_archive_after_the_last_tick_folds_the_deltas() {
     let fixture = Fixture::new();
