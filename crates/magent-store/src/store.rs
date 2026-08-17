@@ -9,7 +9,8 @@ use magent_core::{
     CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
     FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState, HarnessKind,
     OperationId, RepositoryId, RepositoryRole, RunId, RunSnapshot, RunStatus, SessionId,
-    SpecBinding, StartRunCommand, StartRunResult, Validate, WorkflowStage, WorkspaceId,
+    SpecBinding, StartRunCommand, StartRunResult, TaskClosed, TaskDone, Validate, WorkflowStage,
+    WorkspaceId,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Serialize, de::DeserializeOwned};
@@ -17,7 +18,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     error::StoreError,
     git::{self, RepositoryProbe},
-    migrations,
+    migrations, sdd,
 };
 
 /// How long a writer waits for a competing writer before giving up.
@@ -317,10 +318,28 @@ impl Store {
                 ),
             )?;
 
+            // In this transaction rather than in a call after it: a checkpoint
+            // recorded whose tick was lost is a plan that has the evidence of
+            // finished work and no sign the work finished.
+            //
+            // Anything this transaction learns to write to `runs` — the binding
+            // a checkpoint carries, above all — has to be written *before* this
+            // line. `close_task` finds the change through the `run` row loaded
+            // at the top of the closure, so a single message that binds the run
+            // and ticks its first task, which is exactly what a first
+            // checkpoint of a task looks like, would otherwise be refused for a
+            // binding this very call supplied.
+            let task = command
+                .task_done
+                .as_ref()
+                .map(|done| close_task(tx, &run, done, &now))
+                .transpose()?;
+
             Ok(CheckpointResult {
                 checkpoint_id,
                 run_id: command.run_id,
                 stage: command.stage,
+                task,
             })
         })
     }
@@ -853,6 +872,93 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
         status: enum_from_sql(&row.2)?,
         stage: enum_from_sql(&row.3)?,
         spec,
+    })
+}
+
+/// Closes the task a checkpoint ticks off, and says what the tick did.
+///
+/// The change is taken from the run's own binding rather than from the caller:
+/// `runs.spec_change_id` holds a slug (`0001_slice1.sql`), and a checkpoint late
+/// in a task carries the tick and nothing else, so a tick that had to restate
+/// its change would be one an agent could get wrong.
+///
+/// `evidence` and `verified_at` are written with the status, which is what
+/// `0009_tasks.sql` means by their landing together: a task recorded as done
+/// with no record of what proved it reads afterwards exactly like one that was
+/// checked. The output is stored as it came — trimming or summarising it would
+/// edit the one part of a tick a later reader can judge for themselves — and
+/// `expected_output` is compared only to report the comparison, because the
+/// plan wrote that string before the work was done and refusing a tick over it
+/// would stop correct work.
+fn close_task(
+    tx: &Transaction<'_>,
+    run: &RunRow,
+    done: &TaskDone,
+    now: &str,
+) -> Result<TaskClosed, StoreError> {
+    let slug = run
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.change_id.as_deref())
+        .ok_or_else(|| {
+            StoreError::TaskNotPlaced(
+                "this run is bound to no change, so there is no plan to look a task number up in"
+                    .to_owned(),
+            )
+        })?;
+
+    let mut found = sdd::change_by_slug(tx, &run.workspace_id.to_string(), slug)?;
+    if found.len() > 1 {
+        // The namespaces rather than the ids: the ids are UUIDs the caller has
+        // never seen, and the namespace is the one part of this a person can
+        // act on. Picking the first would file the evidence of finished work
+        // against a plan nobody did it for.
+        let namespaces: Vec<&str> = found
+            .iter()
+            .map(|(_, namespace)| namespace.as_deref().unwrap_or("(no namespace)"))
+            .collect();
+        return Err(StoreError::TaskNotPlaced(format!(
+            "the slug {slug:?} this run is bound to names an open change in each of {}; \
+             nothing can tell which of those plans the tick belongs to",
+            namespaces.join(", ")
+        )));
+    }
+    let (change_id, _) = found.pop().ok_or_else(|| {
+        StoreError::TaskNotPlaced(format!("no open change here is called {slug:?}"))
+    })?;
+
+    let expected: String = tx
+        .query_row(
+            "SELECT expected_output FROM tasks WHERE change_id = ?1 AND number = ?2",
+            rusqlite::params![&change_id, &done.number],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            StoreError::TaskNotPlaced(format!(
+                "the plan of {slug:?} has no task numbered {}",
+                done.number
+            ))
+        })?;
+
+    // Trimmed on the plan's side only. A plan states the line it expects to
+    // see, and the whitespace around that line is how the plan was written
+    // rather than part of what it claims; the output keeps every character of
+    // its own, being quoted evidence.
+    let expected_output_found = done.output.contains(expected.trim());
+
+    tx.execute(
+        "UPDATE tasks SET status = 'done', evidence = ?1, verified_at = ?2, updated_at = ?3
+         WHERE change_id = ?4 AND number = ?5",
+        rusqlite::params![&done.output, now, now, &change_id, &done.number],
+    )?;
+
+    Ok(TaskClosed {
+        number: done.number.clone(),
+        expected_output_found,
+        // Whether the plan is finished is a question about the change's other
+        // tasks, and nothing here reads them.
+        change_ready: false,
     })
 }
 

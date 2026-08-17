@@ -201,6 +201,16 @@ pub enum StoreError {
         "change {0} proposes no spec deltas and did not declare skip_specs; there is nothing to archive"
     )]
     NothingToArchive(ChangeId),
+
+    /// A checkpoint carried a tick that reaches no task row, and every way
+    /// that happens is a different thing for the caller to fix: a run bound to
+    /// no change, a slug that names none, a slug that names several, a number
+    /// belonging to no task of the plan. The situation travels in the message
+    /// because the caller cannot see any of it — least of all two changes
+    /// answering to one slug, where closing whichever sorted first would file
+    /// the evidence against the wrong plan.
+    #[error("this checkpoint's task_done reaches no task: {0}")]
+    TaskNotPlaced(String),
 }
 
 /// The tail of [`StoreError::ChangeNotExecuted`]'s message.
@@ -259,6 +269,7 @@ impl StoreError {
             Self::RequirementsUncovered(_) => "requirements_uncovered",
             Self::ChangeNotExecuted { .. } => "change_not_executed",
             Self::NothingToArchive(_) => "nothing_to_archive",
+            Self::TaskNotPlaced(_) => "task_not_placed",
         }
     }
 }

@@ -697,6 +697,49 @@ impl Store {
     }
 }
 
+/// Every open change of this workspace that answers to `slug`, as its id and
+/// the namespace it is filed under.
+///
+/// Mirrors `sdd_changes_live_slug` (`0007_sdd.sql`) — a slug is held only by a
+/// change that has not been archived or abandoned — with one difference: no
+/// namespace. `runs.spec_change_id` holds a slug and a run row names no
+/// namespace, so a tick resolved from the run's own binding has nothing to
+/// scope by. Resolution happens here rather than at the MCP edge, where
+/// caller-supplied addresses are turned into ids, for the same reason: this
+/// address comes out of the database, on a checkpoint that may carry only a
+/// task number.
+///
+/// Which means more than one row can come back, and that a caller must not
+/// resolve by taking the first: the namespace is what separates them, and it
+/// is the only part of the answer a person could act on. What to do about it is
+/// left to the caller rather than refused here, because the refusal has to
+/// speak in the vocabulary of whatever was being resolved.
+///
+/// [`Store::propose`] keeps its own namespace-scoped lookup: a slug live in
+/// another namespace does not stop a change being opened here, so that call has
+/// to walk past exactly the collision this one hands back.
+pub(crate) fn change_by_slug(
+    tx: &Transaction<'_>,
+    workspace_id: &str,
+    slug: &str,
+) -> Result<Vec<(String, Option<String>)>, StoreError> {
+    // Ordered by the index's own expression, so a caller listing two matches
+    // lists them the same way however often the refusal is re-read.
+    let mut statement = tx.prepare(
+        "SELECT id, namespace FROM sdd_changes
+         WHERE workspace_id = ?1 AND slug = ?2
+           AND status NOT IN ('archived', 'abandoned')
+         ORDER BY IFNULL(namespace, ''), id",
+    )?;
+    let found = statement
+        .query_map(rusqlite::params![workspace_id, slug], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(found)
+}
+
 /// Rewrites the proposal of the change the slug already names, and hands back
 /// its id so a rewrite is indistinguishable from the first call to the caller.
 ///

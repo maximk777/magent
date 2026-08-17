@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{DomainError, Validate},
-    sdd::TaskDone,
+    sdd::{TaskClosed, TaskDone},
 };
 
 /// Declares a UUID newtype that is a bare string on the wire.
@@ -311,6 +311,14 @@ pub struct CheckpointResult {
     pub checkpoint_id: CheckpointId,
     pub run_id: RunId,
     pub stage: WorkflowStage,
+    /// The task this checkpoint closed, when it carried a [`TaskDone`].
+    ///
+    /// Absent rather than null in the serialized report, and defaulted on the
+    /// way back in — the pair [`RunSnapshot::spec`] carries: most checkpoints
+    /// close no task, and a field of nulls reads as a broken reference rather
+    /// than as the absence of one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskClosed>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

@@ -498,6 +498,33 @@ impl Validate for TaskDone {
     }
 }
 
+/// What a tick did: the counterpart of [`TaskDone`], answered by the store.
+///
+/// A caller that has just closed a task cannot see the row it wrote, and the
+/// two things it wants to know next are not in its own request: whether the
+/// output it recorded looks like what the plan expected, and whether that was
+/// the last task standing between this change and its archive.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct TaskClosed {
+    /// The task that was closed, as the plan numbered it.
+    pub number: String,
+    /// Whether the plan's `expected_output` occurs in the output supplied.
+    ///
+    /// Reported and never enforced. `expected_output` is written while the
+    /// plan is being drafted, before anyone has run the command, so a tick
+    /// that does not match it is still the record of what happened — and
+    /// refusing it would leave the task open with the work already done.
+    pub expected_output_found: bool,
+    /// Whether this tick left the change with no open task.
+    ///
+    /// The store does not work this out yet and leaves it `false`, so a reader
+    /// cannot take it for an answer today. It is declared with the tick it
+    /// belongs to rather than bolted on beside it later, and it starts telling
+    /// the truth with the code that moves a finished change to `ready` —
+    /// `0009_tasks.sql` promises that status and nothing writes it.
+    pub change_ready: bool,
+}
+
 /// A request to close out a change once every task on it is done.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ArchiveCommand {
