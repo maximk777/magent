@@ -156,8 +156,13 @@ fn user_prompt_submit(
     let binding = store.bind_session(session, cwd, &prompt, HarnessKind::ClaudeCode)?;
 
     // The notice comes first: it is about how this session has been working,
-    // not about the subject it is working on.
+    // not about the subject it is working on. Separated by a blank line when
+    // both fire, because two markdown headings on consecutive lines read as
+    // one block with a stray title in it.
     let mut out = reasoning_notice(store, session, binding.run_id);
+    if !out.is_empty() {
+        out.push('\n');
+    }
     out.push_str(&memory_index(
         store,
         session,
