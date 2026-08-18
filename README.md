@@ -64,17 +64,26 @@ personal memory, and it is not the daemon this design deliberately does
 without: it opens the same file every hook opens, holds nothing, and can be
 closed at any moment.
 
-Spec-driven work: superpowers' process, OpenSpec's artifacts, Magent's thread.
+Spec-driven work: superpowers' process, OpenSpec's artifact model, Magent's
+thread.
 
 The three parts are deliberately borrowed rather than invented, because both
 sources encode practice that is expensive to rediscover.
 
-**OpenSpec owns the artifacts.** `openspec new change`, `openspec instructions`,
-`openspec validate`, `openspec archive` — the skills call the CLI rather than
-hand-rolling directories that then drift from what it expects. The archive step
-is the reason it is worth using at all: a completed change's ADDED, MODIFIED
-and REMOVED requirements merge into `openspec/specs/`, which becomes what is
-currently true for the next change.
+**OpenSpec's artifact model, as rows.** A change is a proposal, its requirement
+deltas and its plan: `magent_propose`, `magent_specify`, `magent_plan` write
+it, `magent_changes` and the read-only `magent changes` read it back, and a
+task closes only through `magent_checkpoint` carrying the command the plan
+named and what that command printed. `magent_archive` is the step the rest
+exists for — a completed change's added, modified and removed requirements fold
+into the live specification, which becomes what is currently true for the next
+change, and the change is kept with its reasoning intact.
+
+Rows rather than the CLI and its markdown, because markdown lets an invalid
+document be written and then needs a validator to notice: OpenSpec's runs to
+842 lines, and its own instructions admit that a scenario under the wrong
+heading "will fail silently". As rows that document is unrepresentable. Markdown
+stays an export.
 
 **superpowers owns the process.** The hard gate before any code. One question
 per message rather than a form. "Too simple to need a design" named as the

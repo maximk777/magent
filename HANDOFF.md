@@ -85,7 +85,7 @@ Everything lands in one SQLite file, `~/.magent/magent.db`. There is no daemon.
 
 ## Where things stand
 
-53 commits, 395 tests, schema version 9.
+76 commits, 427 tests, schema version 10.
 
 ```
 crates/magent-core      domain types, I/O free
@@ -109,18 +109,18 @@ The spec process is in the store: `magent_propose`, `magent_specify`,
 with a change addressable by its slug. Every write is one operation and either
 lands whole or not at all.
 
-**Not built, and the gap that matters most:** nothing closes a task. `plan`
-writes tasks as `pending`, no verb moves them, and `archive` refuses while any
-is open — so the loop reaches `planned` and stops. The decision was that
-`magent_checkpoint` ticks a task off with its evidence, and no task in the plan
-ever built it. Running the loop on itself is what found this; eight reviews did
-not, because each looked at its own piece and the hole was between them.
+The loop closes. `magent_checkpoint` ticks a task off with the command its
+plan named and what that command printed, the last tick moves the change to
+`ready`, and `archive` folds its deltas into the live specification —
+`magent_changes` reads that back, capability by capability. The hole was found
+by running the loop on itself, not by review: eight reviews looked at their own
+piece each, and the gap was between them.
 
-Also not built: the three SDD skills still call the `openspec` CLI and are
-wrong in two known places (`openspec status <id>` is `--change <id>`, and
-`openspec/project.md` is never created — project context lives in
-`config.yaml`). Distillation now runs, but has not been exercised at length.
-There is no `project.md` constitution.
+Not built: the console has no page for changes, so the specification is
+readable through the tools and not in a browser. There is no `task_reviews`
+table, so the two-stage review a plan goes through leaves no record
+(`0009_tasks.sql` says where it would go). Distillation now runs, but has not
+been exercised at length. There is no `project.md` constitution.
 
 ## Getting oriented fast
 
