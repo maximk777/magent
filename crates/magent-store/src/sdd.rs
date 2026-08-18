@@ -1662,25 +1662,10 @@ fn require_full_coverage(
         .flat_map(|task| task.covers.iter().map(String::as_str))
         .collect();
 
-    // Ordered so that a caller re-reading the refusal after a failed fix sees
-    // the same list in the same order rather than a reshuffled one.
-    let mut statement = tx.prepare(
-        "SELECT name FROM spec_deltas WHERE change_id = ?1
-         ORDER BY created_at, name",
-    )?;
-    let uncovered = statement
-        .query_map([change_id], |row| row.get::<_, String>(0))?
-        .filter(|name| match name {
-            Ok(name) => !covered.contains(name.as_str()),
-            Err(_) => true,
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if !uncovered.is_empty() {
-        return Err(StoreError::RequirementsUncovered(uncovered));
+    match uncovered_deltas(tx, change_id, &covered)? {
+        names if names.is_empty() => Ok(()),
+        names => Err(StoreError::RequirementsUncovered(names)),
     }
-
-    Ok(())
 }
 
 /// Refuses to archive a change carrying a requirement no finished task covers.
@@ -1707,11 +1692,46 @@ fn require_covered_by_done(tx: &Transaction<'_>, change_id: &str) -> Result<(), 
         .query_map([change_id], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<String>, _>>()?;
 
-    let mut covered: HashSet<String> = HashSet::new();
+    // Parsed into a Vec that outlives the set, so the set can borrow like the
+    // one built from `PlanCommand`: there, the names belong to the command and
+    // need no owner; here they have just been decoded and need one.
+    let mut names: Vec<String> = Vec::new();
     for json in &covers {
-        covered.extend(serde_json::from_str::<Vec<String>>(json)?);
+        names.extend(serde_json::from_str::<Vec<String>>(json)?);
     }
+    let covered: HashSet<&str> = names.iter().map(String::as_str).collect();
 
+    match uncovered_deltas(tx, change_id, &covered)? {
+        names if names.is_empty() => Ok(()),
+        names => Err(StoreError::RequirementsUnimplemented(names)),
+    }
+}
+
+/// The names of this change's deltas that `covered` does not hold.
+///
+/// The half the two gates above share. What differs between them is which
+/// tasks count as covering — the plan being written, or the tasks already
+/// finished — and that is the argument; everything from the query down was the
+/// same in both, including the reason for the ordering, which is why it now
+/// lives here once instead of in two comments that could drift apart.
+///
+/// Ordered so that a caller re-reading the refusal after a failed fix sees the
+/// same list in the same order rather than a reshuffled one.
+///
+/// Compared against `spec_deltas.name` rather than `requirements.name`: a
+/// task's `covers` holds the name the requirement was proposed under in *this*
+/// change, fixed at the moment of planning (`0009_tasks.sql`). A `renamed`
+/// delta moves the live name in `requirements` without touching the plan, so
+/// matching there would report a perfectly covered requirement as uncovered
+/// the first time one is renamed.
+///
+/// A change proposed with `skip_specs` has no deltas, so this returns nothing
+/// and both callers pass without needing a branch of their own.
+fn uncovered_deltas(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    covered: &HashSet<&str>,
+) -> Result<Vec<String>, StoreError> {
     let mut statement = tx.prepare(
         "SELECT name FROM spec_deltas WHERE change_id = ?1
          ORDER BY created_at, name",
@@ -1719,16 +1739,12 @@ fn require_covered_by_done(tx: &Transaction<'_>, change_id: &str) -> Result<(), 
     let uncovered = statement
         .query_map([change_id], |row| row.get::<_, String>(0))?
         .filter(|name| match name {
-            Ok(name) => !covered.contains(name),
+            Ok(name) => !covered.contains(name.as_str()),
             Err(_) => true,
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    if !uncovered.is_empty() {
-        return Err(StoreError::RequirementsUncovered(uncovered));
-    }
-
-    Ok(())
+    Ok(uncovered)
 }
 
 /// Reads the change these deltas are for, refusing one that cannot take them,

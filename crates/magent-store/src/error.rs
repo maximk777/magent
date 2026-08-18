@@ -171,8 +171,25 @@ pub enum StoreError {
     /// from the command it just sent. Listed rather than counted: "coverage is
     /// incomplete" makes the caller re-derive the query against a plan it has
     /// only been told is wrong.
-    #[error("no task covers these requirements: {}", .0.join(", "))]
+    #[error(
+        "no task covers these requirements: {}; add a task for each before planning",
+        .0.join(", ")
+    )]
     RequirementsUncovered(Vec<String>),
+
+    /// The same question asked at the other end of the process, and a separate
+    /// variant because the answer means something different. `RequirementsUncovered`
+    /// says the plan in hand is incomplete; this says the plan is fine and the
+    /// work is not — every task exists, and the one covering this requirement
+    /// was never finished. Sharing one code would leave the caller unable to
+    /// tell "write another task" from "close the one you have", and the older
+    /// message would be false outright for a task that was skipped, where a
+    /// covering task demonstrably exists.
+    #[error(
+        "no finished task covers these requirements: {}; close the task covering each, or plan one, before archiving",
+        .0.join(", ")
+    )]
+    RequirementsUnimplemented(Vec<String>),
 
     /// Archiving files a change's deltas as what is now true of the product,
     /// so work still open would put an unbuilt behaviour into the live base
@@ -362,6 +379,7 @@ impl StoreError {
             Self::DeltaAlreadyProposed { .. } => "delta_already_proposed",
             Self::ChangeNotSpecified { .. } => "change_not_specified",
             Self::RequirementsUncovered(_) => "requirements_uncovered",
+            Self::RequirementsUnimplemented(_) => "requirements_unimplemented",
             Self::ChangeNotExecuted { .. } => "change_not_executed",
             Self::NothingToArchive(_) => "nothing_to_archive",
             Self::RunNotBoundToChange { .. } => "run_not_bound",

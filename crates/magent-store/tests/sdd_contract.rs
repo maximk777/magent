@@ -2244,9 +2244,9 @@ fn archiving_refuses_a_requirement_no_finished_task_covers() {
         .expect_err("expected a refusal");
 
     assert!(
-        matches!(&error, StoreError::RequirementsUncovered(names)
+        matches!(&error, StoreError::RequirementsUnimplemented(names)
             if names == &[late.to_string()]),
-        "expected the requirement no task covers to be named, got {error:?}"
+        "expected the requirement no finished task covers to be named, got {error:?}"
     );
 
     let raw = Connection::open(&path).expect("raw connection");
@@ -2282,7 +2282,7 @@ fn a_skipped_task_covers_nothing() {
         .expect_err("expected a refusal");
 
     assert!(
-        matches!(&error, StoreError::RequirementsUncovered(names)
+        matches!(&error, StoreError::RequirementsUnimplemented(names)
             if names == &[REQUIREMENT.to_string()]),
         "expected the skipped task's requirement to be named, got {error:?}"
     );
@@ -2707,5 +2707,52 @@ fn a_change_from_another_workspace_is_invisible_to_open_changes_and_change_detai
     assert!(
         detail.is_none(),
         "a change from another workspace must not be readable through this one"
+    );
+}
+
+/// The two coverage gates ask different questions and a caller has to be able
+/// to tell which one refused it. `magent_plan` says the plan in hand is
+/// incomplete — write another task. `magent_archive` says the work is not
+/// finished — close one. Under a single code the caller cannot tell the two
+/// apart, and the archive-side message reads falsely for the skipped case,
+/// where a task covering the requirement demonstrably exists.
+#[test]
+fn the_two_coverage_refusals_do_not_share_a_code() {
+    let (dir, _path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    // Planning with a task that covers nothing: the plan itself is incomplete.
+    let at_plan = store
+        .plan(&plan_command(change, vec![task("1", &[])]), &ctx)
+        .expect_err("expected a refusal");
+    assert_eq!(at_plan.code(), "requirements_uncovered", "{at_plan:?}");
+
+    // Now a complete plan, left unexecuted: the plan is fine, the work is not.
+    store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("plan");
+    let raw = Connection::open(dir.path().join("magent.db")).expect("raw connection");
+    raw.execute(
+        "UPDATE tasks SET status = 'skipped' WHERE change_id = ?1",
+        [change.to_string()],
+    )
+    .expect("skip the only task");
+
+    let at_archive = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+    assert_eq!(
+        at_archive.code(),
+        "requirements_unimplemented",
+        "{at_archive:?}"
+    );
+    assert!(
+        at_archive.to_string().contains(REQUIREMENT),
+        "the refusal names what is unimplemented: {at_archive}"
+    );
+    assert!(
+        at_archive.to_string().contains("close"),
+        "a refusal says what to do instead: {at_archive}"
     );
 }
