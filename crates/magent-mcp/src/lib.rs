@@ -15,8 +15,8 @@ use magent_core::{
     StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
 };
 use magent_store::{
-    ChangeDetail, ChangeSummary, Dependency, FactContext, FactQuery, GroupingCommand,
-    GroupingProposal, Store, StoreError, dependency_checkout,
+    CapabilityDetail, CapabilitySummary, ChangeDetail, ChangeSummary, Dependency, FactContext,
+    FactQuery, GroupingCommand, GroupingProposal, Store, StoreError, dependency_checkout,
 };
 use rmcp::{
     ServerHandler,
@@ -346,19 +346,33 @@ pub struct ChangesToolInput {
     /// that change's proposal, deltas and tasks to the answer.
     #[serde(default)]
     pub change: Option<String>,
+    /// A capability of the live specification, by its path — adds what the
+    /// specification currently says under that path: every live requirement
+    /// with its text and its scenarios. Independent of `change`: one asks
+    /// what is being changed, the other what is already true.
+    #[serde(default)]
+    pub capability: Option<String>,
 }
 
-/// What is open here, and — when one was asked about — the whole of it.
+/// What is open here, what the specification already covers, and — when one
+/// was asked about — the whole of either.
 ///
-/// Both fields on every answer rather than one shape per call: a caller that
-/// named a change it can no longer find still gets the list that tells it what
-/// it should have named.
+/// The two indexes on every answer rather than one shape per call: a caller
+/// that named a change or a capability it can no longer find still gets the
+/// lists that tell it what it should have named.
 #[derive(Debug, Serialize)]
 struct ChangesReport {
     open: Vec<ChangeSummary>,
+    /// Every capability of the live specification, unasked. What a change
+    /// proposes only means anything against what is already true, and a caller
+    /// that had to ask for this separately would propose without it.
+    capabilities: Vec<CapabilitySummary>,
     /// Null unless a change was named, and null too when the identifier given
     /// belongs to no change of this workspace — `open` is then the answer.
     change: Option<ChangeDetail>,
+    /// Null unless a capability was named, and null too when nothing stands
+    /// under that path — `capabilities` is then the answer.
+    capability: Option<CapabilityDetail>,
 }
 
 #[derive(Debug, Serialize)]
@@ -926,7 +940,7 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Open a spec-driven change: a proposal plus its process metadata. Call before writing any code, and call again with the same slug to rewrite a proposal that has not been archived — that is how a change widens its scope, and the only way to declare a capability the first call missed. Requires slug, title, classification and why; capabilities may be left empty only when skip_specs is true, in which case the change writes no deltas."
+        description = "Open a spec-driven change: a proposal plus its process metadata. Call before writing any code, and call again with the same slug to rewrite a proposal that has not been planned yet — that is how a change widens its scope, and the only way to declare a capability the first call missed. Requires slug, title, classification and why; capabilities may be left empty only when skip_specs is true, in which case the change writes no deltas."
     )]
     async fn magent_propose(
         &self,
@@ -1021,7 +1035,7 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Show the spec-driven changes open in this workspace, or the whole of one — its proposal, its deltas and its tasks. Call when resuming work, or whenever the change being worked on is no longer in context: this is how to find a change again after a compaction, and what to read before proposing something that may already be open. Read-only."
+        description = "Show the spec-driven changes open in this workspace, or the whole of one — its proposal, its deltas and its tasks. Call when resuming work, or whenever the change being worked on is no longer in context: this is how to find a change again after a compaction, and what to read before proposing something that may already be open. Every answer also indexes the live specification, and naming a capability reads it back in full — what is already true, against which a proposal is written. Read-only."
     )]
     async fn magent_changes(
         &self,
@@ -1039,12 +1053,25 @@ impl MagentMcp {
             None => None,
         };
 
+        let capability = match input.capability {
+            Some(path) => self
+                .store
+                .capability_detail(&path, &context)
+                .map_err(|error| render_error(&error))?,
+            None => None,
+        };
+
         render(&ChangesReport {
             open: self
                 .store
                 .open_changes(&context)
                 .map_err(|error| render_error(&error))?,
+            capabilities: self
+                .store
+                .live_capabilities(&context)
+                .map_err(|error| render_error(&error))?,
             change,
+            capability,
         })
     }
 }

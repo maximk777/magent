@@ -1966,6 +1966,126 @@ async fn changes_lists_what_is_open_and_opens_one_by_slug() {
     client.cancel().await.expect("shutdown");
 }
 
+/// Carries one change all the way to `archived`, which is the only thing that
+/// puts a capability into the live specification: until a change is folded in,
+/// its requirements are deltas of a proposal and nothing reads them back as
+/// what is currently true.
+async fn archive_one_capability(client: &Client, fixture: &Fixture) {
+    call(client, "magent_propose", proposal("add-retry-budget")).await;
+    call(client, "magent_specify", deltas("add-retry-budget")).await;
+    call(client, "magent_plan", tasks("add-retry-budget")).await;
+    finish_tasks(fixture);
+    call(
+        client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "add-retry-budget" }),
+    )
+    .await;
+}
+
+/// The index comes on every answer, unasked. A model that has just been handed
+/// what is open still has to know what the specification already covers before
+/// it proposes anything, and a second call to find that out is a call it will
+/// not make.
+#[tokio::test]
+async fn changes_carries_the_capability_index() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    archive_one_capability(&client, &fixture).await;
+
+    let listed = call(&client, "magent_changes", json!({})).await;
+    let capabilities = listed["capabilities"].as_array().expect("capabilities");
+
+    assert_eq!(capabilities.len(), 1, "{listed}");
+    assert_eq!(capabilities[0]["path"].as_str(), Some("worker/retry"));
+    assert_eq!(
+        capabilities[0]["requirement_count"].as_u64(),
+        Some(1),
+        "the archived delta is one live requirement: {listed}"
+    );
+    assert_eq!(
+        listed["capability"],
+        Value::Null,
+        "nothing was asked about in particular: {listed}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Naming a capability reads the live specification back — the text of each
+/// requirement and the scenarios that make it checkable, not the names alone.
+/// This is what `archive` exists to produce, and until now nothing consumed it.
+#[tokio::test]
+async fn changes_reads_one_capability_in_full() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    archive_one_capability(&client, &fixture).await;
+
+    let read = call(
+        &client,
+        "magent_changes",
+        json!({ "capability": "worker/retry" }),
+    )
+    .await;
+    let capability = &read["capability"];
+
+    assert_eq!(capability["path"].as_str(), Some("worker/retry"), "{read}");
+    let requirement = &capability["requirements"][0];
+    assert_eq!(
+        requirement["name"].as_str(),
+        Some("budget-caps-retries"),
+        "{read}"
+    );
+    assert_eq!(
+        requirement["text"].as_str(),
+        Some("A retry budget caps the number of attempts a worker makes before giving up."),
+        "the name without the text is not the specification: {read}"
+    );
+    let scenario = &requirement["scenarios"][0];
+    assert_eq!(
+        scenario["when"].as_str(),
+        Some("a job has already failed budget times"),
+        "{read}"
+    );
+    assert_eq!(
+        scenario["then"].as_str(),
+        Some("the worker does not retry it again"),
+        "{read}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// A path nobody has is a mistake the caller can fix, and the index is what
+/// tells it which path it meant — the same courtesy an unknown slug gets. An
+/// error here would be a refusal to answer a legitimate question.
+#[tokio::test]
+async fn an_unknown_capability_still_gets_the_index() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    archive_one_capability(&client, &fixture).await;
+
+    let read = call(
+        &client,
+        "magent_changes",
+        json!({ "capability": "worker/retyr" }),
+    )
+    .await;
+
+    assert_eq!(
+        read["capability"],
+        Value::Null,
+        "there is nothing under that path: {read}"
+    );
+    assert_eq!(
+        read["capabilities"][0]["path"].as_str(),
+        Some("worker/retry"),
+        "the index has to name what the caller should have asked for: {read}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
 /// A slug nobody has is a mistake the caller can fix, but only if it is told
 /// what does exist. Sending it away to look for itself is what made the
 /// identifier-only addressing painful in the first place.
