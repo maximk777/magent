@@ -66,6 +66,8 @@ These are plan failures. Never write them:
 - "Similar to Task N" — repeat it; tasks get read out of order
 - A step that says what to do without showing how
 - A reference to a type or function no task defines
+- An `expected_output` written as a sentence about the output rather than a
+  fragment of it
 
 ## The call
 
@@ -86,7 +88,8 @@ magent_plan { change: "add-retry-budget",
                   files: ["tests/budget.rs"],
                   produces: "the test budget::caps_attempts, failing",
                   verify_command: "cargo test budget::caps_attempts",
-                  expected_output: "no function or associated item named `new` found for struct `RetryBudget`",
+                  expected_output: ["no function or associated item named `new`",
+                                    "RetryBudget"],
                   covers: ["A retry budget caps attempts"] },
                 { number: "1.2",
                   title: "Implement RetryBudget in src/budget.rs",
@@ -97,7 +100,7 @@ magent_plan { change: "add-retry-budget",
                   consumes: "the test budget::caps_attempts from 1.1",
                   produces: "RetryBudget::new(u32), RetryBudget::take(&mut self) -> bool",
                   verify_command: "cargo test budget",
-                  expected_output: "test result: ok. 1 passed; 0 failed",
+                  expected_output: ["test result: ok", "1 passed"],
                   covers: ["A retry budget caps attempts"] } ] }
 ```
 
@@ -106,6 +109,15 @@ task; `body`, `files`, `consumes`, `produces` and `covers` are what make it
 executable by someone who cannot see the rest of the plan. `consumes` and
 `produces` repeat the exact names and signatures across the seam, because the
 agent doing 1.2 never sees 1.1.
+
+`expected_output` is one or more markers, and a marker is a string the command
+will print verbatim — the invariant fragments of a line rather than the line
+itself. Counts that shift between runs, and prose the plan invented, belong in
+the task's `body`: every marker has to turn up in the output before the tick
+reports the check as met, so a marker nobody could find makes that report
+useless. Sixteen tasks running closed in exactly that state while this process
+was being built, their expected output reported missing every time — including
+the tasks whose command had printed precisely what was expected.
 
 The numbering matters beyond tidiness: a run binds to its task by that number,
 and the checkpoint that closes the task names it. Numbers are addresses, not
