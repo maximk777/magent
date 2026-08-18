@@ -10,7 +10,7 @@
 use magent_core::{
     ArchiveCommand, ChangeId, CheckpointCommand, CheckpointOrigin, Classification, DeltaOp,
     HarnessKind, OperationId, PlanCommand, ProposeCommand, RequirementDraft, ScenarioDraft,
-    SpecBinding, SpecifyCommand, StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
+    SpecBinding, SpecifyCommand, StartRunCommand, TaskClosed, TaskDone, TaskDraft, WorkflowStage,
 };
 use magent_store::{FactContext, Store};
 use rusqlite::Connection;
@@ -200,9 +200,23 @@ impl Fixture {
         change
     }
 
-    /// The plan's one task, closed by a checkpoint of a run bound to the
-    /// change by its slug — which is what `runs.spec_change_id` holds.
+    /// The plan's one task, closed and leaving the change ready to archive.
     fn close_the_task(&self, slug: &str) {
+        let closed = self.tick(slug, "1");
+
+        assert!(
+            closed.change_ready,
+            "the plan's only task is closed, so the change is ready to archive"
+        );
+    }
+
+    /// Task `number` of the plan, closed by a checkpoint of a run bound to the
+    /// change by its slug — which is what `runs.spec_change_id` holds.
+    ///
+    /// Hands the result back rather than asserting on it, because a plan with a
+    /// task still open closes one without becoming ready, and that is a state a
+    /// test needs: a `ready` change refuses a replan.
+    fn tick(&self, slug: &str, number: &str) -> TaskClosed {
         let started = self
             .store
             .start_run(
@@ -222,20 +236,19 @@ impl Fixture {
                 started.run_id,
                 &SpecBinding {
                     change_id: Some(slug.into()),
-                    current_task: Some("1: the change's only task".into()),
+                    current_task: Some(format!("{number}: the task in hand")),
                 },
             )
             .expect("bind");
 
-        let closed = self
-            .store
+        self.store
             .save_checkpoint(&CheckpointCommand {
                 operation_id: OperationId::new(),
                 run_id: started.run_id,
                 session_id: started.session_id,
                 stage: WorkflowStage::Executing,
                 origin: CheckpointOrigin::Enriched,
-                completed_steps: vec!["did the change's one task".into()],
+                completed_steps: vec!["did the task in hand".into()],
                 next_steps: vec![],
                 decisions: vec![],
                 rejected: vec![],
@@ -244,7 +257,7 @@ impl Fixture {
                 risks: vec![],
                 handoff_summary: "The verification ran and printed what the plan expected.".into(),
                 task_done: Some(TaskDone {
-                    number: "1".into(),
+                    number: number.into(),
                     verify_command: VERIFY.into(),
                     output: format!("running 3 tests\n...\n{EXPECTED}; finished in 0.42s\n"),
                 }),
@@ -252,12 +265,7 @@ impl Fixture {
             })
             .expect("checkpoint")
             .task
-            .expect("the checkpoint closed a task");
-
-        assert!(
-            closed.change_ready,
-            "the plan's only task is closed, so the change is ready to archive"
-        );
+            .expect("the checkpoint closed a task")
     }
 
     /// A second change, taken the same way to `archived`, that retires one
@@ -729,5 +737,142 @@ fn a_closed_task_carries_its_evidence() {
     assert!(
         task.verified_at.is_some(),
         "evidence and the moment it was taken land together"
+    );
+}
+
+/// Every close of a task appends a row to `task_ticks`, and until this read them
+/// back nothing did: a journal nobody can read is a checked box with extra
+/// steps. What it answers that `TaskSummary.evidence` cannot is what was run
+/// against which plan — evidence sits on the task row and the next close
+/// overwrites it, while a tick is one run and stays one run.
+#[test]
+fn a_change_reads_back_its_ticks() {
+    let fixture = Fixture::new();
+    let change = fixture.archived_change();
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    assert_eq!(detail.ticks.len(), 1, "{:?}", detail.ticks);
+    let tick = &detail.ticks[0];
+
+    assert_eq!(tick.number, "1");
+    assert_eq!(tick.verify_command, VERIFY);
+    assert!(
+        tick.output.contains(EXPECTED),
+        "the output is kept as it came, not summarised: {}",
+        tick.output
+    );
+    assert!(
+        tick.expected_output_missing.is_empty(),
+        "the command printed every marker the plan named: {:?}",
+        tick.expected_output_missing
+    );
+    assert!(
+        tick.in_current_plan,
+        "task 1 is still the task the plan holds"
+    );
+}
+
+/// Why the journal is keyed to the change and not to the task row: `Store::plan`
+/// deletes a change's tasks wholesale — that is what replanning means — and
+/// nothing that happened stops having happened because the plan changed.
+///
+/// `in_current_plan` is what tells this case apart from the one above. Without
+/// it a tick against a number no task holds reads exactly like a tick against a
+/// task the plan still has.
+///
+/// The plan is written with a second task and the change is left short of
+/// `archived`, because a replan has to be legal for there to be anything to
+/// prove: `mark_change_ready` moves a change with nothing open to `ready`, and
+/// `require_plannable_change` refuses `ready` and `archived` alike. The same
+/// shape the sibling test in `task_closing.rs` uses, for the same reason.
+#[test]
+fn a_tick_survives_the_plan_it_was_made_against() {
+    let fixture = Fixture::new();
+    let change = fixture.specified_change();
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks: vec![
+                    task("Cap the retry loop", &[BUDGET, ATTEMPT]),
+                    TaskDraft {
+                        number: "2".into(),
+                        ..task("Wire the budget into the config", &[])
+                    },
+                ],
+            },
+            &fixture.context,
+        )
+        .expect("plan");
+
+    fixture.tick(SLUG, "1");
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks: vec![TaskDraft {
+                    number: "9".into(),
+                    ..task("Cap the retry loop", &[BUDGET, ATTEMPT])
+                }],
+            },
+            &fixture.context,
+        )
+        .expect("replan");
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    assert_eq!(
+        detail
+            .tasks
+            .iter()
+            .map(|task| task.number.as_str())
+            .collect::<Vec<_>>(),
+        vec!["9"],
+        "the replan replaced the plan, the row task 1 was closed on included"
+    );
+
+    assert_eq!(detail.ticks.len(), 1, "{:?}", detail.ticks);
+    let tick = &detail.ticks[0];
+
+    assert_eq!(tick.number, "1");
+    assert!(
+        !tick.in_current_plan,
+        "no task numbered 1 is left, so the tick records a plan this change no longer has"
+    );
+}
+
+/// A change nothing has been run against reads back with an empty journal rather
+/// than with the field absent: a caller that had to tell "no ticks" apart from
+/// "ticks not loaded" would be guessing at the difference.
+#[test]
+fn a_change_with_no_ticks_reads_an_empty_journal() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    assert!(
+        detail.ticks.is_empty(),
+        "nothing has closed a task of this change: {:?}",
+        detail.ticks
     );
 }

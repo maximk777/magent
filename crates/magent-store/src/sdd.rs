@@ -239,6 +239,41 @@ pub struct TaskSummary {
     pub verified_at: Option<DateTime<Utc>>,
 }
 
+/// One closing of a task, as [`Store::change_detail`] shows it: the command
+/// that was run, what it printed, and what the plan expected to see in that
+/// output and did not.
+///
+/// It answers what [`TaskSummary`]'s `evidence` and `verified_at` cannot. Those
+/// live on the task row, so the next close overwrites them and `Store::plan`
+/// deletes them outright — a replan is legal mid-execution, and the one thing
+/// the design exists to make unforgeable sat in the most deletable place
+/// (`0012_task_ticks.sql`). A tick is a record of something that happened, and
+/// it stays one run rather than becoming the latest one.
+///
+/// `in_current_plan` is answered here rather than left to the caller because
+/// the caller would have to re-derive it by scanning [`ChangeDetail::tasks`] for
+/// a matching number — and a reader that skipped that step would silently read
+/// an orphan tick, taken against a plan this change no longer has, as a tick
+/// against the plan in front of it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskTick {
+    /// The task number as the tick was written with, which is `tasks.number`'s
+    /// own text — so a reader can line a tick up against the plan it was taken
+    /// under, whether or not that plan is still the current one.
+    pub number: String,
+    pub verify_command: String,
+    /// What that command printed, kept as it came.
+    pub output: String,
+    /// The markers of the task's `expected_output` that this output did not
+    /// contain. Empty where the command printed everything the plan named.
+    pub expected_output_missing: Vec<String>,
+    pub recorded_at: DateTime<Utc>,
+    /// Whether the change's plan still holds a task with this number. False for
+    /// a tick a later `plan` orphaned, which is exactly the case this table
+    /// exists to survive.
+    pub in_current_plan: bool,
+}
+
 /// The full content of one change: [`ChangeSummary`]'s fields, the proposal's
 /// own words, and the deltas and tasks filed under it.
 ///
@@ -269,6 +304,9 @@ pub struct ChangeDetail {
     pub deltas: Vec<DeltaSummary>,
     /// Every task of its current plan, in task-number order.
     pub tasks: Vec<TaskSummary>,
+    /// Every tick this change has ever recorded, oldest first — including ones
+    /// taken against tasks a later plan replaced.
+    pub ticks: Vec<TaskTick>,
 }
 
 /// One capability of the live specification, as [`Store::live_capabilities`]
@@ -807,6 +845,7 @@ impl Store {
         let proposal = load_proposal_document(&tx, &change_id)?;
         let deltas = load_delta_summaries(&tx, &change_id)?;
         let tasks = load_task_summaries(&tx, &change_id)?;
+        let ticks = load_task_ticks(&tx, &change_id)?;
         drop(tx);
 
         Ok(Some(ChangeDetail {
@@ -825,6 +864,7 @@ impl Store {
             impact: proposal.impact,
             deltas,
             tasks,
+            ticks,
         }))
     }
 
@@ -2213,6 +2253,72 @@ fn load_task_summaries(
                     .as_deref()
                     .map(parse_timestamp)
                     .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// One row of `task_ticks`, as [`Store::change_detail`] shows it.
+///
+/// Named fields rather than a positional tuple, for the reason
+/// [`LiveRequirementRow`] gives: six columns, four of them adjacent `TEXT`, so a
+/// `SELECT` reordered by a later hand would hand a reader the command where the
+/// output belongs without anything failing to compile.
+struct TaskTickRow {
+    number: String,
+    verify_command: String,
+    output: String,
+    missing_json: String,
+    created_at: String,
+    in_current_plan: bool,
+}
+
+/// The change's ticks, oldest first.
+///
+/// `in_current_plan` is answered by the `EXISTS` rather than by the caller
+/// matching numbers against [`load_task_summaries`]'s result, for the reason
+/// [`TaskTick`] gives: a reader that skipped that step would read an orphan tick
+/// as a tick against the plan in front of it. There is no join to `tasks` and
+/// there deliberately is no foreign key either (`0012_task_ticks.sql`) — a tick
+/// whose task row is gone is precisely what this table exists to keep.
+fn load_task_ticks(tx: &Transaction<'_>, change_id: &str) -> Result<Vec<TaskTick>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT task_ticks.number, task_ticks.verify_command, task_ticks.output,
+                task_ticks.missing_json, task_ticks.created_at,
+                EXISTS(SELECT 1 FROM tasks
+                       WHERE tasks.change_id = task_ticks.change_id
+                         AND tasks.number = task_ticks.number)
+         FROM task_ticks
+         WHERE task_ticks.change_id = ?1 ORDER BY task_ticks.created_at",
+    )?;
+    let rows = statement
+        .query_map([change_id], |row| {
+            Ok(TaskTickRow {
+                number: row.get(0)?,
+                verify_command: row.get(1)?,
+                output: row.get(2)?,
+                missing_json: row.get(3)?,
+                created_at: row.get(4)?,
+                in_current_plan: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(TaskTick {
+                number: row.number,
+                verify_command: row.verify_command,
+                output: row.output,
+                // Parsed rather than defaulted on a failure, for the reason
+                // `load_task_summaries` gives beside its own parse: the column
+                // is written by `serde_json`, so anything unparseable is a row
+                // this crate did not write, and reporting a tick that missed
+                // nothing would hide that from the one caller who could act
+                // on it. The timestamp below is read the same way.
+                expected_output_missing: serde_json::from_str(&row.missing_json)?,
+                recorded_at: parse_timestamp(&row.created_at)?,
+                in_current_plan: row.in_current_plan,
             })
         })
         .collect()
