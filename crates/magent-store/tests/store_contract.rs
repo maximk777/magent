@@ -518,3 +518,46 @@ fn the_run_table_has_no_spec_paths() {
         "the column names files that are not written any more: {columns:?}"
     );
 }
+
+/// A notice the prompt hook prints has to reach a session once. Printed on every
+/// turn it would become scenery, which is how the self-assessed instruction it
+/// compensates for stopped being read in the first place.
+#[test]
+fn a_notice_is_delivered_to_a_session_once() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+
+    assert!(
+        store
+            .claim_notice("s1", "unrecorded_reasoning")
+            .expect("first claim"),
+        "a session that has not been told is told"
+    );
+    assert!(
+        !store
+            .claim_notice("s1", "unrecorded_reasoning")
+            .expect("second claim"),
+        "the same session is not told twice"
+    );
+}
+
+/// The claim is per session, not per notice: a second session has heard nothing
+/// merely because the first one has.
+#[test]
+fn two_sessions_are_each_told_once() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+
+    assert!(
+        store
+            .claim_notice("s1", "unrecorded_reasoning")
+            .expect("s1 claim"),
+        "the first session is told"
+    );
+    assert!(
+        store
+            .claim_notice("s2", "unrecorded_reasoning")
+            .expect("s2 claim"),
+        "a session that has not been told has not been told"
+    );
+}

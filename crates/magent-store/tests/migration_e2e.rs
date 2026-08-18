@@ -46,6 +46,7 @@ fn migration(version: i64) -> String {
         10 => "0010_drop_spec_paths.sql",
         11 => "0011_expected_output_is_a_list.sql",
         12 => "0012_task_ticks.sql",
+        13 => "0013_session_notices.sql",
         other => panic!("no migration {other}"),
     };
 

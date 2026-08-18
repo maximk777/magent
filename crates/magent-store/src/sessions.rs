@@ -431,6 +431,33 @@ impl Store {
 
         Ok(())
     }
+
+    /// Takes the right to tell `session` a notice of `kind`, once.
+    ///
+    /// True means this caller may speak and nobody else will; false means the
+    /// session has already been told. The insert succeeding *is* the claim —
+    /// the uniqueness constraint decides it, not a preceding read — so two
+    /// callers racing cannot both come away believing they may speak. That is
+    /// why this is `claim_notice` rather than `should_notify`: it takes the
+    /// right rather than asking whether the right is available, which is the
+    /// difference between a race that cannot be lost and one that can.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn claim_notice(&self, session: &str, kind: &str) -> Result<bool, StoreError> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let changed = tx.execute(
+            "INSERT INTO session_notices (external_session_hint, kind, sent_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (external_session_hint, kind) DO NOTHING",
+            (session, kind, Utc::now().to_rfc3339()),
+        )?;
+        tx.commit()?;
+
+        Ok(changed == 1)
+    }
 }
 
 /// The workspace's most recently touched open run.
