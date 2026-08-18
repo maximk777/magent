@@ -1618,14 +1618,16 @@ fn planning_a_change_that_does_not_exist_is_named_rather_than_left_to_the_key() 
     );
 }
 
-/// A change under execution keeps the plan it is executing.
+/// A change under execution can be replanned, and doing so replaces its plan.
 ///
-/// Replanning replaces every task, and a task carries the evidence that its
-/// verification actually ran. Allowing it here would delete the record of
-/// work already done and proved, which is why the refusal is by status
-/// rather than by inspecting each task.
+/// This was refused once, on the grounds that a task carries the evidence its
+/// verification ran and replacing it would delete that record. `task_ticks`
+/// holds the evidence now, keyed to the change rather than to the task row, so
+/// the plan is free to change and what was proved under the old one stays
+/// proved. A plan that turns out wrong halfway is the ordinary case, and it is
+/// what the executing skill tells its reader to do.
 #[test]
-fn planning_a_change_already_being_executed_is_refused() {
+fn planning_a_change_already_being_executed_replaces_its_plan() {
     let (dir, path, store) = temp_store();
     let ctx = context(&store, dir.path());
     let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
@@ -1641,15 +1643,9 @@ fn planning_a_change_already_being_executed_is_refused() {
     )
     .expect("start executing");
 
-    let result = store.plan(&plan_command(change, vec![task("9", &[REQUIREMENT])]), &ctx);
-
-    assert!(
-        matches!(
-            &result,
-            Err(StoreError::ChangeNotSpecified { status, .. }) if status == "executing"
-        ),
-        "expected the refusal to name the status it refused on, got {result:?}"
-    );
+    store
+        .plan(&plan_command(change, vec![task("9", &[REQUIREMENT])]), &ctx)
+        .expect("a plan that turns out wrong halfway has to be correctable");
 
     let (number,): (String,) = raw
         .query_row(
@@ -1657,8 +1653,11 @@ fn planning_a_change_already_being_executed_is_refused() {
             [change.to_string()],
             |row| Ok((row.get(0)?,)),
         )
-        .expect("the task under execution must survive");
-    assert_eq!(number, "1", "the plan being executed was replaced anyway");
+        .expect("the new plan's task");
+    assert_eq!(
+        number, "9",
+        "replanning replaces the plan rather than adding to it"
+    );
 }
 
 // --- archiving -----------------------------------------------------------
@@ -2754,5 +2753,79 @@ fn the_two_coverage_refusals_do_not_share_a_code() {
     assert!(
         at_archive.to_string().contains("close"),
         "a refusal says what to do instead: {at_archive}"
+    );
+}
+
+/// The trap the archive gate would otherwise set, on the exact path the change
+/// that added it describes: plan two tasks, tick one, specify a requirement the
+/// plan does not cover, tick the other. The last tick sends the change to
+/// `ready` — and only then does archiving refuse, naming a requirement whose
+/// fix is a plan. So planning has to be possible from `ready`, or the refusal
+/// names a way out that is itself refused.
+///
+/// `ready` was refused for one stated reason: a replan deletes the tasks, and
+/// with them the evidence of work already verified. `task_ticks` is that
+/// evidence now, and no plan can delete it — so the reason is gone, and with it
+/// the refusal.
+#[test]
+fn a_ready_change_can_still_be_replanned() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    store
+        .plan(
+            &plan_command(
+                change,
+                vec![task("1", &[REQUIREMENT]), task("2", &[REQUIREMENT])],
+            ),
+            &ctx,
+        )
+        .expect("plan");
+    close_task_by_checkpoint(&store, dir.path(), "add-retry-budget", "1");
+
+    let late = "the budget is configurable";
+    store
+        .specify(
+            &specify_command(change, "worker/retry", Some(PURPOSE), vec![added(late)]),
+            &ctx,
+        )
+        .expect("the second specify");
+
+    // The tick that leaves no task open, so the change reads `ready` while a
+    // requirement nobody planned for stands uncovered.
+    close_task_by_checkpoint(&store, dir.path(), "add-retry-budget", "2");
+
+    let refused = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("the late requirement is covered by no finished task");
+    assert_eq!(refused.code(), "requirements_unimplemented", "{refused:?}");
+
+    // The way out the refusal names. This is the step that was refused.
+    store
+        .plan(
+            &plan_command(change, vec![task("1", &[REQUIREMENT]), task("2", &[late])]),
+            &ctx,
+        )
+        .expect("a change told to plan a task has to be able to plan one");
+
+    close_task_by_checkpoint(&store, dir.path(), "add-retry-budget", "1");
+    close_task_by_checkpoint(&store, dir.path(), "add-retry-budget", "2");
+    store
+        .archive(&archive_command(change), &ctx)
+        .expect("every requirement is covered by a finished task now");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        live_requirement_count(&raw),
+        2,
+        "both requirements were implemented, so both are now specification"
+    );
+    let ticks: i64 = raw
+        .query_row("SELECT COUNT(*) FROM task_ticks", [], |row| row.get(0))
+        .expect("count the ticks");
+    assert_eq!(
+        ticks, 4,
+        "the two ticks taken under the plan that was replaced are still recorded"
     );
 }

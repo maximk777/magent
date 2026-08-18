@@ -1048,9 +1048,11 @@ fn close_task(
 /// a change whose newest delta no task covers, and it reads `ready`. Guarding
 /// the row would leave the returned flag — computed from the tasks — saying
 /// ready while the row said otherwise, and a caller told both has no way out.
-/// The disagreement worth fixing is upstream, between `specify` leaving a stale
-/// plan in place and archiving never checking that every delta is covered; both
-/// belong to a change of their own.
+///
+/// `ready` is therefore a status a change can reach with a requirement nobody
+/// planned for, and that is caught where it matters: `require_covered_by_done`
+/// refuses to archive one. The way out is a replan, which `ready` now allows —
+/// it did not, until the tick journal made replanning lose nothing.
 fn mark_change_ready(tx: &Transaction<'_>, change_id: &str, now: &str) -> Result<bool, StoreError> {
     if !sdd::open_task_numbers(tx, change_id)?.is_empty() {
         return Ok(false);

@@ -133,9 +133,11 @@ and one that no longer describes the work is worse than no plan, because people
 still trust it.
 
 Re-planning replaces the tasks rather than amending them: the tasks already
-closed have to be resent, they come back open, and the evidence they carried is
-gone. So correct a plan once, deliberately, with the whole list in front of you
-— not task by task as each one turns out slightly off.
+closed have to be resent, and they come back open, so you tick them again. What
+they proved is not lost — every tick is kept in a journal keyed to the change,
+which no plan can delete, and `magent changes` prints it. Still, correct a plan
+once, deliberately, with the whole list in front of you, rather than task by
+task as each one turns out slightly off.
 
 If the **proposal** is wrong — the approach, not the steps — stop and say so
 rather than patching tasks around it.

@@ -682,8 +682,10 @@ impl Store {
     /// [`StoreError::ChangeNotFound`] or [`StoreError::ChangeClosed`] when the
     /// change cannot be archived at all, [`StoreError::ChangeNotExecuted`]
     /// when a task of it is still open or it was never planned,
-    /// [`StoreError::RequirementsUncovered`] when a requirement of it is one
-    /// no finished task covers,
+    /// [`StoreError::RequirementsUnimplemented`] when a requirement of it is
+    /// one no finished task covers — a different variant from the
+    /// [`StoreError::RequirementsUncovered`] planning raises, because a plan
+    /// that is incomplete and a plan that is unfinished need different fixes,
     /// [`StoreError::NothingToArchive`] when it proposes no deltas and did not
     /// declare `skip_specs`, [`StoreError::CapabilityPurposeRequired`] when a
     /// delta creating a capability carries no purpose, or a database error.
@@ -1621,13 +1623,23 @@ fn require_plannable_change(
     }
 
     let plannable = match status {
-        ChangeStatus::Specified | ChangeStatus::Planned => true,
+        // `executing` and `ready` are here too, and were not always. They were
+        // refused for one reason: a replan deletes the tasks (`Store::plan`),
+        // and with them the `evidence` of work already verified. That is no
+        // longer what happens — `task_ticks` records every tick against the
+        // change rather than the task row, and no plan can delete it.
+        //
+        // Leaving the refusal in place once the reason had gone would have made
+        // the archive gate unanswerable: it refuses a change whose delta no
+        // finished task covers, and tells the caller to plan one. Reaching that
+        // refusal means the last task closed, which is exactly what puts a
+        // change in `ready`. So the way out the refusal names has to be open
+        // from there, or the process has a state it cannot leave.
+        ChangeStatus::Specified
+        | ChangeStatus::Planned
+        | ChangeStatus::Executing
+        | ChangeStatus::Ready => true,
         ChangeStatus::Drafting => skip_specs,
-        // `executing` and `ready` are past planning: the tasks are being
-        // worked, and replacing them would delete rows carrying the evidence
-        // of work already verified. `specify` pulls such a change back to
-        // `specified` first, which is the path that keeps that evidence's
-        // disappearance a decision rather than a side effect.
         _ => false,
     };
     if !plannable {
