@@ -2275,6 +2275,13 @@ struct TaskTickRow {
 
 /// The change's ticks, oldest first.
 ///
+/// `created_at` then `rowid`, though the first column alone almost always
+/// decides it: `to_rfc3339` writes microseconds, so two ticks tie only if two
+/// separate write transactions land inside one microsecond. `rowid` is the
+/// order they were inserted in, and adding it costs nothing while making
+/// "oldest first" true unconditionally rather than true in practice — which is
+/// the difference between a promise and an observation.
+///
 /// `in_current_plan` is answered by the `EXISTS` rather than by the caller
 /// matching numbers against [`load_task_summaries`]'s result, for the reason
 /// [`TaskTick`] gives: a reader that skipped that step would read an orphan tick
@@ -2289,7 +2296,8 @@ fn load_task_ticks(tx: &Transaction<'_>, change_id: &str) -> Result<Vec<TaskTick
                        WHERE tasks.change_id = task_ticks.change_id
                          AND tasks.number = task_ticks.number)
          FROM task_ticks
-         WHERE task_ticks.change_id = ?1 ORDER BY task_ticks.created_at",
+         WHERE task_ticks.change_id = ?1
+         ORDER BY task_ticks.created_at, task_ticks.rowid",
     )?;
     let rows = statement
         .query_map([change_id], |row| {
