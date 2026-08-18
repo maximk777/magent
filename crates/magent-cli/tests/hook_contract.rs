@@ -330,7 +330,6 @@ fn session_start_flags_a_spec_bound_run_left_on_main() {
             started.run_id,
             &SpecBinding {
                 change_id: Some("add-retry-budget".into()),
-                paths: vec![],
                 current_task: None,
             },
         )
@@ -377,7 +376,6 @@ fn session_start_flags_a_spec_bound_run_left_on_master() {
             started.run_id,
             &SpecBinding {
                 change_id: Some("add-retry-budget".into()),
-                paths: vec![],
                 current_task: None,
             },
         )
@@ -418,7 +416,6 @@ fn session_start_says_nothing_on_a_feature_branch() {
             started.run_id,
             &SpecBinding {
                 change_id: Some("add-retry-budget".into()),
-                paths: vec![],
                 current_task: None,
             },
         )

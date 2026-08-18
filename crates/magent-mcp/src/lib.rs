@@ -191,9 +191,6 @@ pub struct CheckpointToolInput {
     /// later checkpoints that omit it leave it bound.
     #[serde(default)]
     pub spec_change_id: Option<String>,
-    /// Repository-relative paths to the proposal and task list.
-    #[serde(default)]
-    pub spec_paths: Vec<String>,
     /// The task now in hand, as it reads in the list: `2: wire the budget`.
     #[serde(default)]
     pub current_task: Option<String>,
@@ -697,7 +694,6 @@ impl MagentMcp {
         // nothing about the spec.
         let binding = SpecBinding {
             change_id: input.spec_change_id,
-            paths: input.spec_paths,
             current_task: input.current_task,
         };
 

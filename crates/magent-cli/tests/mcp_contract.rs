@@ -1450,7 +1450,6 @@ async fn a_checkpoint_can_bind_the_run_to_a_spec_change() {
             "stage": "executing",
             "handoff_summary": "budget type is in",
             "spec_change_id": "add-retry-budget",
-            "spec_paths": ["openspec/changes/add-retry-budget/tasks.md"],
             "current_task": "2: wire the budget into the client"
         }),
     )
@@ -1490,7 +1489,6 @@ async fn advancing_to_the_next_task_takes_one_field() {
             "stage": "executing",
             "handoff_summary": "task 1 done",
             "spec_change_id": "add-retry-budget",
-            "spec_paths": ["openspec/changes/add-retry-budget/tasks.md"],
             "current_task": "1"
         }),
     )
@@ -1516,10 +1514,6 @@ async fn advancing_to_the_next_task_takes_one_field() {
         Some("add-retry-budget"),
         "the change was dropped by a checkpoint that did not mention it: {status}"
     );
-    assert_eq!(
-        spec["paths"][0].as_str(),
-        Some("openspec/changes/add-retry-budget/tasks.md")
-    );
     client.cancel().await.expect("shutdown");
 }
 
@@ -1543,7 +1537,7 @@ async fn the_spec_fields_are_all_optional() {
         .filter_map(Value::as_str)
         .collect();
 
-    for field in ["spec_change_id", "spec_paths", "current_task"] {
+    for field in ["spec_change_id", "current_task"] {
         assert!(!required.contains(&field), "{field} became required");
     }
     client.cancel().await.expect("shutdown");

@@ -34,6 +34,7 @@ fn migration(version: i64) -> String {
         7 => "0007_sdd.sql",
         8 => "0008_drop_orphan_distill_jobs.sql",
         9 => "0009_tasks.sql",
+        10 => "0010_drop_spec_paths.sql",
         other => panic!("no migration {other}"),
     };
 

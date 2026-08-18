@@ -1,0 +1,11 @@
+-- The column held repository-relative paths to a proposal and a task list,
+-- back when a change was a directory of markdown. The spec process lives in
+-- the store now: `sdd_changes`, `spec_deltas` and `tasks` are the change, and
+-- there are no files for a run to point at. A binding that kept asking for
+-- them would be asking for something nothing can produce, and the next reader
+-- of this schema would have to work out for themselves that the empty column
+-- means "obsolete" rather than "nobody filled it in yet".
+--
+-- Dropped rather than left unwritten: DROP COLUMN has been available since
+-- SQLite 3.35, which every build this ships against is well past.
+ALTER TABLE runs DROP COLUMN spec_paths;

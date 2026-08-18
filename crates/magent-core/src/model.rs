@@ -361,9 +361,6 @@ pub struct SpecBinding {
     /// The change's directory name, `add-retry-budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_id: Option<String>,
-    /// Repository-relative paths to the proposal and task list.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<String>,
     /// The task in flight, as it reads in the list: `2: wire the budget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_task: Option<String>,

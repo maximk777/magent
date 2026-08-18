@@ -93,7 +93,6 @@ supply:
 Task: make retries bounded
 Change: add-retry-budget
 On task: 1.2 Implement RetryBudget
-Spec: openspec/changes/add-retry-budget/tasks.md
 ```
 
 Three skills — `sdd-brainstorm`, `sdd-plan`, `sdd-execute` — and three

@@ -80,12 +80,6 @@ fn push_spec(out: &mut String, spec: Option<&magent_core::SpecBinding>) {
     if let Some(task) = &spec.current_task {
         let _ = writeln!(out, "On task: {task}");
     }
-    // The paths, not their contents. The files are in the working tree and
-    // reading them costs the agent one tool call; copying them here would spend
-    // the packet's whole budget on something already on disk.
-    if !spec.paths.is_empty() {
-        let _ = writeln!(out, "Spec: {}", spec.paths.join(", "));
-    }
 }
 
 fn push_checkpoint(out: &mut String, checkpoint: &CheckpointSnapshot) {
@@ -362,7 +356,6 @@ mod tests {
         let mut snapshot = run("look into the timeouts");
         snapshot.spec = Some(magent_core::SpecBinding {
             change_id: Some("add-retry-budget".into()),
-            paths: vec!["openspec/changes/add-retry-budget/tasks.md".into()],
             current_task: Some("2: wire the budget into the client".into()),
         });
 
@@ -373,13 +366,12 @@ mod tests {
             packet.contains("wire the budget into the client"),
             "{packet}"
         );
+        // The change is rows now, so there is no file to point at, and a
+        // packet that offered one would send the model looking for something
+        // nothing writes. It reads the change back with `magent changes`.
         assert!(
-            packet.contains("openspec/changes/add-retry-budget/tasks.md"),
-            "the path is what lets it read the rest: {packet}"
-        );
-        assert!(
-            !packet.contains("- [ ]"),
-            "the spec's contents belong on disk, not in the packet: {packet}"
+            !packet.contains(".md"),
+            "nothing here may offer a file path: {packet}"
         );
     }
 

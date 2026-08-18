@@ -222,7 +222,6 @@ impl Fixture {
                 started.run_id,
                 &SpecBinding {
                     change_id: Some(slug.into()),
-                    paths: Vec::new(),
                     current_task: Some("1: the change's only task".into()),
                 },
             )

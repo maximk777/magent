@@ -166,7 +166,6 @@ impl Fixture {
                 run_id,
                 &SpecBinding {
                     change_id: Some(SLUG.into()),
-                    paths: Vec::new(),
                     current_task: Some("1.3: cap the loop".into()),
                 },
             )
@@ -505,7 +504,6 @@ fn one_message_binds_the_run_and_closes_its_first_task() {
             },
             Some(SpecBinding {
                 change_id: Some(SLUG.into()),
-                paths: Vec::new(),
                 current_task: Some("1.3: cap the loop".into()),
             }),
         )
@@ -642,7 +640,6 @@ fn a_tick_whose_slug_names_no_open_change_is_refused() {
             run_id,
             &SpecBinding {
                 change_id: Some("a-change-that-is-gone".into()),
-                paths: Vec::new(),
                 current_task: None,
             },
         )

@@ -830,7 +830,7 @@ pub(crate) struct RunRow {
 pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow, StoreError> {
     let row = tx
         .query_row(
-            "SELECT workspace_id, task, status, stage, spec_change_id, spec_paths, current_task
+            "SELECT workspace_id, task, status, stage, spec_change_id, current_task
              FROM runs WHERE id = ?1",
             [run_id.to_string()],
             |row| {
@@ -841,7 +841,6 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )
@@ -851,24 +850,10 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
     // A binding exists only when something is in it. An empty one reads as a
     // broken reference rather than as the absence of one, and plenty of work is
     // not spec-driven.
-    let paths: Vec<String> = row
-        .5
-        .as_deref()
-        .map(|joined| {
-            joined
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToOwned::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let bound = row.4.is_some() || !paths.is_empty() || row.6.is_some();
+    let bound = row.4.is_some() || row.5.is_some();
     let spec = bound.then_some(SpecBinding {
         change_id: row.4,
-        paths,
-        current_task: row.6,
+        current_task: row.5,
     });
 
     Ok(RunRow {
@@ -892,20 +877,14 @@ fn write_binding(
     binding: &SpecBinding,
     now: &str,
 ) -> Result<(), StoreError> {
-    // Stored newline-joined rather than as JSON: these are read by hand in
-    // sqlite3 as often as by this code, and a path never contains one.
-    let paths = (!binding.paths.is_empty()).then(|| binding.paths.join("\n"));
-
     let changed = tx.execute(
         "UPDATE runs SET
              spec_change_id = COALESCE(?1, spec_change_id),
-             spec_paths     = COALESCE(?2, spec_paths),
-             current_task   = COALESCE(?3, current_task),
-             updated_at     = ?4
-         WHERE id = ?5",
+             current_task   = COALESCE(?2, current_task),
+             updated_at     = ?3
+         WHERE id = ?4",
         (
             &binding.change_id,
-            &paths,
             &binding.current_task,
             now,
             run_id.to_string(),

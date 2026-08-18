@@ -489,3 +489,32 @@ fn public_methods_never_deadlock_on_the_store_itself() {
         Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the lookup thread died"),
     }
 }
+
+/// `runs.spec_paths` held repository-relative paths to a proposal and a task
+/// list — files this project stopped writing when the spec process moved into
+/// the store. A column nothing can fill is one a future reader has to work out
+/// the irrelevance of, so it goes rather than being left empty.
+#[test]
+fn the_run_table_has_no_spec_paths() {
+    let (_dir, path) = temp_db();
+    Store::open(&path).expect("open");
+
+    let connection = rusqlite::Connection::open(&path).expect("raw connection");
+    let mut statement = connection
+        .prepare("SELECT name FROM pragma_table_info('runs')")
+        .expect("prepare");
+    let columns: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("column names");
+
+    assert!(
+        columns.iter().any(|name| name == "spec_change_id"),
+        "the binding's own columns are still there: {columns:?}"
+    );
+    assert!(
+        !columns.iter().any(|name| name == "spec_paths"),
+        "the column names files that are not written any more: {columns:?}"
+    );
+}

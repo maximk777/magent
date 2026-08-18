@@ -164,7 +164,6 @@ impl Fixture {
 fn binding(change_id: &str, task: Option<&str>) -> SpecBinding {
     SpecBinding {
         change_id: Some(change_id.to_owned()),
-        paths: vec![format!("openspec/changes/{change_id}/tasks.md")],
         current_task: task.map(ToOwned::to_owned),
     }
 }
@@ -188,7 +187,6 @@ fn a_bound_run_reports_which_change_it_is_executing() {
     let spec = snapshot.spec.expect("a binding");
     assert_eq!(spec.change_id.as_deref(), Some("add-retry-budget"));
     assert_eq!(spec.current_task.as_deref(), Some("2: wire the budget"));
-    assert_eq!(spec.paths, ["openspec/changes/add-retry-budget/tasks.md"]);
 }
 
 #[test]
@@ -248,7 +246,6 @@ fn advancing_the_task_leaves_the_change_alone() {
             run_id,
             &SpecBinding {
                 change_id: None,
-                paths: vec![],
                 current_task: Some("2".into()),
             },
         )
@@ -261,11 +258,10 @@ fn advancing_the_task_leaves_the_change_alone() {
         .spec
         .expect("binding");
     assert_eq!(spec.change_id.as_deref(), Some("add-retry-budget"));
-    assert_eq!(spec.current_task.as_deref(), Some("2"));
     assert_eq!(
-        spec.paths,
-        ["openspec/changes/add-retry-budget/tasks.md"],
-        "the paths were not restated, so they were not dropped"
+        spec.current_task.as_deref(),
+        Some("2"),
+        "the task the second message named is the one now bound"
     );
 }
 
@@ -349,7 +345,6 @@ fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
             Some(wrong_command()),
             Some(SpecBinding {
                 change_id: None,
-                paths: vec!["openspec/changes/add-retry-budget/proposal.md".into()],
                 current_task: Some("4: something else entirely".into()),
             }),
         )
@@ -411,11 +406,6 @@ fn a_refused_checkpoint_leaves_the_binding_as_it_was() {
         Some("1: cap the loop"),
         "and so did the task the second named"
     );
-    assert_eq!(
-        spec.paths,
-        ["openspec/changes/add-retry-budget/tasks.md"],
-        "and the path it added"
-    );
 }
 
 /// A retry reaches the store as the same command under the same `operation_id`,
@@ -452,7 +442,6 @@ fn a_replayed_checkpoint_does_not_re_apply_its_binding() {
             run_id,
             &SpecBinding {
                 change_id: None,
-                paths: vec![],
                 current_task: Some("2: spend the budget".into()),
             },
         )
