@@ -152,8 +152,13 @@ magent_archive { change: "<slug>" }
 Archiving is the step that makes this worth doing: the change's added, modified
 and removed requirements fold into the live specification, which becomes what is
 currently true for the next change, while the change itself is kept with its
-reasoning intact. It refuses while any task is still open, and lists the ones
-that are — so a refusal here is a task you thought was done and never closed.
+reasoning intact.
+
+It refuses on two counts, and they mean different things. A task still open,
+and it lists the ones that are — a task you thought was done and never closed.
+Or a requirement no finished task covers, named in the refusal: that is a
+requirement specified after the plan was written, and what it needs is a task,
+not a tick.
 
 ```
 magent_finish { action: "complete_run", outcome: "<what is now true>" }
