@@ -276,6 +276,32 @@ fn row_count(connection: &Connection, table: &str) -> i64 {
         .expect("count")
 }
 
+/// Every tick in the journal, oldest first.
+///
+/// Ordered by `rowid` rather than by `created_at`: two ticks of one session
+/// share a timestamp readily, and the question here is the order they were
+/// written in.
+fn ticks(connection: &Connection) -> Vec<(String, String)> {
+    connection
+        .prepare("SELECT number, output FROM task_ticks ORDER BY rowid")
+        .expect("task_ticks")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("ticks")
+}
+
+/// The task numbers the plan now holds.
+fn task_numbers(connection: &Connection) -> Vec<String> {
+    connection
+        .prepare("SELECT number FROM tasks ORDER BY number")
+        .expect("tasks")
+        .query_map([], |row| row.get(0))
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("numbers")
+}
+
 fn task(number: &str, covers: &[&str], markers: &[&str]) -> TaskDraft {
     TaskDraft {
         number: number.into(),
@@ -947,4 +973,124 @@ fn an_archive_after_the_last_tick_folds_the_deltas() {
     );
     assert_eq!(report.status, ChangeStatus::Archived);
     assert_eq!(fixture.change_status(change), ChangeStatus::Archived);
+}
+
+/// `Store::plan` deletes the change's tasks so that a replan replaces the plan
+/// rather than appending to it, and so a reused number is not fighting
+/// `tasks_number`. Replanning a change already under way is legal, so the rows
+/// that go can be ones a tick had written its evidence onto — and the evidence
+/// would go with them if `tasks` were the only place it lived.
+///
+/// A plan is a statement about what remains to be done; a tick is a record of
+/// something that happened, and nothing that happened stops having happened
+/// because the plan changed.
+#[test]
+fn a_replan_leaves_the_journal_alone() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let output = format!("running 3 tests\n...\n{EXPECTED}; finished in 0.42s\n");
+    fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: output.clone(),
+            },
+        )
+        .expect("checkpoint");
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks: vec![task("9", &[REQUIREMENT], &[EXPECTED])],
+            },
+            &fixture.context,
+        )
+        .expect("replanning a change under way is legal");
+
+    let connection = fixture.raw();
+    assert_eq!(
+        task_numbers(&connection),
+        vec!["9".to_owned()],
+        "the replan replaced the plan, the row task 1.3 was closed on included"
+    );
+    assert_eq!(
+        ticks(&connection),
+        vec![("1.3".to_owned(), output)],
+        "and the tick against 1.3 outlived the row it closed"
+    );
+}
+
+/// The journal records what happened, so a tick that did not happen leaves
+/// nothing behind. The insert sits inside the checkpoint's own transaction with
+/// every refusal ahead of it, which is what makes this hold.
+#[test]
+fn a_refused_tick_writes_no_journal_row() {
+    let fixture = Fixture::new();
+    let _change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: "cargo test -p worker".into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected another command to be refused");
+
+    assert_eq!(error.code(), "verify_command_mismatch");
+    assert_eq!(
+        row_count(&fixture.raw(), "task_ticks"),
+        0,
+        "a refused tick is not something that happened"
+    );
+}
+
+/// Nothing is unique on (`change_id`, number): a task closed twice is two
+/// ticks.
+/// The second run is a fact about the work as much as the first, and a journal
+/// that kept only the latest would read afterwards exactly like one where the
+/// task was proved once.
+#[test]
+fn closing_a_task_twice_keeps_both_ticks() {
+    let fixture = Fixture::new();
+    let _change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let first = format!("{EXPECTED}; finished in 0.42s\n");
+    let second = format!("{EXPECTED}; finished in 0.31s\n");
+
+    for output in [&first, &second] {
+        fixture
+            .checkpoint(
+                run_id,
+                session_id,
+                OperationId::new(),
+                TaskDone {
+                    number: "1.3".into(),
+                    verify_command: VERIFY.into(),
+                    output: output.clone(),
+                },
+            )
+            .expect("checkpoint");
+    }
+
+    assert_eq!(
+        ticks(&fixture.raw()),
+        vec![("1.3".to_owned(), first), ("1.3".to_owned(), second)],
+        "both runs are on the record, in the order they happened"
+    );
 }

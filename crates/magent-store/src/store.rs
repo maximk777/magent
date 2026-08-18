@@ -998,6 +998,28 @@ fn close_task(
         rusqlite::params![&done.output, now, now, &change_id, &done.number],
     )?;
 
+    // The same tick again, where a replan cannot reach it. `Store::plan`
+    // deletes the change's tasks, so the `evidence` written just above lives on
+    // a row the next plan of this change is entitled to remove — see
+    // `0012_task_ticks.sql`. In this transaction with the `UPDATE`, which is
+    // the argument above one table further: a task recorded as done whose tick
+    // was lost reads afterwards exactly like one that was never checked.
+    tx.execute(
+        "INSERT INTO task_ticks
+           (id, change_id, number, verify_command, output, missing_json, run_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            uuid::Uuid::new_v4().to_string(),
+            &change_id,
+            &done.number,
+            &done.verify_command,
+            &done.output,
+            serde_json::to_string(&expected_output_missing)?,
+            run_id.to_string(),
+            now,
+        ],
+    )?;
+
     let change_ready = mark_change_ready(tx, &change_id, now)?;
 
     Ok(TaskClosed {
