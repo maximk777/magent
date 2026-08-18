@@ -3,11 +3,15 @@
 //! Every test directs state at a fresh temporary directory. A test that touched
 //! the real `~/.magent` would corrupt working memory, so this is not optional.
 
-use std::{path::Path, process::Command, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
 
 use magent_core::{
-    CheckpointCommand, CheckpointOrigin, FinishAction, FinishRunCommand, HarnessKind, OperationId,
-    RunId, RunStatus, SessionId, StartRunCommand, WorkflowStage,
+    CheckpointCommand, CheckpointOrigin, FileLedgerEntry, FinishAction, FinishRunCommand,
+    HarnessKind, OperationId, RunId, RunStatus, SessionId, StartRunCommand, WorkflowStage,
 };
 use magent_store::{CURRENT_VERSION, Store, StoreError};
 
@@ -37,6 +41,31 @@ fn resume_command(run_id: RunId) -> StartRunCommand {
     StartRunCommand {
         resume_run_id: Some(run_id),
         ..start_command("fix payment timeout")
+    }
+}
+
+/// The harness session id the ledger entries below are attributed through.
+const EDITING_HINT: &str = "harness-session-editing";
+
+fn hinted_command(hint: &str) -> StartRunCommand {
+    StartRunCommand {
+        external_session_hint: Some(hint.into()),
+        ..start_command("rework the payment retry")
+    }
+}
+
+fn append_edits(store: &Store, hint: &str, count: usize) {
+    for index in 0..count {
+        store
+            .append_ledger_for_external_session(
+                hint,
+                &FileLedgerEntry {
+                    path: PathBuf::from(format!("src/module{index}.rs")),
+                    tool: "Edit".into(),
+                    observed_at: chrono::Utc::now(),
+                },
+            )
+            .expect("append ledger");
     }
 }
 
@@ -559,5 +588,80 @@ fn two_sessions_are_each_told_once() {
             .claim_notice("s2", "unrecorded_reasoning")
             .expect("s2 claim"),
         "a session that has not been told has not been told"
+    );
+}
+
+/// The question the prompt hook asks on every turn, so that noticing missing
+/// reasoning is counted rather than left to the model's own judgement.
+#[test]
+fn a_run_with_edits_and_no_enriched_checkpoint_is_reported() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+    let started = store
+        .start_run(&hinted_command(EDITING_HINT), HarnessKind::ClaudeCode)
+        .expect("start");
+
+    append_edits(&store, EDITING_HINT, 12);
+
+    assert_eq!(
+        store
+            .unrecorded_reasoning(started.run_id)
+            .expect("unrecorded_reasoning"),
+        Some(12),
+        "twelve edits and nothing said about them"
+    );
+}
+
+#[test]
+fn a_run_whose_model_wrote_a_checkpoint_is_not_reported() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+    let started = store
+        .start_run(&hinted_command(EDITING_HINT), HarnessKind::ClaudeCode)
+        .expect("start");
+
+    append_edits(&store, EDITING_HINT, 12);
+    store
+        .save_checkpoint(&CheckpointCommand {
+            origin: CheckpointOrigin::Enriched,
+            ..checkpoint_command(started.run_id, started.session_id, "why I did it this way")
+        })
+        .expect("checkpoint");
+
+    assert_eq!(
+        store
+            .unrecorded_reasoning(started.run_id)
+            .expect("unrecorded_reasoning"),
+        None,
+        "the reasoning is recorded, so there is nothing to ask for"
+    );
+}
+
+/// A deterministic checkpoint is written by the hook on the model's behalf
+/// before a compaction and carries no decisions: it is a snapshot, not
+/// reasoning. Counting it would silence exactly the runs this exists for.
+#[test]
+fn a_run_with_only_a_deterministic_checkpoint_is_still_reported() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+    let started = store
+        .start_run(&hinted_command(EDITING_HINT), HarnessKind::ClaudeCode)
+        .expect("start");
+
+    append_edits(&store, EDITING_HINT, 12);
+    store
+        .save_checkpoint(&checkpoint_command(
+            started.run_id,
+            started.session_id,
+            "snapshot before compaction",
+        ))
+        .expect("checkpoint");
+
+    assert_eq!(
+        store
+            .unrecorded_reasoning(started.run_id)
+            .expect("unrecorded_reasoning"),
+        Some(12),
+        "a snapshot is not an account of the work"
     );
 }

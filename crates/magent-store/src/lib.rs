@@ -31,7 +31,7 @@ pub use sdd::{
     ArchiveReport, CapabilityDetail, CapabilitySummary, ChangeDetail, ChangeSummary, DeltaSummary,
     LiveRequirement, LiveScenario, PlanReport, ProposeReport, SpecifyReport, TaskSummary, TaskTick,
 };
-pub use sessions::SessionBinding;
+pub use sessions::{REASONING_EDIT_THRESHOLD, SessionBinding};
 pub use setup::{GroupingProposal, Sibling};
 pub use store::{Job, JobState, Store, WorkspaceResolution};
 pub use toolchain::detect_toolchain;

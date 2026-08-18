@@ -19,6 +19,13 @@ use crate::{
     store::{Store, enum_to_sql, parse_id, upsert_repository},
 };
 
+/// How many edits a run carries before its silence is worth remarking on.
+///
+/// On the profile this was written against, sessions carried 1, 3, 5, 12, 18,
+/// 23, 50, 208 and 303 edits. Ten stays quiet for a quick fix and speaks for
+/// work worth explaining.
+pub const REASONING_EDIT_THRESHOLD: usize = 10;
+
 /// A harness session attached to a run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SessionBinding {
@@ -430,6 +437,39 @@ impl Store {
         })?;
 
         Ok(())
+    }
+
+    /// The number of edits a run has made without the model ever saying why,
+    /// once that number is large enough to be worth asking about.
+    ///
+    /// `None` covers both ways there is nothing to say — too few edits, or
+    /// reasoning already recorded — because the caller has one question, not
+    /// two. A deterministic checkpoint does not count: the hook writes that one
+    /// on the model's behalf before a compaction and it carries no decisions.
+    ///
+    /// One query rather than two: this runs on every prompt of every session,
+    /// and a second round trip buys nothing.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn unrecorded_reasoning(&self, run_id: RunId) -> Result<Option<usize>, StoreError> {
+        let connection = self.lock()?;
+        let (edits, has_reasoning): (i64, bool) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM file_ledger WHERE run_id = ?1),
+                    EXISTS(SELECT 1 FROM checkpoints WHERE run_id = ?1 AND origin = ?2)",
+            (
+                run_id.to_string(),
+                enum_to_sql(&CheckpointOrigin::Enriched)?,
+            ),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let edits = usize::try_from(edits).unwrap_or(usize::MAX);
+        if has_reasoning || edits < REASONING_EDIT_THRESHOLD {
+            return Ok(None);
+        }
+
+        Ok(Some(edits))
     }
 
     /// Takes the right to tell `session` a notice of `kind`, once.
