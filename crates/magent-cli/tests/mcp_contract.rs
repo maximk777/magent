@@ -2196,3 +2196,288 @@ async fn a_tick_over_mcp_closes_the_task() {
     );
     client.cancel().await.expect("shutdown");
 }
+
+// --- the loop, end to end ----------------------------------------------------
+
+/// The proposal the loop test carries the whole way: one capability, two
+/// requirements, two tasks. Held here rather than inline so the test below
+/// reads as the narrative it is meant to be.
+fn loop_proposal() -> Value {
+    json!({
+        "operation_id": uuid(),
+        "slug": "bound-the-retries",
+        "title": "Bound the retries",
+        "classification": "bounded",
+        "why": "retries currently loop forever and starve the queue of capacity",
+        "what_changes": ["cap the attempts", "spend the budget per attempt"],
+        "capabilities": ["worker/retry"]
+    })
+}
+
+/// Its two requirements, whose names sort the other way round from the order
+/// they are specified in — so the order the specification reads back in is the
+/// one `capability_detail` documents rather than the one this test wrote.
+fn loop_deltas() -> Value {
+    json!({
+        "operation_id": uuid(),
+        "change": "bound-the-retries",
+        "capability_path": "worker/retry",
+        "purpose": "Retries stop after a configured budget instead of continuing forever, so a failing dependency cannot starve the queue of capacity for other work.",
+        "requirements": [
+            {
+                "op": "added",
+                "name": "budget-caps-retries",
+                "text": "A retry budget caps the number of attempts a worker makes before giving up.",
+                "scenarios": [{
+                    "name": "exceeding the budget stops retrying",
+                    "given": "a job that has already failed budget times",
+                    "when": "the worker considers it again",
+                    "then": "the job is parked instead of retried"
+                }]
+            },
+            {
+                "op": "added",
+                "name": "attempts-spend-the-budget",
+                "text": "Each attempt spends one unit of the job's budget.",
+                "scenarios": [{
+                    "name": "an attempt is charged",
+                    "when": "an attempt fails",
+                    "then": "the job's remaining budget is one lower"
+                }]
+            }
+        ]
+    })
+}
+
+/// Its plan: one task per requirement, each with the command that will close it
+/// and what that command prints, and the second consuming what the first
+/// promises to produce.
+fn loop_tasks() -> Value {
+    json!({
+        "operation_id": uuid(),
+        "change": "bound-the-retries",
+        "tasks": [
+            {
+                "number": "1",
+                "title": "cap the attempts in the worker",
+                "body": "Read the budget from config and refuse a retry once it is spent.",
+                "files": ["crates/worker/src/retry.rs"],
+                "produces": "fn spend_budget(&mut self) -> bool",
+                "verify_command": "cargo test -p worker budget",
+                "expected_output": "test budget_caps_retries ... ok",
+                "covers": ["budget-caps-retries"]
+            },
+            {
+                "number": "2",
+                "title": "charge every attempt against the budget",
+                "body": "Call spend_budget from the attempt path, once per attempt.",
+                "files": ["crates/worker/src/attempt.rs"],
+                "consumes": "fn spend_budget(&mut self) -> bool, from task 1",
+                "verify_command": "cargo test -p worker attempt",
+                "expected_output": "test attempts_spend_the_budget ... ok",
+                "covers": ["attempts-spend-the-budget"]
+            }
+        ]
+    })
+}
+
+/// The seam itself, as the subject.
+///
+/// Every gap this change closes was found by running the loop and none by
+/// review, because each review looked at one piece and the holes were between
+/// them. So this drives the whole process through the real server: propose,
+/// specify, plan, bind, tick each task with the command its plan named, and
+/// archive — with the refusal that would have caught the original hole asserted
+/// in the middle, at the one moment it can be provoked.
+///
+/// Long on purpose, and split no further than the payloads above: the subject
+/// is the order of the steps, and a step lifted into a helper is a step whose
+/// place in that order stops being visible here.
+#[tokio::test]
+#[expect(clippy::too_many_lines, reason = "one continuous loop narrative")]
+async fn the_whole_loop_closes() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    call(&client, "magent_propose", loop_proposal()).await;
+
+    let specified = call(&client, "magent_specify", loop_deltas()).await;
+    assert_eq!(specified["added"].as_u64(), Some(2), "{specified}");
+
+    let planned = call(&client, "magent_plan", loop_tasks()).await;
+    assert_eq!(planned["tasks"].as_u64(), Some(2), "{planned}");
+    assert_eq!(planned["status"].as_str(), Some("planned"));
+
+    // The negative in the middle, and the reason this test exists: before this
+    // change, `planned` was where the process stopped. Archiving here has to be
+    // refused, and the refusal has to name what is still open — otherwise the
+    // caller is told the loop is stuck and not where.
+    let refused = call_expecting_error(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "bound-the-retries" }),
+    )
+    .await;
+    assert!(
+        refused.contains("change_not_executed"),
+        "expected the stable code in: {refused}"
+    );
+    for number in ["1", "2"] {
+        assert!(
+            refused.contains(number),
+            "the refusal has to name task {number}: {refused}"
+        );
+    }
+
+    // What the agent about to do task 1 reads: its own task, whole, including
+    // the body nobody else is left to hand it after a compaction.
+    let mid_flight = call(
+        &client,
+        "magent_changes",
+        json!({ "change": "bound-the-retries" }),
+    )
+    .await;
+    let task_one = &mid_flight["change"]["tasks"][0];
+    assert_eq!(task_one["status"].as_str(), Some("pending"), "{mid_flight}");
+    assert_eq!(
+        task_one["body"].as_str(),
+        Some("Read the budget from config and refuse a retry once it is spent."),
+        "{mid_flight}"
+    );
+    assert_eq!(
+        task_one["expected_output"].as_str(),
+        Some("test budget_caps_retries ... ok")
+    );
+    assert_eq!(
+        mid_flight["change"]["deltas"][0]["text"].as_str(),
+        Some("Each attempt spends one unit of the job's budget."),
+        "a reviewer reads the requirement, not only its name: {mid_flight}"
+    );
+
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "bound the retries" }),
+    )
+    .await;
+
+    let first = call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "the worker refuses a retry once the budget is spent",
+            "spec_change_id": "bound-the-retries",
+            "current_task": "2: charge every attempt against the budget",
+            "task_done": {
+                "number": "1",
+                "verify_command": "cargo test -p worker budget",
+                "output": "running 1 test\ntest budget_caps_retries ... ok\n"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(first["task"]["expected_output_found"].as_bool(), Some(true));
+    assert_eq!(
+        first["task"]["change_ready"].as_bool(),
+        Some(false),
+        "task 2 is still open: {first}"
+    );
+
+    // The binding rode in with the first tick, so this one carries the tick
+    // alone — which is the whole point of not making it restate the change.
+    let second = call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "every attempt is charged against the budget",
+            "task_done": {
+                "number": "2",
+                "verify_command": "cargo test -p worker attempt",
+                "output": "running 1 test\ntest attempts_spend_the_budget ... ok\n"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        second["task"]["change_ready"].as_bool(),
+        Some(true),
+        "the last open task closed, so the change is ready: {second}"
+    );
+
+    let ticked = call(
+        &client,
+        "magent_changes",
+        json!({ "change": "bound-the-retries" }),
+    )
+    .await;
+    let tasks = ticked["change"]["tasks"].as_array().expect("tasks");
+    for task in tasks {
+        assert_eq!(task["status"].as_str(), Some("done"), "{ticked}");
+        assert!(
+            task["evidence"]
+                .as_str()
+                .is_some_and(|evidence| evidence.contains("... ok")),
+            "a tick is worth no more than the evidence under it: {task}"
+        );
+        assert!(task["verified_at"].as_str().is_some(), "{task}");
+    }
+
+    let archived = call(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "bound-the-retries" }),
+    )
+    .await;
+    assert_eq!(archived["status"].as_str(), Some("archived"), "{archived}");
+    assert_eq!(archived["added"].as_u64(), Some(2));
+    assert_eq!(
+        archived["capabilities_created"][0].as_str(),
+        Some("worker/retry")
+    );
+
+    // And what the next session sees: nothing in flight, and a specification
+    // that now says what this change proposed.
+    let after = call(&client, "magent_changes", json!({})).await;
+    assert_eq!(
+        after["open"].as_array().map(Vec::len),
+        Some(0),
+        "the change is archived, so nothing is open: {after}"
+    );
+    assert_eq!(
+        after["capabilities"][0]["path"].as_str(),
+        Some("worker/retry")
+    );
+    assert_eq!(
+        after["capabilities"][0]["requirement_count"].as_u64(),
+        Some(2),
+        "{after}"
+    );
+
+    let capability = call(
+        &client,
+        "magent_changes",
+        json!({ "capability": "worker/retry" }),
+    )
+    .await;
+    let names: Vec<&str> = capability["capability"]["requirements"]
+        .as_array()
+        .expect("requirements")
+        .iter()
+        .filter_map(|requirement| requirement["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["attempts-spend-the-budget", "budget-caps-retries"],
+        "both requirements are live: {capability}"
+    );
+    assert_eq!(
+        capability["capability"]["requirements"][1]["scenarios"][0]["given"].as_str(),
+        Some("a job that has already failed budget times"),
+        "the scenarios came through the whole loop: {capability}"
+    );
+    client.cancel().await.expect("shutdown");
+}
