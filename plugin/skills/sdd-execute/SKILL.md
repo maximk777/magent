@@ -158,7 +158,9 @@ It refuses on two counts, and they mean different things. A task still open,
 and it lists the ones that are — a task you thought was done and never closed.
 Or a requirement no finished task covers, named in the refusal: that is a
 requirement specified after the plan was written, and what it needs is a task,
-not a tick.
+not a tick. Adding one means re-planning, so read *When the plan turns out
+wrong* above before you do — it costs the whole list, and the tasks already
+closed come back open.
 
 ```
 magent_finish { action: "complete_run", outcome: "<what is now true>" }

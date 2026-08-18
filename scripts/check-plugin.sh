@@ -151,6 +151,19 @@ if [ -f plugin/skills/sdd-execute/SKILL.md ]; then
   done
 fi
 
+# sdd-plan's example is the shape every future plan is copied from, and
+# expected_output is a list of markers. It spent sixteen tasks as one line of
+# prose that no output could ever contain, and nothing noticed — which is what
+# this check is here to stop happening twice.
+if [ -f plugin/skills/sdd-plan/SKILL.md ]; then
+  if grep -q 'expected_output: "' plugin/skills/sdd-plan/SKILL.md; then
+    fail "sdd-plan shows expected_output as a string; it is a list of markers, and a plan copied from that example is refused"
+  fi
+  if ! grep -q 'expected_output: \[' plugin/skills/sdd-plan/SKILL.md; then
+    fail "sdd-plan no longer shows expected_output as a list, so nothing teaches the shape magent_plan accepts"
+  fi
+fi
+
 # --- the language plugin ----------------------------------------------------
 
 for required in \

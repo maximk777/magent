@@ -113,11 +113,11 @@ agent doing 1.2 never sees 1.1.
 `expected_output` is one or more markers, and a marker is a string the command
 will print verbatim — the invariant fragments of a line rather than the line
 itself. Counts that shift between runs, and prose the plan invented, belong in
-the task's `body`: every marker has to turn up in the output before the tick
-reports the check as met, so a marker nobody could find makes that report
-useless. Sixteen tasks running closed in exactly that state while this process
-was being built, their expected output reported missing every time — including
-the tasks whose command had printed precisely what was expected.
+the task's `body`: the tick names every marker it did not find, so a marker the
+command never prints is reported missing on every run and turns that report
+into noise. Sixteen tasks of this project's own work closed that way while the
+process was being built, their expected output reported missing every time —
+including the tasks whose command had printed precisely what was expected.
 
 The numbering matters beyond tidiness: a run binds to its task by that number,
 and the checkpoint that closes the task names it. Numbers are addresses, not
