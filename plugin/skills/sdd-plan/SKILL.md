@@ -100,7 +100,7 @@ magent_plan { change: "add-retry-budget",
                   consumes: "the test budget::caps_attempts from 1.1",
                   produces: "RetryBudget::new(u32), RetryBudget::take(&mut self) -> bool",
                   verify_command: "cargo test budget",
-                  expected_output: ["test result: ok", "1 passed"],
+                  expected_output: ["test result: ok", "caps_attempts ... ok"],
                   covers: ["A retry budget caps attempts"] } ] }
 ```
 
