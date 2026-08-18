@@ -18,8 +18,17 @@ use magent_core::{
 use magent_store::{CURRENT_VERSION, FactContext, FactQuery, Store, StoreError};
 use rusqlite::Connection;
 
+/// The workspace seeded into every legacy fixture.
+const LEGACY_WORKSPACE: &str = "11111111-1111-4111-8111-111111111111";
+
 /// The run seeded into every legacy fixture.
 const LEGACY_RUN: &str = "33333333-3333-4333-8333-333333333333";
+
+/// The change seeded into the fixture that carries a plan.
+const LEGACY_CHANGE: &str = "88888888-8888-4888-8888-888888888888";
+
+/// The single line a pre-0011 plan wrote into `tasks.expected_output`.
+const LEGACY_EXPECTED_OUTPUT: &str = "test result: ok. 3 passed";
 
 /// The migrations as they shipped. Read from disk rather than re-declared, so a
 /// migration edited after release fails these tests instead of passing them.
@@ -121,6 +130,44 @@ fn seed_facts(connection: &Connection) {
         .expect("seed facts");
 }
 
+/// A change, its proposal and one planned task, as slice 3 wrote them before
+/// 0011 — `expected_output` still one column of prose, not a JSON list.
+fn seed_planned_task(connection: &Connection) {
+    connection
+        .execute(
+            "INSERT INTO sdd_changes
+                 (id, workspace_id, namespace, slug, title, classification, status,
+                  created_at, updated_at)
+             VALUES (?1, ?2, 'service', 'add-retry-budget', 'Give retries a ceiling',
+                     'bounded', 'planned', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (LEGACY_CHANGE, LEGACY_WORKSPACE),
+        )
+        .expect("seed change");
+    connection
+        .execute(
+            "INSERT INTO sdd_artifacts (id, change_id, kind, body_json, created_at, updated_at)
+             VALUES ('99999999-9999-4999-8999-999999999999', ?1, 'proposal',
+                     '{\"why\":\"Retries can loop forever.\",
+                       \"what_changes\":[\"cap the retries\"],
+                       \"capabilities\":[\"worker/retry\"]}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [LEGACY_CHANGE],
+        )
+        .expect("seed proposal");
+    connection
+        .execute(
+            "INSERT INTO tasks
+                 (id, change_id, number, title, body, files_json, verify_command,
+                  expected_output, status, created_at, updated_at)
+             VALUES ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', ?1, '1', 'cap the retries',
+                     'Stop the loop.', '[\"crates/worker/src/retry.rs\"]',
+                     'cargo test -p worker retry', ?2, 'pending',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (LEGACY_CHANGE, LEGACY_EXPECTED_OUTPUT),
+        )
+        .expect("seed task");
+}
+
 fn temp() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("magent.db");
@@ -206,6 +253,47 @@ fn a_version_four_profile_can_still_resolve_colliding_directory_names() {
         .expect("two directories called api must both resolve");
 
     assert_ne!(alpha.repository_id, beta.repository_id);
+}
+
+/// 0011 is the only migration so far that rewrites a value someone else wrote
+/// — 0005's `UPDATE` fills a column it has just added — and it does so twice
+/// over, wrapping `expected_output` in `json_array` and then renaming the
+/// column. What a plan stated it was looking for is what makes a tick
+/// auditable, and a botched rewrite would leave a bare string where the store
+/// now parses JSON: a profile planned before the upgrade would refuse to open
+/// its own plan, or come back with the wrong marker.
+#[test]
+fn a_version_ten_profile_keeps_what_its_plan_expected() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 10);
+    seed_slice_one(&legacy);
+    seed_planned_task(&legacy);
+    drop(legacy);
+
+    let store = Store::open(&path).expect("migrate");
+
+    let detail = store
+        .change_detail(
+            LEGACY_CHANGE.parse().expect("a uuid"),
+            &FactContext {
+                workspace_id: Some(LEGACY_WORKSPACE.parse().expect("a uuid")),
+                ..FactContext::default()
+            },
+        )
+        .expect("change_detail")
+        .expect("the change must still be readable after migrating");
+
+    assert_eq!(
+        detail.tasks.len(),
+        1,
+        "the task was lost: {:?}",
+        detail.tasks
+    );
+    assert_eq!(
+        detail.tasks[0].expected_output,
+        vec![LEGACY_EXPECTED_OUTPUT.to_string()],
+        "the line the plan wrote must survive as a single-element list"
+    );
 }
 
 #[test]
