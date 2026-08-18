@@ -149,6 +149,39 @@ impl World {
             .expect("close the task");
         assert_eq!(closed, 1, "no task numbered {number} to close");
     }
+
+    /// A tick in the journal, written directly rather than through a
+    /// checkpoint: closing a task properly needs a run bound to the change and
+    /// a plan whose command it can quote, and what this file tests is what the
+    /// command prints, not how a tick gets there.
+    fn journal_a_tick(&self, number: &str, command: &str, output: &str) {
+        let connection = rusqlite::Connection::open(self.database()).expect("open the store");
+        let change_id: String = connection
+            .query_row("SELECT id FROM sdd_changes LIMIT 1", [], |row| row.get(0))
+            .expect("the change");
+        connection
+            .execute(
+                "INSERT INTO task_ticks
+                     (id, change_id, number, verify_command, output, missing_json,
+                      run_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '[]', ?6, ?7)",
+                rusqlite::params![
+                    uuid_like(number),
+                    change_id,
+                    number,
+                    command,
+                    output,
+                    uuid_like("run"),
+                    "2026-08-18T12:00:00+00:00",
+                ],
+            )
+            .expect("journal the tick");
+    }
+}
+
+/// Any distinct value works where the store only stores an identifier.
+fn uuid_like(seed: &str) -> String {
+    format!("{seed:0>8}-0000-4000-8000-000000000000")
 }
 
 /// Silence here is indistinguishable from a broken install, and this runs
@@ -227,5 +260,62 @@ fn a_named_change_prints_its_tasks() {
         report.contains("done") && report.contains("pending"),
         "a task list that does not say which tasks are closed is a list of \
          work already done: {report}"
+    );
+}
+
+/// A tick is worth no more than the evidence under it, and evidence nobody can
+/// read is a checked box. The store keeps the journal precisely so a replan
+/// cannot take it, and this command is where a person goes to look at it.
+#[test]
+fn a_named_change_prints_what_its_ticks_proved() {
+    let world = World::new();
+    world.plan_a_change(
+        "retry-budget",
+        "Retries have no ceiling and can loop forever.",
+        &[("1", "Write the failing test"), ("2", "Add the budget")],
+    );
+    world.close_task("1");
+    world.journal_a_tick(
+        "1",
+        "cargo test budget",
+        "running 1 test\ntest caps_attempts ... ok\n",
+    );
+
+    let (ok, report) = world.changes(&["retry-budget"]);
+
+    assert!(ok, "{report}");
+    assert!(
+        report.contains("cargo test budget"),
+        "the command that proved the task is what makes the tick checkable: {report}"
+    );
+    assert!(
+        report.contains("caps_attempts ... ok"),
+        "and so is what it printed: {report}"
+    );
+}
+
+/// A tick against a number the current plan no longer holds is the case the
+/// journal exists for — a plan rewritten mid-execution. Printing it beside the
+/// others without a word would read as a task that vanished from the list.
+#[test]
+fn a_tick_from_a_replaced_plan_is_marked_as_such() {
+    let world = World::new();
+    world.plan_a_change(
+        "retry-budget",
+        "Retries have no ceiling and can loop forever.",
+        &[("1", "Write the failing test")],
+    );
+    world.journal_a_tick("9", "cargo test old", "test old_shape ... ok\n");
+
+    let (ok, report) = world.changes(&["retry-budget"]);
+
+    assert!(ok, "{report}");
+    assert!(
+        report.contains("cargo test old"),
+        "a tick outlives its task, so it is still printed: {report}"
+    );
+    assert!(
+        report.to_lowercase().contains("not in the current plan"),
+        "a tick whose task the plan no longer holds has to say so: {report}"
     );
 }

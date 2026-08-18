@@ -209,6 +209,72 @@ fn write_detail(detail: &ChangeDetail, out: &mut String) {
             task.number, task.status, task.title,
         );
     }
+
+    push_journal(out, detail);
+}
+
+/// What the plan has already proved, under the plan itself.
+///
+/// Beneath the tasks rather than beside them, because the two answer different
+/// questions and a reader is usually asking the first: the task list is what is
+/// left to do, and the journal is what was done. Silent when there is nothing —
+/// a heading with nothing under it is the defect this project has already been
+/// caught printing once.
+///
+/// The output is quoted rather than characterised, and truncated to its last
+/// line rather than summarised: what makes a tick checkable is that a reader
+/// other than its author can see what the command actually printed, and a
+/// terminal that had to scroll a full test run to reach the next task would be
+/// paying for that in the one place it cannot afford to.
+fn push_journal(out: &mut String, detail: &ChangeDetail) {
+    if detail.ticks.is_empty() {
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "\nproved  {} {}",
+        detail.ticks.len(),
+        if detail.ticks.len() == 1 {
+            "tick"
+        } else {
+            "ticks"
+        }
+    );
+
+    for tick in &detail.ticks {
+        let orphan = if tick.in_current_plan {
+            ""
+        } else {
+            "  (not in the current plan)"
+        };
+        let _ = writeln!(
+            out,
+            "  {}  {}{}",
+            tick.number,
+            tick.verify_command.trim(),
+            orphan
+        );
+
+        // The last non-blank line: a verify command's verdict is what it prints
+        // last, and the lines above it are the run rather than the result.
+        if let Some(verdict) = tick
+            .output
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+        {
+            let _ = writeln!(out, "        {}", verdict.trim());
+        }
+
+        if !tick.expected_output_missing.is_empty() {
+            let _ = writeln!(
+                out,
+                "        missing: {}",
+                tick.expected_output_missing.join(", ")
+            );
+        }
+    }
 }
 
 /// Turns a reference into an identifier, the way the MCP tool does: a UUID is
