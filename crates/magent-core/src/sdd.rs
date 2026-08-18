@@ -350,7 +350,10 @@ pub struct TaskDraft {
     /// genuinely done. A list rather than one line, because a plan writes it
     /// before the work and a whole line of prose never survives the run
     /// verbatim — the short, invariant fragments of it do.
-    #[serde(default)]
+    ///
+    /// Required, and no `serde(default)`: the store refuses a task that names
+    /// no marker, so a schema letting a planner leave the field out would only
+    /// send it to argue with the wrong layer.
     pub expected_output: Vec<String>,
     /// Names of the requirements this task implements. Exists so "which
     /// requirement has no task covering it" is a query against this field,
@@ -527,13 +530,20 @@ impl Validate for TaskDone {
 pub struct TaskClosed {
     /// The task that was closed, as the plan numbered it.
     pub number: String,
-    /// Whether the plan's `expected_output` occurs in the output supplied.
+    /// Those of the plan's `expected_output` markers the output does not
+    /// carry. Empty when the run printed everything the plan named.
     ///
     /// Reported and never enforced. `expected_output` is written while the
     /// plan is being drafted, before anyone has run the command, so a tick
     /// that does not match it is still the record of what happened — and
     /// refusing it would leave the task open with the work already done.
-    pub expected_output_found: bool,
+    ///
+    /// A list rather than a flag, because "the tick disagrees with its plan
+    /// somewhere" is not something a reader can act on. Naming the marker that
+    /// went missing separates a test that was renamed — one marker gone, the
+    /// rest printed — from a run that genuinely failed, and a boolean reports
+    /// both as the same `false`.
+    pub expected_output_missing: Vec<String>,
     /// Whether this tick left the change with no open task.
     ///
     /// True when no task of the plan is open once this tick has landed, which

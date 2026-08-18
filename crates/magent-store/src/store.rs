@@ -910,8 +910,10 @@ fn write_binding(
 /// checked. The output is stored as it came — trimming or summarising it would
 /// edit the one part of a tick a later reader can judge for themselves — and
 /// `expected_output` is compared only to report the comparison, because the
-/// plan wrote that string before the work was done and refusing a tick over it
-/// would stop correct work.
+/// plan wrote those markers before the work was done and refusing a tick over
+/// them would stop correct work. What comes back is the markers the output does
+/// not carry, not a verdict on the pair: a reader who can see which marker went
+/// missing can tell a renamed test from a run that genuinely failed.
 ///
 /// A tick that leaves no task open moves the change to `ready` in the same
 /// transaction: that is what `0009_tasks.sql` means by a change reaching `ready`
@@ -985,9 +987,10 @@ fn close_task(
     // than part of what it claims; the output keeps every character of its own,
     // being quoted evidence.
     let markers: Vec<String> = serde_json::from_str(&expected_output_json)?;
-    let expected_output_found = markers
-        .iter()
-        .all(|marker| done.output.contains(marker.trim()));
+    let expected_output_missing: Vec<String> = markers
+        .into_iter()
+        .filter(|marker| !done.output.contains(marker.trim()))
+        .collect();
 
     tx.execute(
         "UPDATE tasks SET status = 'done', evidence = ?1, verified_at = ?2, updated_at = ?3
@@ -999,7 +1002,7 @@ fn close_task(
 
     Ok(TaskClosed {
         number: done.number.clone(),
-        expected_output_found,
+        expected_output_missing,
         change_ready,
     })
 }

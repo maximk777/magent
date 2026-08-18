@@ -9,8 +9,9 @@
 //! will build on regardless.
 //!
 //! What the command printed is recorded exactly as it came, and the plan's
-//! `expected_output` is only *reported* on. That string is written before the
-//! work is done, so refusing a tick over it would stop correct work.
+//! `expected_output` markers are only *reported* on: the tick names the ones
+//! the output does not carry. They are written before the work is done, so
+//! refusing a tick over them would stop correct work.
 
 use magent_core::{
     ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, CheckpointResult,
@@ -73,6 +74,13 @@ impl Fixture {
     /// (`0009_tasks.sql`), and a fixture whose numbers are all single digits
     /// would pass whether or not the number is carried as written.
     fn planned_change(&self) -> ChangeId {
+        self.planned_change_expecting(&[EXPECTED])
+    }
+
+    /// The same change, with the markers task "1.3" is planned to expect
+    /// handed in — so a test can plan more than one of them and read back
+    /// which ones the tick did not find.
+    fn planned_change_expecting(&self, markers: &[&str]) -> ChangeId {
         let change = self
             .store
             .propose(
@@ -126,7 +134,10 @@ impl Fixture {
                 &PlanCommand {
                     operation_id: OperationId::new(),
                     change,
-                    tasks: vec![task("1.3", &[REQUIREMENT]), task("2", &[])],
+                    tasks: vec![
+                        task("1.3", &[REQUIREMENT], markers),
+                        task("2", &[], &[EXPECTED]),
+                    ],
                 },
                 &self.context,
             )
@@ -265,7 +276,7 @@ fn row_count(connection: &Connection, table: &str) -> i64 {
         .expect("count")
 }
 
-fn task(number: &str, covers: &[&str]) -> TaskDraft {
+fn task(number: &str, covers: &[&str], markers: &[&str]) -> TaskDraft {
     TaskDraft {
         number: number.into(),
         title: format!("Cap the retry loop, step {number}"),
@@ -274,7 +285,7 @@ fn task(number: &str, covers: &[&str]) -> TaskDraft {
         consumes: None,
         produces: Some("fn spend_budget(&mut self) -> bool".into()),
         verify_command: VERIFY.into(),
-        expected_output: vec![EXPECTED.into()],
+        expected_output: markers.iter().map(|marker| (*marker).to_string()).collect(),
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
     }
 }
@@ -302,7 +313,7 @@ fn task_closes_with_its_evidence() {
     let closed = result.task.expect("the checkpoint closed a task");
     assert_eq!(closed.number, "1.3");
     assert!(
-        closed.expected_output_found,
+        closed.expected_output_missing.is_empty(),
         "the plan's expected_output is in this output"
     );
     assert!(
@@ -348,14 +359,88 @@ fn evidence_is_recorded_even_when_the_output_differs() {
         .expect("checkpoint");
 
     let closed = result.task.expect("the checkpoint closed a task");
-    assert!(
-        !closed.expected_output_found,
+    assert_eq!(
+        closed.expected_output_missing,
+        [EXPECTED],
         "{EXPECTED:?} does not appear in {output:?}"
     );
 
     let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
     assert_eq!(status, "done", "the task closes either way");
     assert_eq!(evidence.as_deref(), Some(output));
+    assert!(verified_at.is_some());
+}
+
+/// Which markers were missed, rather than that something was.
+///
+/// A boolean says only that the tick and its plan disagree somewhere, and a
+/// reader of that cannot tell a renamed test from a run that genuinely failed.
+/// Naming the marker the output does not carry makes the difference readable:
+/// here the suite passed and the count moved, and only the count is reported.
+#[test]
+fn a_tick_names_the_markers_it_did_not_find() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change_expecting(&["test result: ok", "7 passed"]);
+    let (run_id, session_id) = fixture.bound_run();
+
+    let output = format!("running 3 tests\n...\n{EXPECTED}; finished in 0.42s\n");
+    let result = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: output.clone(),
+            },
+        )
+        .expect("checkpoint");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert_eq!(
+        closed.expected_output_missing,
+        ["7 passed"],
+        "the suite passed, so only the count is missing from {output:?}"
+    );
+
+    let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
+    assert_eq!(status, "done", "the task closes either way");
+    assert_eq!(evidence.as_deref(), Some(output.as_str()));
+    assert!(verified_at.is_some());
+}
+
+/// The empty list is the good news, and it is the same list: a caller reads
+/// one field either way rather than a flag it has to pair with a reason.
+#[test]
+fn a_tick_that_matches_every_marker_reports_none() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change_expecting(&["test result: ok", "7 passed"]);
+    let (run_id, session_id) = fixture.bound_run();
+
+    let output = "running 7 tests\n...\ntest result: ok. 7 passed; finished in 0.42s\n";
+    let result = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "1.3".into(),
+                verify_command: VERIFY.into(),
+                output: output.into(),
+            },
+        )
+        .expect("checkpoint");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert!(
+        closed.expected_output_missing.is_empty(),
+        "every marker the plan named is in {output:?}, and {:?} says otherwise",
+        closed.expected_output_missing
+    );
+
+    let (status, _, verified_at) = fixture.task_row(change, "1.3");
+    assert_eq!(status, "done");
     assert!(verified_at.is_some());
 }
 

@@ -1845,6 +1845,42 @@ async fn the_plan_and_archive_schemas_ask_for_only_what_they_need() {
     client.cancel().await.expect("shutdown");
 }
 
+/// What a task cannot be planned without, read off the schema a planner is
+/// handed rather than off the refusal it would otherwise meet. `expected_output`
+/// belongs there: `Store::plan` turns away a task that names no marker, and a
+/// schema advertising the field as optional would send a planner to argue with
+/// the wrong layer. The list is asserted whole, because a field quietly leaving
+/// it is the same mistake in the other direction.
+#[tokio::test]
+async fn the_plan_schema_asks_every_task_for_its_expected_output() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let tools = client.list_all_tools().await.expect("tools");
+    let plan = tools
+        .iter()
+        .find(|tool| tool.name == "magent_plan")
+        .expect("magent_plan");
+    let root = Value::Object(plan.input_schema.as_ref().clone());
+
+    let tasks = resolve_schema(&root, &root["properties"]["tasks"]);
+    let draft = resolve_schema(&root, &tasks["items"]);
+    let mut required: Vec<&str> = draft["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a task requires nothing: {draft}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    required.sort_unstable();
+
+    assert_eq!(
+        required,
+        ["expected_output", "number", "title", "verify_command"],
+        "a task the schema lets a planner send incomplete: {draft}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
 /// Reading never mutates, so there is nothing for an `operation_id` to make
 /// idempotent — and asking for one would imply the call changes something.
 #[tokio::test]
@@ -2185,8 +2221,8 @@ async fn a_tick_over_mcp_closes_the_task() {
         "the tick closed nothing: {saved}"
     );
     assert_eq!(
-        task["expected_output_found"].as_bool(),
-        Some(true),
+        task["expected_output_missing"].as_array(),
+        Some(&vec![]),
         "the plan expected that line and the output carries it: {saved}"
     );
     assert_eq!(
@@ -2378,7 +2414,11 @@ async fn the_whole_loop_closes() {
         }),
     )
     .await;
-    assert_eq!(first["task"]["expected_output_found"].as_bool(), Some(true));
+    assert_eq!(
+        first["task"]["expected_output_missing"].as_array(),
+        Some(&vec![]),
+        "the plan expected that line and the output carries it: {first}"
+    );
     assert_eq!(
         first["task"]["change_ready"].as_bool(),
         Some(false),
