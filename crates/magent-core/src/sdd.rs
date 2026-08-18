@@ -81,7 +81,11 @@ pub enum DeltaOp {
 /// columns are `when_text`/`then_text` because `when` and `then` are
 /// reserved there. The mismatch is deliberate, and mapping between the two
 /// is the store's job, not this one's.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// `Eq` as well as `PartialEq`, unlike the drafts around it: this is the type
+/// the store hands back when a change is read for review, and the structs that
+/// carry it there are compared whole.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ScenarioDraft {
     pub name: String,
     #[serde(default)]

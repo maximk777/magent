@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use magent_core::{
     ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, ProposeCommand,
-    RequirementDraft, SpecifyCommand, Validate,
+    RequirementDraft, ScenarioDraft, SpecifyCommand, Validate,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -155,17 +155,43 @@ pub struct ChangeSummary {
     pub tasks_closed: usize,
 }
 
-/// One delta as [`Store::change_detail`] shows it.
+/// One delta as [`Store::change_detail`] shows it: what it does, and what it
+/// says.
 ///
-/// Only what a caller re-reading its own change needs to see where things
-/// stand: `requirement_id`, `text`, `reason`, `migration` and the scenarios
-/// stay in the database, because a caller asking this question already wrote
-/// them and is not asking for them back.
+/// It carried the three identifying fields alone until a reviewer was
+/// dispatched to check a change through this method and found it could not see
+/// what it was reviewing — the caller is not always the author, and by the time
+/// a change is worth reviewing its author has usually lost the text to a
+/// compaction too.
+///
+/// Every field the delta may carry, and `None` wherever the operation does not
+/// carry one: a removal has no `text`, an addition no `reason`. Nothing is
+/// invented to fill a shape — a null here says the delta really is silent on
+/// that, which is what a reviewer needs to know.
+///
+/// `requirement_id` stays in the database. It is the one field that addresses a
+/// row rather than describing the proposal, and reading a change back is not
+/// how a caller should be finding requirement ids to patch.
+///
+/// [`ScenarioDraft`] rather than [`LiveScenario`], the distinction that type's
+/// comment draws: these are what a change proposed, not what shipped.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeltaSummary {
     pub op: DeltaOp,
     pub name: String,
     pub capability_path: String,
+    /// The requirement's text as this change writes it — `added` and
+    /// `modified` carry one, the other two do not.
+    pub text: Option<String>,
+    /// The new name a `renamed` delta proposes.
+    pub rename_to: Option<String>,
+    /// Why a `removed` delta retires the requirement.
+    pub reason: Option<String>,
+    /// What to do instead, for the same.
+    pub migration: Option<String>,
+    /// In `seq` order — the order `specify` received them, which
+    /// `delta_scenarios` keeps. Empty where the delta proposed none.
+    pub scenarios: Vec<ScenarioDraft>,
 }
 
 /// One task as [`Store::change_detail`] shows it.
@@ -1919,11 +1945,23 @@ fn load_proposal_document(
     Ok(serde_json::from_str(&body_json)?)
 }
 
-/// One row of `spec_deltas`, as [`Store::change_detail`] shows it.
+/// One row of `spec_deltas`, as [`Store::change_detail`] shows it, plus the id
+/// its scenarios hang off.
+///
+/// Named fields rather than a positional tuple for the reason
+/// [`LiveRequirementRow`] gives: `name`, `text`, `rename_to`, `reason` and
+/// `migration` are five adjacent nullable `TEXT` columns, and a reordered
+/// `SELECT` would file a removal's reason as its text without anything failing
+/// to compile.
 struct DeltaSummaryRow {
+    id: String,
     op: String,
     name: String,
     capability_path: String,
+    text: Option<String>,
+    rename_to: Option<String>,
+    reason: Option<String>,
+    migration: Option<String>,
 }
 
 /// The change's deltas, oldest first — the same ordering [`load_deltas`]
@@ -1934,18 +1972,26 @@ fn load_delta_summaries(
     change_id: &str,
 ) -> Result<Vec<DeltaSummary>, StoreError> {
     let mut statement = tx.prepare(
-        "SELECT op, name, capability_path FROM spec_deltas
+        "SELECT id, op, name, capability_path, text, rename_to, reason, migration
+         FROM spec_deltas
          WHERE change_id = ?1 ORDER BY created_at, name",
     )?;
     let rows = statement
         .query_map([change_id], |row| {
             Ok(DeltaSummaryRow {
-                op: row.get(0)?,
-                name: row.get(1)?,
-                capability_path: row.get(2)?,
+                id: row.get(0)?,
+                op: row.get(1)?,
+                name: row.get(2)?,
+                capability_path: row.get(3)?,
+                text: row.get(4)?,
+                rename_to: row.get(5)?,
+                reason: row.get(6)?,
+                migration: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+
+    let mut scenarios = load_delta_scenarios(tx, change_id)?;
 
     rows.into_iter()
         .map(|row| {
@@ -1953,9 +1999,58 @@ fn load_delta_summaries(
                 op: enum_from_sql(&row.op)?,
                 name: row.name,
                 capability_path: row.capability_path,
+                text: row.text,
+                rename_to: row.rename_to,
+                reason: row.reason,
+                migration: row.migration,
+                // Absent rather than refused, for the reason
+                // `load_live_requirements` gives: a `removed` or `renamed`
+                // delta writes no scenarios at all, so an empty list is the
+                // ordinary answer here rather than a row that went missing.
+                scenarios: scenarios.remove(&row.id).unwrap_or_default(),
             })
         })
         .collect()
+}
+
+/// Every scenario of the change's deltas, by delta id.
+///
+/// One query for the whole change rather than one per delta — the same shape
+/// `load_live_scenarios` uses, and for the same reason. Ordered by `seq` alone:
+/// what a reader compares is the scenarios of one delta against each other, and
+/// rows that arrive in ascending `seq` land in their group in that order.
+fn load_delta_scenarios(
+    tx: &Transaction<'_>,
+    change_id: &str,
+) -> Result<HashMap<String, Vec<ScenarioDraft>>, StoreError> {
+    let mut statement = tx.prepare(
+        "SELECT delta_scenarios.delta_id, delta_scenarios.name,
+                delta_scenarios.given_text, delta_scenarios.when_text,
+                delta_scenarios.then_text
+         FROM delta_scenarios
+         JOIN spec_deltas ON spec_deltas.id = delta_scenarios.delta_id
+         WHERE spec_deltas.change_id = ?1
+         ORDER BY delta_scenarios.seq",
+    )?;
+    let rows = statement
+        .query_map([change_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                ScenarioDraft {
+                    name: row.get(1)?,
+                    given: row.get(2)?,
+                    when: row.get(3)?,
+                    then: row.get(4)?,
+                },
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut grouped: HashMap<String, Vec<ScenarioDraft>> = HashMap::new();
+    for (delta_id, scenario) in rows {
+        grouped.entry(delta_id).or_default().push(scenario);
+    }
+    Ok(grouped)
 }
 
 /// One row of `tasks`, as [`Store::change_detail`] shows it.

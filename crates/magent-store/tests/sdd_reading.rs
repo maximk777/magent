@@ -77,6 +77,38 @@ impl Fixture {
     /// `tasks`, because that is the only thing that moves a change to `ready`
     /// and `archive` refuses one whose tasks are still open.
     fn archived_change(&self) -> ChangeId {
+        let change = self.specified_change();
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![task("Cap the retry loop", &[BUDGET, ATTEMPT])],
+                },
+                &self.context,
+            )
+            .expect("plan");
+
+        self.close_the_task(SLUG);
+
+        self.store
+            .archive(
+                &ArchiveCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                },
+                &self.context,
+            )
+            .expect("archive");
+
+        change
+    }
+
+    /// The same change stopped at `specified`: proposed, and its two additions
+    /// attached. This is the state a spec review reads it in — the deltas are
+    /// written, and nothing has folded them into the live base yet.
+    fn specified_change(&self) -> ChangeId {
         let change = self
             .store
             .propose(
@@ -151,29 +183,6 @@ impl Fixture {
             )
             .expect("specify");
 
-        self.store
-            .plan(
-                &PlanCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                    tasks: vec![task("Cap the retry loop", &[BUDGET, ATTEMPT])],
-                },
-                &self.context,
-            )
-            .expect("plan");
-
-        self.close_the_task(SLUG);
-
-        self.store
-            .archive(
-                &ArchiveCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                },
-                &self.context,
-            )
-            .expect("archive");
-
         change
     }
 
@@ -245,7 +254,10 @@ impl Fixture {
     /// to `removed` and leaves it, and its scenarios, exactly where they are —
     /// `0007_sdd.sql` keeps them as the record of the decision. Nothing but the
     /// `status = 'live'` filter separates a retired requirement from a live one.
-    fn retire(&self, name: &str) {
+    ///
+    /// Hands the change back so a test can read the removal delta itself, not
+    /// only its effect on the live base.
+    fn retire(&self, name: &str) -> ChangeId {
         let requirement_id = self.live_requirement_id(name);
 
         let change = self
@@ -313,6 +325,8 @@ impl Fixture {
                 &self.context,
             )
             .expect("archive");
+
+        change
     }
 
     /// The id of a live requirement, read straight off the row.
@@ -511,5 +525,115 @@ fn an_unknown_capability_reads_as_none() {
     assert!(
         detail.is_none(),
         "nothing has archived worker/backoff: {detail:?}"
+    );
+}
+
+/// The gap writing this change's own proposal ran into: a reviewer dispatched
+/// to check a change reads it through `change_detail`, and until now that
+/// answered with the names of the requirements and nothing else — so the review
+/// was of a list of titles, against a specification the reviewer could not see.
+#[test]
+fn a_specified_change_reads_back_its_requirements() {
+    let fixture = Fixture::new();
+    let change = fixture.specified_change();
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    assert_eq!(detail.deltas.len(), 2, "{:?}", detail.deltas);
+
+    // `created_at` then `name`, the order `load_deltas` applies them in, which
+    // puts the requirement specified second first.
+    let attempt = &detail.deltas[0];
+    assert_eq!(attempt.name, ATTEMPT);
+    assert_eq!(attempt.op, DeltaOp::Added);
+    assert_eq!(
+        attempt.text.as_deref(),
+        Some(ATTEMPT_TEXT),
+        "the name without the text is not something anyone can review"
+    );
+    assert_eq!(attempt.rename_to, None);
+    assert_eq!(attempt.reason, None);
+    assert_eq!(attempt.migration, None);
+
+    let budget = &detail.deltas[1];
+    assert_eq!(budget.name, BUDGET);
+    assert_eq!(budget.text.as_deref(), Some(BUDGET_TEXT));
+
+    let scenarios: Vec<(&str, Option<&str>, &str, &str)> = budget
+        .scenarios
+        .iter()
+        .map(|scenario| {
+            (
+                scenario.name.as_str(),
+                scenario.given.as_deref(),
+                scenario.when.as_str(),
+                scenario.then.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        scenarios,
+        vec![
+            (
+                "budget exhausted",
+                None,
+                "the budget is exhausted",
+                "the job is parked"
+            ),
+            (
+                "a fresh job",
+                Some("a job with a full budget"),
+                "an attempt fails",
+                "the worker retries"
+            ),
+        ],
+        "a delta's scenarios come back in the sequence it wrote them, with \
+         `given` where there was one"
+    );
+    assert_eq!(
+        attempt.scenarios.len(),
+        1,
+        "each delta gets its own scenarios, not the other's: {:?}",
+        attempt.scenarios
+    );
+}
+
+/// A removal carries no text and never did — what it carries is why it is going
+/// and what to do instead, and those are the two things a reviewer of a removal
+/// has to read. A null `text` here is the honest answer, not a gap to fill in.
+#[test]
+fn a_removed_delta_reads_back_its_reason() {
+    let fixture = Fixture::new();
+    fixture.archived_change();
+    let change = fixture.retire(ATTEMPT);
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    assert_eq!(detail.deltas.len(), 1, "{:?}", detail.deltas);
+    let removal = &detail.deltas[0];
+
+    assert_eq!(removal.op, DeltaOp::Removed);
+    assert_eq!(removal.name, ATTEMPT);
+    assert_eq!(
+        removal.text, None,
+        "a removal proposes no text, and inventing one would be a lie"
+    );
+    assert_eq!(removal.reason.as_deref(), Some("The budget subsumes it."));
+    assert_eq!(
+        removal.migration.as_deref(),
+        Some("Set the budget to one for the old behaviour.")
+    );
+    assert!(
+        removal.scenarios.is_empty(),
+        "a removal writes no scenarios: {:?}",
+        removal.scenarios
     );
 }
