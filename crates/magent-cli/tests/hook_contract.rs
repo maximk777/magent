@@ -668,6 +668,159 @@ fn the_index_is_not_pushed_twice_in_one_session() {
     );
 }
 
+// --- the unrecorded-reasoning notice ----------------------------------------
+
+/// Reasoning is the one thing hooks cannot capture, and asking the model to
+/// judge when its own work became non-trivial is what failed on the real
+/// profile: six of nine sessions that edited a file left no reasoning at all.
+/// So the hook counts instead, and reports the count as a fact.
+#[test]
+fn a_run_with_work_and_no_reasoning_is_told_at_the_prompt() {
+    let fixture = Fixture::new();
+    let session = "n1";
+
+    // The first prompt is what opens the run the edits are attributed to.
+    assert!(
+        fixture
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&fixture, session, "rework the retry budget"),
+            )
+            .succeeded()
+    );
+    record_edits(&fixture, session, 12);
+
+    let run = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, session, "now wire it up"),
+    );
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        run.stdout.contains("12"),
+        "the notice must report the count it counted:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("magent_checkpoint"),
+        "the notice must name the tool that records reasoning:\n{}",
+        run.stdout
+    );
+}
+
+/// Below the threshold there is nothing to report. A notice on every short
+/// session would be the same tax the memory index is careful not to charge.
+#[test]
+fn a_short_run_is_not_told() {
+    let fixture = Fixture::new();
+    let session = "n2";
+
+    assert!(
+        fixture
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&fixture, session, "a small fix"),
+            )
+            .succeeded()
+    );
+    record_edits(&fixture, session, 3);
+
+    let run = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, session, "and one more"),
+    );
+
+    assert!(run.succeeded(), "stderr: {}", run.stderr);
+    assert!(
+        !run.stdout.contains("magent_checkpoint"),
+        "three edits is not a session that has forgotten to explain itself:\n{}",
+        run.stdout
+    );
+}
+
+/// Repeating it every prompt would turn a fact into nagging, and nagging is
+/// what gets tuned out.
+#[test]
+fn a_session_is_told_only_once() {
+    let fixture = Fixture::new();
+    let session = "n3";
+
+    assert!(
+        fixture
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&fixture, session, "port the parser"),
+            )
+            .succeeded()
+    );
+    record_edits(&fixture, session, 12);
+
+    let first = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, session, "keep going"),
+    );
+    assert!(
+        first.stdout.contains("magent_checkpoint"),
+        "{}",
+        first.stdout
+    );
+
+    let second = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, session, "keep going"),
+    );
+    assert!(
+        !second.stdout.contains("magent_checkpoint"),
+        "the session was told twice:\n{}",
+        second.stdout
+    );
+}
+
+/// The notice is subject to the same rule as everything else in this file:
+/// Magent being broken costs the user nothing.
+#[test]
+fn a_broken_store_still_answers_the_prompt() {
+    let fixture = Fixture::new();
+    let session = "n4";
+
+    assert!(
+        fixture
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&fixture, session, "rework the retry budget"),
+            )
+            .succeeded()
+    );
+    record_edits(&fixture, session, 12);
+
+    // The write-ahead log would otherwise carry the run past a corrupt header.
+    for sidecar in ["magent.db-wal", "magent.db-shm"] {
+        let _ = std::fs::remove_file(fixture.state_dir.join(sidecar));
+    }
+    std::fs::write(
+        fixture.state_dir.join("magent.db"),
+        b"this is definitely not a sqlite file",
+    )
+    .expect("corrupt the database");
+
+    let run = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, session, "now wire it up"),
+    );
+
+    assert!(
+        run.succeeded(),
+        "exited {:?}; hooks must never fail a session\n{}",
+        run.code,
+        run.stderr
+    );
+    assert!(
+        run.stdout.is_empty(),
+        "wrote to stdout while degraded: {:?}",
+        run.stdout
+    );
+}
+
 // --- the file ledger -------------------------------------------------------
 
 #[test]
@@ -936,6 +1089,23 @@ fn a_hook_running_inside_a_distillation_does_nothing() {
 fn with(mut value: Value, key: &str, entry: Value) -> Value {
     value[key] = entry;
     value
+}
+
+fn record_edits(fixture: &Fixture, session: &str, count: usize) {
+    for index in 0..count {
+        let mut input = fixture.base("PostToolUse", session);
+        input["tool_name"] = json!("Edit");
+        input["tool_input"] = json!({ "file_path": fixture.repo.join(format!("src/e{index}.rs")) });
+        assert!(fixture.hook("post-tool-use", &input).succeeded());
+    }
+}
+
+fn prompt_of(fixture: &Fixture, session: &str, text: &str) -> Value {
+    with(
+        fixture.base("UserPromptSubmit", session),
+        "prompt",
+        json!(text),
+    )
 }
 
 fn seed_run(fixture: &Fixture, task: &str) {

@@ -13,7 +13,7 @@ use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use magent_core::{FileLedgerEntry, HarnessKind};
+use magent_core::{FileLedgerEntry, HarnessKind, RunId};
 use magent_store::Store;
 use serde_json::Value;
 
@@ -25,6 +25,10 @@ const LEDGER_LIMIT: usize = 200;
 /// Facts named per prompt. Small deliberately: this is paid for on every turn,
 /// and a long list gets skimmed rather than used.
 const INDEX_LIMIT: usize = 5;
+
+/// The notice kind claimed for the unrecorded-reasoning report, named once so
+/// the store's ledger of what a session has been told and this hook agree.
+const REASONING_NOTICE: &str = "unrecorded_reasoning";
 
 /// Job kind for turning a transcript into reasoning.
 pub const ENRICH_JOB: &str = "enrich_checkpoint";
@@ -151,13 +155,46 @@ fn user_prompt_submit(
     let prompt = prompt_text(input).unwrap_or_else(|| "(untitled session)".to_owned());
     let binding = store.bind_session(session, cwd, &prompt, HarnessKind::ClaudeCode)?;
 
-    Ok(memory_index(
+    // The notice comes first: it is about how this session has been working,
+    // not about the subject it is working on.
+    let mut out = reasoning_notice(store, session, binding.run_id);
+    out.push_str(&memory_index(
         store,
         session,
         cwd,
         &prompt,
         binding.workspace_id,
-    ))
+    ));
+    Ok(out)
+}
+
+/// Reports work this run has done and never explained.
+///
+/// Reasoning is the one thing hooks cannot capture, and the instruction asking
+/// for it is self-assessed: non-triviality accumulates gradually, so there is
+/// no moment at which the model can be asked whether the work is non-trivial
+/// yet. So this counts instead, and states the count as a fact — it names the
+/// tool without saying when to reach for it, because asking for a judgement is
+/// exactly what failed.
+///
+/// Failure is swallowed, like the memory index: a prompt must never be held up.
+fn reasoning_notice(store: &Store, session: &str, run_id: RunId) -> String {
+    let Ok(Some(edits)) = store.unrecorded_reasoning(run_id) else {
+        return String::new();
+    };
+
+    // Claimed only once the condition holds, never before: a session still
+    // under the threshold would otherwise spend its one notice saying nothing,
+    // and by the time it had something to say the right would be gone.
+    let Ok(true) = store.claim_notice(session, REASONING_NOTICE) else {
+        return String::new();
+    };
+
+    format!(
+        "## Magent: {edits} file edits, no reasoning recorded\n\
+         Decisions, the alternatives you rejected and what you verified live only in\n\
+         this session. magent_checkpoint is what records them; the ledger and git do not.\n"
+    )
 }
 
 /// Names what memory holds that bears on this prompt.
