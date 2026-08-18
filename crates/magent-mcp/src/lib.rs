@@ -45,10 +45,10 @@ Call magent_start before non-trivial work. It opens or resumes a run and returns
 any earlier checkpoint. Pass resume_run_id when continuing a run named in \
 restored context.
 
-Call magent_checkpoint at stage boundaries, after a significant decision, and \
-before handing work over. Record what only you know: decisions and the \
+Call magent_checkpoint to record what only you know: decisions, the \
 alternatives you rejected, what you verified and how. File edits are captured \
-automatically, so do not restate them.
+automatically, so do not restate them. You will be told when edits have \
+accumulated with no reasoning recorded.
 
 Call magent_finish with close_session when stepping away, or complete_run when \
 the task is done and verified. Closing a session does not finish the task.
