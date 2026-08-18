@@ -194,11 +194,19 @@ pub struct DeltaSummary {
     pub scenarios: Vec<ScenarioDraft>,
 }
 
-/// One task as [`Store::change_detail`] shows it.
+/// One task as [`Store::change_detail`] shows it: the whole row a plan wrote,
+/// and the evidence a closed one carries.
 ///
-/// `body`, `consumes`/`produces` and the evidence a finished task carries stay
-/// in the database: those are what an agent executing *that* task reads from
-/// its own row, not what a caller asking "where did this change get to" needs.
+/// It held the four identifying fields alone, and that made
+/// [`magent_core::TaskDraft`]'s own contract unreachable. `body`, `consumes`
+/// and `produces` exist because the agent executing one task sees its own task
+/// and nothing around it — so the only way to hand them over was for an
+/// orchestrator to keep them in context, which is precisely what a compaction
+/// takes away. They were written by `plan` and read by nothing.
+///
+/// `covers` is still left out: it answers "which requirement has no task", a
+/// question about the plan as a whole, and no executor needs it to do its own
+/// task.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskSummary {
     pub number: String,
@@ -208,6 +216,25 @@ pub struct TaskSummary {
     /// enum `magent-core` does not define for tasks.
     pub status: String,
     pub verify_command: String,
+    /// What the plan says the task is, at whatever length it took.
+    pub body: Option<String>,
+    /// The files the plan expects the work to touch, as the list `plan` was
+    /// given rather than the JSON `files_json` stores it as: a caller that had
+    /// to parse that string would be doing this module's job.
+    pub files: Vec<String>,
+    /// The names and signatures the task before this one promised, and what
+    /// the next task is waiting on this one to produce.
+    pub consumes: Option<String>,
+    pub produces: Option<String>,
+    /// What `verify_command` should print, which is half of the instruction —
+    /// a command with no stated result is one an executor cannot judge.
+    pub expected_output: String,
+    /// What that command actually printed when the task was closed, kept as it
+    /// came. `None` until a tick lands.
+    pub evidence: Option<String>,
+    /// When that evidence was taken. Written with `evidence` and never without
+    /// it (`0009_tasks.sql`), so a reader auditing a tick has both or neither.
+    pub verified_at: Option<DateTime<Utc>>,
 }
 
 /// The full content of one change: [`ChangeSummary`]'s fields, the proposal's
@@ -2054,11 +2081,24 @@ fn load_delta_scenarios(
 }
 
 /// One row of `tasks`, as [`Store::change_detail`] shows it.
+///
+/// Named fields rather than a positional tuple, for the reason
+/// [`LiveRequirementRow`] gives and more so here: `body`, `consumes`,
+/// `produces` and `evidence` are four nullable `TEXT` columns in a row of
+/// eleven, and a `SELECT` reordered by a later hand would hand an executor the
+/// previous task's promise as its own body without anything failing to compile.
 struct TaskSummaryRow {
     number: String,
     title: String,
     status: String,
     verify_command: String,
+    body: Option<String>,
+    files_json: String,
+    consumes: Option<String>,
+    produces: Option<String>,
+    expected_output: String,
+    evidence: Option<String>,
+    verified_at: Option<String>,
 }
 
 /// The change's tasks, sorted lexicographically by number — the same `ORDER BY`
@@ -2069,7 +2109,9 @@ fn load_task_summaries(
     change_id: &str,
 ) -> Result<Vec<TaskSummary>, StoreError> {
     let mut statement = tx.prepare(
-        "SELECT number, title, status, verify_command FROM tasks
+        "SELECT number, title, status, verify_command, body, files_json, consumes,
+                produces, expected_output, evidence, verified_at
+         FROM tasks
          WHERE change_id = ?1 ORDER BY number",
     )?;
     let rows = statement
@@ -2079,19 +2121,42 @@ fn load_task_summaries(
                 title: row.get(1)?,
                 status: row.get(2)?,
                 verify_command: row.get(3)?,
+                body: row.get(4)?,
+                files_json: row.get(5)?,
+                consumes: row.get(6)?,
+                produces: row.get(7)?,
+                expected_output: row.get(8)?,
+                evidence: row.get(9)?,
+                verified_at: row.get(10)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(rows
-        .into_iter()
-        .map(|row| TaskSummary {
-            number: row.number,
-            title: row.title,
-            status: row.status,
-            verify_command: row.verify_command,
+    rows.into_iter()
+        .map(|row| {
+            Ok(TaskSummary {
+                number: row.number,
+                title: row.title,
+                status: row.status,
+                verify_command: row.verify_command,
+                body: row.body,
+                // Parsed rather than defaulted on a failure: `plan` writes this
+                // column with `serde_json`, so anything unparseable is a row
+                // this crate did not write, and reporting a task with no files
+                // would hide that from the one caller who could act on it.
+                files: serde_json::from_str(&row.files_json)?,
+                consumes: row.consumes,
+                produces: row.produces,
+                expected_output: row.expected_output,
+                evidence: row.evidence,
+                verified_at: row
+                    .verified_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// One row of `requirements`, as [`Store::capability_detail`] shows it, plus

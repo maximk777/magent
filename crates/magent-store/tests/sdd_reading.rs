@@ -31,6 +31,12 @@ const ATTEMPT_TEXT: &str = "The worker SHALL spend one unit of the budget per at
 const VERIFY: &str = "cargo test -p worker retry";
 const EXPECTED: &str = "test result: ok. 3 passed";
 
+/// What the plan tells the agent executing its one task — the fields that exist
+/// precisely because that agent sees its own row and nothing around it.
+const BODY: &str = "Read the budget from config and spend it per attempt.";
+const CONSUMES: &str = "struct RetryConfig, from the task before this one";
+const PRODUCES: &str = "fn spend_budget(&mut self) -> bool";
+
 /// Long enough to clear `magent-core`'s 50-character floor on a purpose.
 const PURPOSE: &str = "Retrying work that failed for a reason that may not repeat, without \
                        hammering a service that is already struggling.";
@@ -77,18 +83,7 @@ impl Fixture {
     /// `tasks`, because that is the only thing that moves a change to `ready`
     /// and `archive` refuses one whose tasks are still open.
     fn archived_change(&self) -> ChangeId {
-        let change = self.specified_change();
-
-        self.store
-            .plan(
-                &PlanCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                    tasks: vec![task("Cap the retry loop", &[BUDGET, ATTEMPT])],
-                },
-                &self.context,
-            )
-            .expect("plan");
+        let change = self.planned_change();
 
         self.close_the_task(SLUG);
 
@@ -101,6 +96,25 @@ impl Fixture {
                 &self.context,
             )
             .expect("archive");
+
+        change
+    }
+
+    /// The same change stopped at `planned`: its one task is written and still
+    /// `pending`, which is the state the agent about to execute it reads it in.
+    fn planned_change(&self) -> ChangeId {
+        let change = self.specified_change();
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![task("Cap the retry loop", &[BUDGET, ATTEMPT])],
+                },
+                &self.context,
+            )
+            .expect("plan");
 
         change
     }
@@ -358,10 +372,15 @@ fn task(title: &str, covers: &[&str]) -> TaskDraft {
     TaskDraft {
         number: "1".into(),
         title: title.into(),
-        body: Some("Read the budget from config and spend it per attempt.".into()),
-        files: vec!["crates/worker/src/retry.rs".into()],
-        consumes: None,
-        produces: Some("fn spend_budget(&mut self) -> bool".into()),
+        body: Some(BODY.into()),
+        // Two, because one file reads the same whether the loader returns the
+        // list or only its first element.
+        files: vec![
+            "crates/worker/src/retry.rs".into(),
+            "crates/worker/src/config.rs".into(),
+        ],
+        consumes: Some(CONSUMES.into()),
+        produces: Some(PRODUCES.into()),
         verify_command: VERIFY.into(),
         expected_output: EXPECTED.into(),
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
@@ -635,5 +654,80 @@ fn a_removed_delta_reads_back_its_reason() {
         removal.scenarios.is_empty(),
         "a removal writes no scenarios: {:?}",
         removal.scenarios
+    );
+}
+
+/// `TaskDraft.body`, `consumes` and `produces` exist because the agent
+/// executing one task sees its own row and nothing around it — and until this
+/// read them back, the only way that agent could be handed them was for an
+/// orchestrator to hold them in context, which is exactly what a compaction
+/// takes away.
+#[test]
+fn a_planned_task_reads_back_whole() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    assert_eq!(detail.tasks.len(), 1, "{:?}", detail.tasks);
+    let task = &detail.tasks[0];
+
+    assert_eq!(task.number, "1");
+    assert_eq!(task.title, "Cap the retry loop");
+    assert_eq!(task.status, "pending");
+    assert_eq!(task.body.as_deref(), Some(BODY));
+    assert_eq!(
+        task.files,
+        vec![
+            "crates/worker/src/retry.rs".to_string(),
+            "crates/worker/src/config.rs".to_string()
+        ],
+        "the files come back as the list the plan wrote, not as the JSON they are stored in"
+    );
+    assert_eq!(task.consumes.as_deref(), Some(CONSUMES));
+    assert_eq!(task.produces.as_deref(), Some(PRODUCES));
+    assert_eq!(task.verify_command, VERIFY);
+    assert_eq!(
+        task.expected_output, EXPECTED,
+        "the command without what it should print is half an instruction"
+    );
+
+    assert_eq!(
+        task.evidence, None,
+        "nothing has been run against this task yet"
+    );
+    assert_eq!(task.verified_at, None);
+}
+
+/// A tick is worth no more than the evidence under it, and evidence nobody can
+/// read is a checked box. Reading a closed task back with what its command
+/// printed, and when, is what makes auditing one possible instead of trusting
+/// the agent that ticked it.
+#[test]
+fn a_closed_task_carries_its_evidence() {
+    let fixture = Fixture::new();
+    let change = fixture.archived_change();
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("change detail")
+        .expect("the change is this workspace's");
+
+    let task = &detail.tasks[0];
+    assert_eq!(task.status, "done");
+
+    let evidence = task.evidence.as_deref().expect("the tick carried output");
+    assert!(
+        evidence.contains(EXPECTED),
+        "the output is kept as it came, not summarised: {evidence}"
+    );
+    assert!(
+        task.verified_at.is_some(),
+        "evidence and the moment it was taken land together"
     );
 }
