@@ -126,7 +126,7 @@ impl World {
                             consumes: None,
                             produces: None,
                             verify_command: "cargo test -p magent-cli".to_owned(),
-                            expected_output: "test result: ok".to_owned(),
+                            expected_output: vec!["test result: ok".to_owned()],
                             covers: Vec::new(),
                         })
                         .collect(),

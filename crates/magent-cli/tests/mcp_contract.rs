@@ -1799,7 +1799,7 @@ fn tasks(change: &str) -> Value {
             "number": "1",
             "title": "cap the attempts in the worker",
             "verify_command": "cargo test -p worker budget",
-            "expected_output": "test budget_caps_retries ... ok",
+            "expected_output": ["test budget_caps_retries ... ok"],
             "covers": ["budget-caps-retries"]
         }]
     })
@@ -2264,7 +2264,7 @@ fn loop_tasks() -> Value {
                 "files": ["crates/worker/src/retry.rs"],
                 "produces": "fn spend_budget(&mut self) -> bool",
                 "verify_command": "cargo test -p worker budget",
-                "expected_output": "test budget_caps_retries ... ok",
+                "expected_output": ["test budget_caps_retries ... ok"],
                 "covers": ["budget-caps-retries"]
             },
             {
@@ -2274,7 +2274,7 @@ fn loop_tasks() -> Value {
                 "files": ["crates/worker/src/attempt.rs"],
                 "consumes": "fn spend_budget(&mut self) -> bool, from task 1",
                 "verify_command": "cargo test -p worker attempt",
-                "expected_output": "test attempts_spend_the_budget ... ok",
+                "expected_output": ["test attempts_spend_the_budget ... ok"],
                 "covers": ["attempts-spend-the-budget"]
             }
         ]
@@ -2345,8 +2345,8 @@ async fn the_whole_loop_closes() {
         "{mid_flight}"
     );
     assert_eq!(
-        task_one["expected_output"].as_str(),
-        Some("test budget_caps_retries ... ok")
+        task_one["expected_output"],
+        json!(["test budget_caps_retries ... ok"])
     );
     assert_eq!(
         mid_flight["change"]["deltas"][0]["text"].as_str(),

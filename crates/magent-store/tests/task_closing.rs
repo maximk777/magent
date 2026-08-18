@@ -274,7 +274,7 @@ fn task(number: &str, covers: &[&str]) -> TaskDraft {
         consumes: None,
         produces: Some("fn spend_budget(&mut self) -> bool".into()),
         verify_command: VERIFY.into(),
-        expected_output: EXPECTED.into(),
+        expected_output: vec![EXPECTED.into()],
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
     }
 }

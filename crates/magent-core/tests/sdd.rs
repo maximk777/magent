@@ -56,7 +56,7 @@ fn valid_task() -> TaskDraft {
         consumes: None,
         produces: Some("RetryPolicy::budget".into()),
         verify_command: "cargo test -p worker retry_budget".into(),
-        expected_output: "test retry_budget ... ok".into(),
+        expected_output: vec!["test retry_budget ... ok".into()],
         covers: vec!["retry-budget-cap".into()],
     }
 }
@@ -563,7 +563,25 @@ fn a_task_title_verify_command_and_expected_output_must_not_be_blank() {
 
     let command = PlanCommand {
         tasks: vec![TaskDraft {
-            expected_output: "\n".into(),
+            expected_output: vec!["\n".into()],
+            ..valid_task()
+        }],
+        ..valid_plan()
+    };
+    assert_eq!(
+        command.validate().unwrap_err().code(),
+        "invalid_expected_output"
+    );
+}
+
+/// A task naming no marker at all is refused the same way a blank one is: a
+/// command whose output nothing is checked against is a command nobody can
+/// judge the result of.
+#[test]
+fn a_task_expected_output_must_name_at_least_one_marker() {
+    let command = PlanCommand {
+        tasks: vec![TaskDraft {
+            expected_output: Vec::new(),
             ..valid_task()
         }],
         ..valid_plan()
@@ -648,7 +666,7 @@ fn a_task_must_not_contain_placeholder_text() {
                     ..valid_task()
                 },
                 "expected_output" => TaskDraft {
-                    expected_output: format!("output ({mixed_case})"),
+                    expected_output: vec![format!("output ({mixed_case})")],
                     ..valid_task()
                 },
                 _ => unreachable!(),

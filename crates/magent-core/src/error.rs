@@ -97,7 +97,7 @@ pub enum DomainError {
     #[error("a task's verify_command must not be blank")]
     InvalidVerifyCommand,
 
-    #[error("a task's expected_output must not be blank")]
+    #[error("a task's expected_output must name at least one marker, and no marker may be blank")]
     InvalidExpectedOutput,
 
     /// The output is the whole point of a tick. A task closed with no record

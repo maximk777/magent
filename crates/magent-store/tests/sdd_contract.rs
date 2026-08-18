@@ -1291,7 +1291,7 @@ fn task(number: &str, covers: &[&str]) -> TaskDraft {
         consumes: None,
         produces: Some("fn spend_budget(&mut self) -> bool".into()),
         verify_command: "cargo test -p worker retry".into(),
-        expected_output: "test result: ok. 3 passed".into(),
+        expected_output: vec!["test result: ok".into(), "3 passed".into()],
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
     }
 }
@@ -1357,7 +1357,7 @@ fn plan_writes_the_tasks_and_moves_the_change_to_planned() {
     let raw = Connection::open(&path).expect("raw connection");
     assert_eq!(count(&raw, "tasks", "change_id", &change.to_string()), 2);
 
-    let (number, verify_command, expected_output, covers_json, status): (
+    let (number, verify_command, expected_output_json, covers_json, status): (
         String,
         String,
         String,
@@ -1365,7 +1365,7 @@ fn plan_writes_the_tasks_and_moves_the_change_to_planned() {
         String,
     ) = raw
         .query_row(
-            "SELECT number, verify_command, expected_output, covers_json, status
+            "SELECT number, verify_command, expected_output_json, covers_json, status
              FROM tasks WHERE change_id = ?1 AND number = '2.1'",
             [change.to_string()],
             |row| {
@@ -1381,7 +1381,7 @@ fn plan_writes_the_tasks_and_moves_the_change_to_planned() {
         .expect("task row");
     assert_eq!(number, "2.1");
     assert_eq!(verify_command, "cargo test -p worker retry");
-    assert_eq!(expected_output, "test result: ok. 3 passed");
+    assert_eq!(expected_output_json, r#"["test result: ok","3 passed"]"#);
     assert_eq!(status, "pending");
 
     let covers: Vec<String> = serde_json::from_str(&covers_json).expect("covers is json");

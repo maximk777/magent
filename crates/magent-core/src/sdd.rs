@@ -346,10 +346,12 @@ pub struct TaskDraft {
     /// Required: a task with no way to be checked is not a task, and the
     /// executing agent has no other way to know it is done.
     pub verify_command: String,
-    /// What `verify_command` should print when the task is genuinely done,
-    /// so its output can be compared against something rather than eyeballed
-    /// by whoever runs it.
-    pub expected_output: String,
+    /// The markers `verify_command`'s output should contain when the task is
+    /// genuinely done. A list rather than one line, because a plan writes it
+    /// before the work and a whole line of prose never survives the run
+    /// verbatim — the short, invariant fragments of it do.
+    #[serde(default)]
+    pub expected_output: Vec<String>,
     /// Names of the requirements this task implements. Exists so "which
     /// requirement has no task covering it" is a query against this field,
     /// not a self-grade the executing agent hands itself.
@@ -401,7 +403,12 @@ impl Validate for TaskDraft {
         if self.verify_command.trim().is_empty() {
             return Err(DomainError::InvalidVerifyCommand);
         }
-        if self.expected_output.trim().is_empty() {
+        if self.expected_output.is_empty()
+            || self
+                .expected_output
+                .iter()
+                .any(|marker| marker.trim().is_empty())
+        {
             return Err(DomainError::InvalidExpectedOutput);
         }
 
@@ -412,8 +419,16 @@ impl Validate for TaskDraft {
             ("title", Some(self.title.as_str())),
             ("body", self.body.as_deref()),
             ("verify_command", Some(self.verify_command.as_str())),
-            ("expected_output", Some(self.expected_output.as_str())),
-        ] {
+        ]
+        .into_iter()
+        // Every marker under the one field name: the plan wrote them as one
+        // field, and telling it which element of a list holds the stub would
+        // name a position it never numbered.
+        .chain(
+            self.expected_output
+                .iter()
+                .map(|marker| ("expected_output", Some(marker.as_str()))),
+        ) {
             if let Some(phrase) = text.and_then(placeholder_in) {
                 return Err(DomainError::PlaceholderTextInTask {
                     number: self.number.clone(),

@@ -89,7 +89,7 @@ impl Fixture {
                             consumes: None,
                             produces: None,
                             verify_command: VERIFY.into(),
-                            expected_output: "test result: ok".into(),
+                            expected_output: vec!["test result: ok".into()],
                             covers: vec![],
                         })
                         .collect(),

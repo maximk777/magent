@@ -954,13 +954,13 @@ fn close_task(
 
     let planned: Option<(String, String)> = tx
         .query_row(
-            "SELECT verify_command, expected_output FROM tasks
+            "SELECT verify_command, expected_output_json FROM tasks
              WHERE change_id = ?1 AND number = ?2",
             rusqlite::params![&change_id, &done.number],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some((verify_command, expected)) = planned else {
+    let Some((verify_command, expected_output_json)) = planned else {
         return Err(StoreError::TaskNotFound {
             slug: slug.to_owned(),
             number: done.number.clone(),
@@ -980,11 +980,14 @@ fn close_task(
         });
     }
 
-    // Trimmed on the plan's side only. A plan states the line it expects to
-    // see, and the whitespace around that line is how the plan was written
-    // rather than part of what it claims; the output keeps every character of
-    // its own, being quoted evidence.
-    let expected_output_found = done.output.contains(expected.trim());
+    // Trimmed on the plan's side only. A plan states the markers it expects to
+    // see, and the whitespace around each is how the plan was written rather
+    // than part of what it claims; the output keeps every character of its own,
+    // being quoted evidence.
+    let markers: Vec<String> = serde_json::from_str(&expected_output_json)?;
+    let expected_output_found = markers
+        .iter()
+        .all(|marker| done.output.contains(marker.trim()));
 
     tx.execute(
         "UPDATE tasks SET status = 'done', evidence = ?1, verified_at = ?2, updated_at = ?3

@@ -381,7 +381,7 @@ fn task(title: &str, covers: &[&str]) -> TaskDraft {
         consumes: Some(CONSUMES.into()),
         produces: Some(PRODUCES.into()),
         verify_command: VERIFY.into(),
-        expected_output: EXPECTED.into(),
+        expected_output: vec![EXPECTED.into()],
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
     }
 }
@@ -691,7 +691,8 @@ fn a_planned_task_reads_back_whole() {
     assert_eq!(task.produces.as_deref(), Some(PRODUCES));
     assert_eq!(task.verify_command, VERIFY);
     assert_eq!(
-        task.expected_output, EXPECTED,
+        task.expected_output,
+        vec![EXPECTED.to_string()],
         "the command without what it should print is half an instruction"
     );
 

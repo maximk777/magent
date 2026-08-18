@@ -226,9 +226,11 @@ pub struct TaskSummary {
     /// the next task is waiting on this one to produce.
     pub consumes: Option<String>,
     pub produces: Option<String>,
-    /// What `verify_command` should print, which is half of the instruction —
-    /// a command with no stated result is one an executor cannot judge.
-    pub expected_output: String,
+    /// The markers `verify_command`'s output should contain, which is half of
+    /// the instruction — a command with no stated result is one an executor
+    /// cannot judge. Handed over as the list `plan` was given, for the reason
+    /// `files` gives.
+    pub expected_output: Vec<String>,
     /// What that command actually printed when the task was closed, kept as it
     /// came. `None` until a tick lands.
     pub evidence: Option<String>,
@@ -589,7 +591,7 @@ impl Store {
                 tx.execute(
                     "INSERT INTO tasks (
                          id, change_id, number, title, body, files_json, consumes, produces,
-                         verify_command, expected_output, covers_json, status,
+                         verify_command, expected_output_json, covers_json, status,
                          created_at, updated_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?12)",
                     rusqlite::params![
@@ -602,7 +604,7 @@ impl Store {
                         task.consumes.as_deref(),
                         task.produces.as_deref(),
                         &task.verify_command,
-                        &task.expected_output,
+                        serde_json::to_string(&task.expected_output)?,
                         serde_json::to_string(&task.covers)?,
                         &now,
                     ],
@@ -2096,7 +2098,7 @@ struct TaskSummaryRow {
     files_json: String,
     consumes: Option<String>,
     produces: Option<String>,
-    expected_output: String,
+    expected_output_json: String,
     evidence: Option<String>,
     verified_at: Option<String>,
 }
@@ -2110,7 +2112,7 @@ fn load_task_summaries(
 ) -> Result<Vec<TaskSummary>, StoreError> {
     let mut statement = tx.prepare(
         "SELECT number, title, status, verify_command, body, files_json, consumes,
-                produces, expected_output, evidence, verified_at
+                produces, expected_output_json, evidence, verified_at
          FROM tasks
          WHERE change_id = ?1 ORDER BY number",
     )?;
@@ -2125,7 +2127,7 @@ fn load_task_summaries(
                 files_json: row.get(5)?,
                 consumes: row.get(6)?,
                 produces: row.get(7)?,
-                expected_output: row.get(8)?,
+                expected_output_json: row.get(8)?,
                 evidence: row.get(9)?,
                 verified_at: row.get(10)?,
             })
@@ -2147,7 +2149,9 @@ fn load_task_summaries(
                 files: serde_json::from_str(&row.files_json)?,
                 consumes: row.consumes,
                 produces: row.produces,
-                expected_output: row.expected_output,
+                // Parsed rather than defaulted on a failure, for the reason
+                // `files` gives above.
+                expected_output: serde_json::from_str(&row.expected_output_json)?,
                 evidence: row.evidence,
                 verified_at: row
                     .verified_at
