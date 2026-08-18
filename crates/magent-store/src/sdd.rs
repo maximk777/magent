@@ -644,6 +644,8 @@ impl Store {
     /// [`StoreError::ChangeNotFound`] or [`StoreError::ChangeClosed`] when the
     /// change cannot be archived at all, [`StoreError::ChangeNotExecuted`]
     /// when a task of it is still open or it was never planned,
+    /// [`StoreError::RequirementsUncovered`] when a requirement of it is one
+    /// no finished task covers,
     /// [`StoreError::NothingToArchive`] when it proposes no deltas and did not
     /// declare `skip_specs`, [`StoreError::CapabilityPurposeRequired`] when a
     /// delta creating a capability carries no purpose, or a database error.
@@ -663,6 +665,11 @@ impl Store {
             let (namespace, skip_specs) =
                 require_archivable_change(tx, command.change, &workspace)?;
             require_tasks_closed(tx, command.change, &change_id, skip_specs)?;
+            // After the tasks and not before: a change with work still open
+            // hears about that first, because "finish the work" is the more
+            // actionable of the two when both are true — the open task may be
+            // the very one that was going to cover the requirement.
+            require_covered_by_done(tx, &change_id)?;
 
             let deltas = load_deltas(tx, &change_id)?;
             if deltas.is_empty() && !skip_specs {
@@ -1625,6 +1632,54 @@ fn require_full_coverage(
         .query_map([change_id], |row| row.get::<_, String>(0))?
         .filter(|name| match name {
             Ok(name) => !covered.contains(name.as_str()),
+            Err(_) => true,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if !uncovered.is_empty() {
+        return Err(StoreError::RequirementsUncovered(uncovered));
+    }
+
+    Ok(())
+}
+
+/// Refuses to archive a change carrying a requirement no finished task covers.
+///
+/// `require_full_coverage` above asks the same question of the plan, and
+/// nothing holds the answer afterwards: `specify` adds a delta to a change
+/// that is already planned without touching its plan. So a requirement can
+/// reach this gate having never been anybody's task — every task done, the
+/// change reading `ready` — and archiving would file a behaviour nobody
+/// implemented as true of the product.
+///
+/// `skipped` is excluded by the status filter rather than counted as closed
+/// the way `require_tasks_closed` counts it: a task nobody did implements
+/// nothing, whoever decided to pass it over.
+///
+/// Names are compared against `spec_deltas` for the reason
+/// `require_full_coverage` gives, in the same order for the same reason. A
+/// change proposed with `skip_specs` has no deltas, so this passes for one
+/// without needing a branch of its own.
+fn require_covered_by_done(tx: &Transaction<'_>, change_id: &str) -> Result<(), StoreError> {
+    let mut finished =
+        tx.prepare("SELECT covers_json FROM tasks WHERE change_id = ?1 AND status = 'done'")?;
+    let covers = finished
+        .query_map([change_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let mut covered: HashSet<String> = HashSet::new();
+    for json in &covers {
+        covered.extend(serde_json::from_str::<Vec<String>>(json)?);
+    }
+
+    let mut statement = tx.prepare(
+        "SELECT name FROM spec_deltas WHERE change_id = ?1
+         ORDER BY created_at, name",
+    )?;
+    let uncovered = statement
+        .query_map([change_id], |row| row.get::<_, String>(0))?
+        .filter(|name| match name {
+            Ok(name) => !covered.contains(name),
             Err(_) => true,
         })
         .collect::<Result<Vec<_>, _>>()?;

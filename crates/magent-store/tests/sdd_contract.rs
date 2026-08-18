@@ -9,8 +9,10 @@
 //! retry after a crash cannot duplicate state.
 
 use magent_core::{
-    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, OperationId, PlanCommand,
-    ProposeCommand, RequirementDraft, ScenarioDraft, SpecifyCommand, TaskDraft,
+    ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, Classification,
+    DeltaOp, HarnessKind, OperationId, PlanCommand, ProposeCommand, RequirementDraft,
+    ScenarioDraft, SpecBinding, SpecifyCommand, StartRunCommand, TaskDone, TaskDraft,
+    WorkflowStage,
 };
 use magent_store::{FactContext, Store, StoreError};
 use rusqlite::Connection;
@@ -1760,6 +1762,64 @@ fn requirement_row(connection: &Connection, id: &str) -> (String, String, String
         .expect("requirement row")
 }
 
+/// How much of the live specification exists at all. Zero until an archive
+/// folds something in, so a refused one is measured by it staying there.
+fn live_requirement_count(connection: &Connection) -> i64 {
+    connection
+        .query_row("SELECT COUNT(*) FROM requirements", [], |row| row.get(0))
+        .expect("requirement count")
+}
+
+/// Closes one task the way executing a plan closes it: a run bound to the
+/// change by its slug, carrying a tick with the command the plan named.
+///
+/// Unlike `finish_tasks`, which sets the column, this is the path that also
+/// moves the change to `ready` — the state the coverage hole below is reached
+/// from. The run is started from the same `project` directory `context`
+/// resolved its workspace from, or the tick would be looking for the change in
+/// another workspace's plan.
+fn close_task_by_checkpoint(store: &Store, dir: &std::path::Path, slug: &str, number: &str) {
+    let started = store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "Cap the retry loop".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![dir.join("project")],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start run");
+
+    store
+        .save_checkpoint(&CheckpointCommand {
+            operation_id: OperationId::new(),
+            run_id: started.run_id,
+            session_id: started.session_id,
+            stage: WorkflowStage::Executing,
+            origin: CheckpointOrigin::Enriched,
+            completed_steps: vec!["capped the retry loop".into()],
+            next_steps: vec![],
+            decisions: vec![],
+            rejected: vec![],
+            changed_files: vec![],
+            verification: vec![],
+            risks: vec![],
+            handoff_summary: "The budget is read from config and spent per attempt.".into(),
+            task_done: Some(TaskDone {
+                number: number.into(),
+                verify_command: "cargo test -p worker retry".into(),
+                output: "running 3 tests\ntest result: ok. 3 passed\n".into(),
+            }),
+            binding: Some(SpecBinding {
+                change_id: Some(slug.into()),
+                current_task: Some(format!("{number}: cap the retry loop")),
+            }),
+        })
+        .expect("checkpoint");
+}
+
 /// The step the rest of the process exists for: until a change is archived
 /// its deltas are only a proposal, and the live base still describes the
 /// product as it was.
@@ -1845,6 +1905,14 @@ fn archiving_an_added_delta_writes_the_requirement_its_scenarios_and_its_capabil
 
     let (_, _, change_status) = change_row(&raw, &change.to_string());
     assert_eq!(change_status, "archived");
+
+    // The other side of the two coverage refusals below: a change every delta
+    // of which a done task covers is folded in, not held back by that gate.
+    assert_eq!(
+        live_requirement_count(&raw),
+        1,
+        "a fully covered change still archives, and its delta lands"
+    );
 }
 
 /// A `modified` delta carries the whole requirement rather than a diff, so
@@ -2145,6 +2213,84 @@ fn archiving_a_change_with_an_open_task_names_that_task() {
 
     let (_, _, status) = change_row(&raw, &change.to_string());
     assert_eq!(status, "planned", "a refused archive does not advance");
+}
+
+/// Coverage is checked once, when the plan is written, and nothing holds it
+/// afterwards: `specify` adds a requirement to a change that is already
+/// planned without touching its plan. So a requirement can reach this gate
+/// having never been anybody's task — every task done, the change reading
+/// `ready`, and a behaviour nobody implemented about to be filed as true.
+#[test]
+fn archiving_refuses_a_requirement_no_finished_task_covers() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("plan");
+    close_task_by_checkpoint(&store, dir.path(), "add-retry-budget", "1");
+
+    let late = "the budget is configurable";
+    store
+        .specify(
+            &specify_command(change, "worker/retry", Some(PURPOSE), vec![added(late)]),
+            &ctx,
+        )
+        .expect("the second specify");
+
+    let error = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::RequirementsUncovered(names)
+            if names == &[late.to_string()]),
+        "expected the requirement no task covers to be named, got {error:?}"
+    );
+
+    let raw = Connection::open(&path).expect("raw connection");
+    assert_eq!(
+        live_requirement_count(&raw),
+        0,
+        "a refused archive folds nothing into the live specification"
+    );
+}
+
+/// `require_tasks_closed` counts a skipped task as closed, because passing one
+/// over is a decision somebody took. Coverage cannot count it: a task nobody
+/// did implements nothing, whoever decided that.
+#[test]
+fn a_skipped_task_covers_nothing() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+
+    store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("plan");
+
+    let raw = Connection::open(&path).expect("raw connection");
+    raw.execute(
+        "UPDATE tasks SET status = 'skipped' WHERE change_id = ?1",
+        [change.to_string()],
+    )
+    .expect("skip the only task");
+
+    let error = store
+        .archive(&archive_command(change), &ctx)
+        .expect_err("expected a refusal");
+
+    assert!(
+        matches!(&error, StoreError::RequirementsUncovered(names)
+            if names == &[REQUIREMENT.to_string()]),
+        "expected the skipped task's requirement to be named, got {error:?}"
+    );
+    assert_eq!(
+        live_requirement_count(&raw),
+        0,
+        "a refused archive folds nothing into the live specification"
+    );
 }
 
 /// A change with specs but no plan was never executed either. It reaches the
