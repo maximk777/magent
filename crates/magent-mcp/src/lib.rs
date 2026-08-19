@@ -45,10 +45,10 @@ Call magent_start before non-trivial work. It opens or resumes a run and returns
 any earlier checkpoint. Pass resume_run_id when continuing a run named in \
 restored context.
 
-Call magent_checkpoint to record what only you know: decisions, the \
+Call magent_checkpoint at stage boundaries, after a significant decision, and \
+before handing work over. Record what only you know: decisions and the \
 alternatives you rejected, what you verified and how. File edits are captured \
-automatically, so do not restate them. You will be told when edits have \
-accumulated with no reasoning recorded.
+automatically, so do not restate them.
 
 Call magent_finish with close_session when stepping away, or complete_run when \
 the task is done and verified. Closing a session does not finish the task.
@@ -677,7 +677,7 @@ impl MagentMcp {
     }
 
     #[tool(
-        description = "Persist what only you know about this run: decisions, alternatives rejected, what was verified, open risks. Nothing else records these — the file ledger and git hold what changed, never why, and you will be told when edits have accumulated with none of this written down. Only stage and handoff_summary are needed; the server knows which run and session this is. A task of a plan is closed by carrying task_done: the number the plan gave it, the command the plan named, and what that command printed."
+        description = "Persist what only you know about this run: decisions, alternatives rejected, what was verified, open risks. Call at stage boundaries and before handing work over. Only stage and handoff_summary are needed; the server knows which run and session this is. A task of a plan is closed by carrying task_done: the number the plan gave it, the command the plan named, and what that command printed."
     )]
     async fn magent_checkpoint(
         &self,

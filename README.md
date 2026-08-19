@@ -195,7 +195,7 @@ The split between the two surfaces follows one rule — what MCP cannot guarante
 
 | Surface | Carries | Why there |
 | --- | --- | --- |
-| Hooks | run identity, the file ledger, the pre-compaction checkpoint, the notice when edits accumulate with no reasoning recorded | they fire whether or not the model cooperates |
+| Hooks | run identity, the file ledger, the pre-compaction checkpoint | they fire whether or not the model cooperates |
 | MCP | instructions, tools, decisions and verification | it needs the model's own knowledge, and it is portable to other harnesses |
 
 ## Install
