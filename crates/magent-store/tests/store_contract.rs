@@ -612,8 +612,12 @@ fn a_run_with_edits_and_no_enriched_checkpoint_is_reported() {
     );
 }
 
+/// Any checkpoint carrying reasoning silences the question, whoever wrote it.
+/// The distiller produces one from a transcript (`magent-distill`), and that
+/// counts too: what the notice asks for is that the reasoning behind this run
+/// can be read afterwards, not that a particular author typed it.
 #[test]
-fn a_run_whose_model_wrote_a_checkpoint_is_not_reported() {
+fn a_run_whose_reasoning_is_recorded_is_not_reported() {
     let (_dir, path) = temp_db();
     let store = Store::open(&path).expect("open");
     let started = store

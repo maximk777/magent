@@ -447,6 +447,16 @@ impl Store {
     /// two. A deterministic checkpoint does not count: the hook writes that one
     /// on the model's behalf before a compaction and it carries no decisions.
     ///
+    /// An `enriched` checkpoint counts however it was written, and that
+    /// includes one the distiller produced from a transcript
+    /// (`magent-distill`). The question here is whether the reasoning behind
+    /// this run can be read afterwards, not who typed it: a distilled
+    /// checkpoint carries decisions and rejected alternatives, so the thing the
+    /// notice asks for exists. The ordering makes the case rarer than it looks
+    /// — the notice fires at the threshold, long before a session compacts —
+    /// but a run that has been distilled is genuinely explained, and saying
+    /// otherwise would be the notice arguing with the record.
+    ///
     /// One query rather than two: this runs on every prompt of every session,
     /// and a second round trip buys nothing.
     ///
@@ -486,6 +496,23 @@ impl Store {
     /// Fails on a database error.
     pub fn claim_notice(&self, session: &str, kind: &str) -> Result<bool, StoreError> {
         let mut connection = self.lock()?;
+
+        // Read before writing. Once a session has been told, every later prompt
+        // asks again for as long as the condition holds, and an unconditional
+        // INSERT would take a write lock on the prompt's hot path to insert a
+        // row that always conflicts. The claim below is still the only thing
+        // that decides: two callers finding the row absent both reach it, and
+        // ON CONFLICT lets exactly one through.
+        let told: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_notices
+                            WHERE external_session_hint = ?1 AND kind = ?2)",
+            (session, kind),
+            |row| row.get(0),
+        )?;
+        if told {
+            return Ok(false);
+        }
+
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let changed = tx.execute(

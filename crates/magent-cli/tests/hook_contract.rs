@@ -1123,3 +1123,148 @@ fn seed_run(fixture: &Fixture, task: &str) {
         )
         .expect("seed run");
 }
+
+/// The scenario the requirement names and nothing exercised: a session that
+/// joins a run already in flight has not been told, whoever was told before it.
+/// The record is per session precisely because a fresh one has not seen the
+/// line, and the run it joined is still the one carrying unexplained work.
+#[test]
+fn a_new_session_joining_the_run_is_told_too() {
+    let fixture = Fixture::new();
+
+    assert!(
+        fixture
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&fixture, "n5", "rework the retry budget"),
+            )
+            .succeeded()
+    );
+    record_edits(&fixture, "n5", 12);
+    let first = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, "n5", "keep going"),
+    );
+    assert!(
+        first.stdout.contains("magent_checkpoint"),
+        "the session that did the work is told: {}",
+        first.stdout
+    );
+
+    // A different harness session, joining the run the first one opened.
+    let second = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, "n6", "picking this up"),
+    );
+
+    assert!(second.succeeded(), "stderr: {}", second.stderr);
+    assert!(
+        second.stdout.contains("magent_checkpoint"),
+        "a session that has not been told has not been told: {}",
+        second.stdout
+    );
+}
+
+/// The boundary the threshold names. Nine edits is the largest run this stays
+/// quiet for, and ten the smallest it speaks for; a test that only checks
+/// twelve and three would pass with the comparison off by one either way.
+#[test]
+fn the_threshold_is_where_the_store_says_it_is() {
+    let quiet = Fixture::new();
+    assert!(
+        quiet
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&quiet, "n7", "a small fix"),
+            )
+            .succeeded()
+    );
+    record_edits(&quiet, "n7", magent_store::REASONING_EDIT_THRESHOLD - 1);
+    let under = quiet.hook("user-prompt-submit", &prompt_of(&quiet, "n7", "and again"));
+    assert!(
+        !under.stdout.contains("magent_checkpoint"),
+        "one edit below the threshold is still a fix: {}",
+        under.stdout
+    );
+
+    let loud = Fixture::new();
+    assert!(
+        loud.hook("user-prompt-submit", &prompt_of(&loud, "n8", "a small fix"),)
+            .succeeded()
+    );
+    record_edits(&loud, "n8", magent_store::REASONING_EDIT_THRESHOLD);
+    let at = loud.hook("user-prompt-submit", &prompt_of(&loud, "n8", "and again"));
+    assert!(
+        at.stdout.contains("magent_checkpoint"),
+        "the threshold is reached, not merely approached: {}",
+        at.stdout
+    );
+}
+
+/// Both blocks fire on the same prompt often enough that running them together
+/// is the ordinary case rather than the odd one. Two markdown headings on
+/// consecutive lines read as one block with a stray title in it.
+#[test]
+fn the_notice_and_the_memory_index_stay_separate() {
+    let fixture = Fixture::new();
+
+    // The prompt that opens the run, before the fact exists: the index shows a
+    // fact once per session, so anything seeded earlier would be spent here
+    // rather than on the prompt under test.
+    assert!(
+        fixture
+            .hook(
+                "user-prompt-submit",
+                &prompt_of(&fixture, "n9", "rename the config loader"),
+            )
+            .succeeded()
+    );
+    record_edits(&fixture, "n9", 12);
+
+    let store = fixture.store();
+    store
+        .remember(
+            &magent_core::RememberCommand {
+                operation_id: OperationId::new(),
+                name: "retry-budget-is-per-job".into(),
+                title: "The retry budget is counted per job, not per attempt".into(),
+                body: "Counting per attempt let one poisoned job exhaust the pool.".into(),
+                kind: magent_core::FactKind::Project,
+                scope: magent_core::FactScope::Repository,
+                cardinality: magent_core::Cardinality::Single,
+                status: magent_core::FactStatus::Observed,
+                confidence: 0.9,
+                evidence: vec![],
+                relates_to: vec![],
+            },
+            &magent_store::FactContext {
+                namespace: Some(
+                    fixture
+                        .repo
+                        .file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..magent_store::FactContext::default()
+            },
+        )
+        .expect("remember");
+    drop(store);
+
+    let run = fixture.hook(
+        "user-prompt-submit",
+        &prompt_of(&fixture, "n9", "the retry budget again"),
+    );
+
+    assert!(
+        run.stdout.contains("no reasoning recorded") && run.stdout.contains("## Magent: memory"),
+        "both blocks fire on this prompt: {}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("\n\n## Magent: memory"),
+        "a blank line separates them, or the two headings read as one block: {:?}",
+        run.stdout
+    );
+}
