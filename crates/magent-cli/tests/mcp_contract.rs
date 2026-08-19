@@ -336,7 +336,11 @@ async fn the_contract_says_when_to_checkpoint() {
         .and_then(|info| info.instructions.clone())
         .expect("instructions");
 
-    for clause in ["at stage boundaries", "before handing work over"] {
+    for clause in [
+        "at stage boundaries",
+        "after a significant decision",
+        "before handing work over",
+    ] {
         assert!(
             instructions.contains(clause),
             "the contract stopped saying when to checkpoint: {instructions}"
@@ -360,6 +364,12 @@ async fn the_contract_says_when_to_checkpoint() {
         description.contains("at stage boundaries"),
         "the tool stopped saying when to call it: {description}"
     );
+    for asked in ["decisions", "alternatives rejected", "what was verified"] {
+        assert!(
+            description.contains(asked),
+            "the tool stopped asking for {asked}: {description}"
+        );
+    }
     assert!(
         !description.contains("be told"),
         "the tool promises the notice instead of saying when to call: {description}"
