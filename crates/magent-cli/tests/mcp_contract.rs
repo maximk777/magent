@@ -317,15 +317,18 @@ async fn the_instructions_name_the_spec_driven_process() {
 ///
 /// This guards a decision rather than a mechanism. The sentence saying when
 /// to checkpoint was once deleted to buy room for a promise that the hook's
-/// notice would arrive, and the contract has no room to hold both: it is
-/// 1870 bytes against the 2048 at which Claude Code truncates it, and the
-/// setup note spends some 126 more. The timing is worth more, because the
-/// notice arrives once a session and only past the tenth edit, which leaves
-/// everything before that moment to this sentence.
+/// notice would arrive, and the contract has no room to hold both: the
+/// contract and the setup note together sit within a few bytes of the limit
+/// Claude Code truncates at, as `the_bootstrap_instructions_still_fit`
+/// measures. The timing is worth more, because the notice arrives once a
+/// session and only past the tenth edit, which leaves everything before
+/// that moment to this sentence.
 ///
 /// The absence half is a canary against that exact edit returning, not a
 /// defence against a paraphrase of it — no string match could be. The
-/// requirement is where the reasoning lives.
+/// requirement is where the reasoning lives. The tool description carries
+/// the same requirement even though it is outside the 2048-byte budget,
+/// because the two surfaces must not disagree about when to call the tool.
 #[tokio::test]
 async fn the_contract_says_when_to_checkpoint() {
     let fixture = Fixture::new();
@@ -343,7 +346,7 @@ async fn the_contract_says_when_to_checkpoint() {
     ] {
         assert!(
             instructions.contains(clause),
-            "the contract stopped saying when to checkpoint: {instructions}"
+            "the contract stopped saying to checkpoint {clause}: {instructions}"
         );
     }
     assert!(
