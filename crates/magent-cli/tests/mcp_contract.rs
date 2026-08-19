@@ -313,6 +313,61 @@ async fn the_instructions_name_the_spec_driven_process() {
     client.cancel().await.expect("shutdown");
 }
 
+/// The contract's checkpoint instruction names its moment.
+///
+/// This guards a decision rather than a mechanism. The sentence saying when
+/// to checkpoint was once deleted to buy room for a promise that the hook's
+/// notice would arrive, and the contract has no room to hold both: it is
+/// 1870 bytes against the 2048 at which Claude Code truncates it, and the
+/// setup note spends some 126 more. The timing is worth more, because the
+/// notice arrives once a session and only past the tenth edit, which leaves
+/// everything before that moment to this sentence.
+///
+/// The absence half is a canary against that exact edit returning, not a
+/// defence against a paraphrase of it — no string match could be. The
+/// requirement is where the reasoning lives.
+#[tokio::test]
+async fn the_contract_says_when_to_checkpoint() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("instructions");
+
+    for clause in ["at stage boundaries", "before handing work over"] {
+        assert!(
+            instructions.contains(clause),
+            "the contract stopped saying when to checkpoint: {instructions}"
+        );
+    }
+    assert!(
+        !instructions.contains("be told"),
+        "the contract promises the notice instead of saying when to call: {instructions}"
+    );
+
+    let checkpoint = client
+        .list_all_tools()
+        .await
+        .expect("list tools")
+        .into_iter()
+        .find(|tool| tool.name.as_ref() == "magent_checkpoint")
+        .expect("magent_checkpoint is served");
+    let description = checkpoint.description.expect("a description");
+
+    assert!(
+        description.contains("at stage boundaries"),
+        "the tool stopped saying when to call it: {description}"
+    );
+    assert!(
+        !description.contains("be told"),
+        "the tool promises the notice instead of saying when to call: {description}"
+    );
+
+    client.cancel().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn every_mutating_tool_requires_an_operation_id() {
     let fixture = Fixture::new();
