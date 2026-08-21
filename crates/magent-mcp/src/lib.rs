@@ -587,20 +587,20 @@ impl MagentMcp {
     /// through: the store is the one that knows whether it names a change of
     /// this workspace, and it says so in its own terms. Anything else is a
     /// slug, and [`Store::changes_named`] hands back every change that has ever
-    /// held it, live ones first. The first is what the caller means: a name
-    /// that is currently open names the open change, and an archived one
-    /// answers only once nothing live has taken the name back — which is what
-    /// lets a finished change still be read under the name it was archived
-    /// under, the only handle a caller has left after a compaction.
+    /// held it, open ones first. The first is what the caller means: a name
+    /// that is currently open names the open change, and a finished one
+    /// answers only once nothing open has taken the name back — which is what
+    /// lets a finished change still be read under the name it ended under, the
+    /// only handle a caller has left after a compaction.
     ///
-    /// Several archived changes and nothing live is the one case with no
+    /// Several finished changes and nothing open is the one case with no
     /// answer. The slug says nothing about which of them was meant, and the
     /// most recent is the wrong guess exactly when the question matters — when
     /// work of the same name was done twice. So it refuses and lists them by
-    /// id, which is unambiguous, with the date each was archived as the only
-    /// thing that tells them apart from outside. (`updated_at` is that date:
-    /// archiving is the last thing that touches such a change, and there is no
-    /// separate column for it.)
+    /// id, which is unambiguous, with the status each ended in and the date it
+    /// ended on as the only things that tell them apart from outside.
+    /// (`updated_at` is that date: ending a change is the last thing that
+    /// touches it, and there is no separate column for it.)
     ///
     /// A slug that matches nothing is refused with the open slugs in the
     /// message. The alternative — "no such change" and nothing else — sends the
@@ -617,7 +617,7 @@ impl MagentMcp {
             .map_err(|error| render_error(&error))?;
 
         if let Some(first) = named.first() {
-            if named.len() == 1 || is_live(first) {
+            if named.len() == 1 || first.status.is_open() {
                 return Ok(first.id);
             }
 
@@ -625,8 +625,9 @@ impl MagentMcp {
                 .iter()
                 .map(|change| {
                     format!(
-                        "{} (archived {})",
+                        "{} ({} {})",
                         change.id,
+                        status_name(change.status),
                         change.updated_at.date_naive()
                     )
                 })
@@ -634,7 +635,7 @@ impl MagentMcp {
             return Err(fail(
                 "slug_names_several_archived_changes",
                 &format!(
-                    "{reference} has named {} changes here and every one of them is archived, so the name does not say which you mean. Ask again by id: {}",
+                    "{reference} has named {} changes here and none of them is open, so the name does not say which you mean. Ask again by id: {}",
                     named.len(),
                     candidates.join(", ")
                 ),
@@ -1146,15 +1147,14 @@ fn render<T: Serialize>(value: &T) -> Result<String, String> {
     })
 }
 
-/// Whether a change is still in flight, in the same terms
-/// [`Store::open_changes`] uses: everything but the two statuses that end a
-/// change. Written as an exclusion rather than a list of the live ones so a
-/// status added mid-process is treated as open without an edit here.
-fn is_live(change: &ChangeSummary) -> bool {
-    !matches!(
-        change.status,
-        ChangeStatus::Archived | ChangeStatus::Abandoned
-    )
+/// A status as the store spells it, taken through serde rather than a match
+/// written here: a variant added to the enum then reaches a refusal as its own
+/// name instead of as something this file invented for it.
+fn status_name(status: ChangeStatus) -> String {
+    match serde_json::to_value(status) {
+        Ok(serde_json::Value::String(name)) => name,
+        _ => "unknown".to_owned(),
+    }
 }
 
 /// Renders a failure as a tool error carrying a stable code.

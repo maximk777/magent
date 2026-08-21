@@ -53,6 +53,24 @@ pub enum ChangeStatus {
     Abandoned,
 }
 
+impl ChangeStatus {
+    /// Whether a change is still being worked on.
+    ///
+    /// Archived and abandoned are the two finished states, and this is the
+    /// distinction every slug resolver and the `status NOT IN` filters beside
+    /// them turn on: `sdd_changes_live_slug` is unique only among changes that
+    /// are still open, so which of them is open is what decides whether a name
+    /// points at one change or at several.
+    ///
+    /// Spelled as the complement of the finished pair rather than as a list of
+    /// the open ones, so a status added mid-process counts as open without an
+    /// edit here.
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        !matches!(self, Self::Archived | Self::Abandoned)
+    }
+}
+
 /// What a delta does to a requirement.
 ///
 /// Matches `spec_deltas.op`'s `CHECK` in `0007_sdd.sql`.

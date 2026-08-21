@@ -126,10 +126,13 @@ pub enum StoreError {
     /// Nothing outside the store addresses a requirement by id: a patch delta
     /// names one, and `specify` resolves the id from the capability and that
     /// name. So this is never a mistyped address. It is raised only on the
-    /// archive path, against an id the store itself wrote, and what it reports
-    /// is that the row moved underneath that id — `specify` found the
-    /// requirement live, and between then and `archive` another change retired
-    /// it.
+    /// archive path, and usually against an id the store itself wrote, where
+    /// what it reports is that the row moved underneath that id — `specify`
+    /// found the requirement live, and between then and `archive` another
+    /// change retired it. The one exception carries no id at all — a patch
+    /// delta that reached `archive` without one, which `specify` should have
+    /// made impossible — and it reports that in place of an id rather than
+    /// being passed over in silence.
     ///
     /// The guarded `UPDATE` is what notices: it matches nothing where an
     /// unguarded one would rewrite a retired requirement with text nobody

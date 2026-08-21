@@ -375,18 +375,12 @@ fn resolve(
         // the slug is unique among changes that are neither archived nor
         // abandoned. So a live change wins over the finished ones sharing its
         // name, which is what someone naming a slug while working means.
-        [first, ..] if is_live(first.status) => Some(first.id),
+        [first, ..] if first.status.is_open() => Some(first.id),
         finished => {
             refuse_ambiguous(reference, finished, out);
             None
         }
     }
-}
-
-/// Whether a change is still in flight — the statuses [`Store::open_changes`]
-/// keeps, spelled here as the complement of the two it drops.
-fn is_live(status: ChangeStatus) -> bool {
-    !matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned)
 }
 
 /// The two messages for a slug nothing here answers to: one for a profile with

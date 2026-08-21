@@ -821,8 +821,8 @@ impl Store {
             .collect()
     }
 
-    /// Every change of this workspace and namespace carrying `slug`, live ones
-    /// first and archived ones after, most recently touched first within each.
+    /// Every change of this workspace and namespace carrying `slug`, open ones
+    /// first and finished ones after, most recently touched first within each.
     ///
     /// A list rather than one change, because `sdd_changes_live_slug` is unique
     /// only among changes that are neither archived nor abandoned: a slug is
@@ -1323,7 +1323,7 @@ fn require_archivable_change(
 
     let (status, namespace, skip_specs) = row.ok_or(StoreError::ChangeNotFound(change))?;
     let status: ChangeStatus = enum_from_sql(&status)?;
-    if matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned) {
+    if !status.is_open() {
         return Err(StoreError::ChangeClosed(change));
     }
 
@@ -1418,9 +1418,8 @@ fn load_deltas(tx: &Transaction<'_>, change_id: &str) -> Result<Vec<DeltaRow>, S
 /// Folds one delta into the live base and counts it in the report.
 ///
 /// `change_id` is stamped on every requirement this leaves live, so a reader
-/// can reach the reasoning behind it (`0014_requirement_origin.sql`) — threaded
-/// from the caller rather than re-queried, which is a row `load_deltas` has
-/// already been past.
+/// can reach the reasoning behind it (`0014_requirement_origin.sql`).
+///
 /// `Removed` does not stamp it: a retired requirement is history for the change
 /// that retired it, and nothing reads it back as part of the specification.
 fn apply_delta(
@@ -1692,7 +1691,7 @@ fn require_plannable_change(
 
     let (raw_status, skip_specs) = row.ok_or(StoreError::ChangeNotFound(change))?;
     let status: ChangeStatus = enum_from_sql(&raw_status)?;
-    if matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned) {
+    if !status.is_open() {
         return Err(StoreError::ChangeClosed(change));
     }
 
@@ -1856,7 +1855,7 @@ fn require_open_change(
 
     let (status, namespace) = row.ok_or(StoreError::ChangeNotFound(change))?;
     let status: ChangeStatus = enum_from_sql(&status)?;
-    if matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned) {
+    if !status.is_open() {
         return Err(StoreError::ChangeClosed(change));
     }
 
