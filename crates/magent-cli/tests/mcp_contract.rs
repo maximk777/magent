@@ -2448,7 +2448,7 @@ async fn a_slug_naming_two_archived_changes_and_no_live_one_is_refused() {
     .await;
 
     assert!(
-        error.contains("slug_names_several_archived_changes"),
+        error.contains("slug_names_several_finished_changes"),
         "expected a stable code in: {error}"
     );
     assert!(

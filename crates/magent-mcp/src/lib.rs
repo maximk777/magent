@@ -633,7 +633,7 @@ impl MagentMcp {
                 })
                 .collect();
             return Err(fail(
-                "slug_names_several_archived_changes",
+                "slug_names_several_finished_changes",
                 &format!(
                     "{reference} has named {} changes here and none of them is open, so the name does not say which you mean. Ask again by id: {}",
                     named.len(),
