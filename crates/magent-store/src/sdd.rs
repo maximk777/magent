@@ -514,8 +514,9 @@ impl Store {
     /// the capability is not one the proposal declared,
     /// [`StoreError::CapabilityPurposeRequired`] or
     /// [`StoreError::CapabilityPurposeRedundant`] when the purpose does not
-    /// match what the capability needs, [`StoreError::RequirementNotFound`]
-    /// when a delta patches a requirement this capability does not have live,
+    /// match what the capability needs, [`StoreError::RequirementNameNotLive`]
+    /// when a patch delta names a requirement this capability does not hold
+    /// live, which comes back carrying the names it does hold,
     /// [`StoreError::DeltaAlreadyProposed`] when it repeats a requirement name
     /// this change has already used, or a database error.
     pub fn specify(
@@ -1517,12 +1518,12 @@ fn apply_delta(
 
 /// The requirement a `modified`, `removed` or `renamed` delta patches.
 ///
-/// `magent-core` refuses all three without an id and `specify` checked that id
-/// against the capability's live requirements, so this cannot be `None` for a
-/// row this crate wrote. Named as an error rather than defaulted anyway,
-/// because the alternative is an `UPDATE ... WHERE id IS NULL`, which matches
-/// nothing, changes nothing and would still be counted in the report as
-/// applied.
+/// No draft carries an id: `specify` resolved this one from the capability and
+/// the name the draft gave, and refused the whole command when that name
+/// matched nothing live — so a patch delta this crate wrote always has it.
+/// Named as an error rather than defaulted anyway, because the alternative is
+/// an `UPDATE ... WHERE id IS NULL`, which matches nothing, changes nothing and
+/// would still be counted in the report as applied.
 fn patched_requirement(delta: &DeltaRow) -> Result<&str, StoreError> {
     delta
         .requirement_id

@@ -123,17 +123,20 @@ pub enum StoreError {
     )]
     CapabilityPurposeRedundant(String),
 
-    /// `Modified`, `Removed` and `Renamed` patch a requirement by id. Left to
-    /// the foreign key, a requirement belonging to a *different* capability
-    /// would not be caught at all — the key only knows the row exists — and a
-    /// missing one would be reported as a constraint rather than as the
-    /// mistyped id it is.
+    /// Nothing outside the store addresses a requirement by id: a patch delta
+    /// names one, and `specify` resolves the id from the capability and that
+    /// name. So this is never a mistyped address. It is raised only on the
+    /// archive path, against an id the store itself wrote, and what it reports
+    /// is that the row moved underneath that id — `specify` found the
+    /// requirement live, and between then and `archive` another change retired
+    /// it.
     ///
-    /// "live" covers all three ways the target can be wrong: absent, another
-    /// capability's, or already retired. A retired requirement is kept rather
-    /// than deleted, so it is findable and still may not be patched — the
-    /// message says *live* so that a caller holding a correct id is told what
-    /// is actually the matter with it.
+    /// The guarded `UPDATE` is what notices: it matches nothing where an
+    /// unguarded one would rewrite a retired requirement with text nobody
+    /// agreed to ship. The message says *live* rather than *missing* because a
+    /// retired requirement is kept rather than deleted — the row is still
+    /// there, and calling it absent would send a reader looking for the wrong
+    /// thing.
     #[error(
         "requirement {requirement_id} is not a live requirement of capability {capability_path:?}"
     )]
