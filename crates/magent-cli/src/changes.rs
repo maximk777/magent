@@ -335,10 +335,17 @@ fn push_journal(out: &mut String, detail: &ChangeDetail) {
 }
 
 /// Turns a reference into an identifier, the way the MCP tool does: a UUID is
-/// passed through, anything else is a slug looked up among what is open here.
+/// passed through, anything else is a slug looked up among every change of this
+/// workspace carrying it — the archived ones included.
 ///
-/// A slug that matches nothing is refused with the open slugs, because the
-/// reader who mistyped one is standing in front of the list they needed.
+/// Archived ones included because archiving is not deletion: `magent_archive`
+/// keeps the change with its reasoning, and the reader who comes back for that
+/// reasoning has the name and nothing else — the id went with the session that
+/// had it. Looking the slug up among what is open would answer them "nothing is
+/// open here at all", which is true and not what they asked.
+///
+/// A slug that matches nothing is still refused with the open slugs, because
+/// the reader who mistyped one is standing in front of the list they needed.
 fn resolve(
     store: &Store,
     context: &FactContext,
@@ -349,17 +356,50 @@ fn resolve(
         return Some(change);
     }
 
-    let open = match store.open_changes(context) {
-        Ok(open) => open,
+    let named = match store.changes_named(context, reference) {
+        Ok(named) => named,
         Err(error) => {
             let _ = writeln!(out, "cannot read the changes here: {error}");
             return None;
         }
     };
 
-    if let Some(found) = open.iter().find(|change| change.slug == reference) {
-        return Some(found.id);
+    match named.as_slice() {
+        [] => {
+            refuse_unknown(store, context, reference, out);
+            None
+        }
+        // Whatever its status, one change of this name is the one meant.
+        [only] => Some(only.id),
+        // `changes_named` sorts the live one first, and there is at most one:
+        // the slug is unique among changes that are neither archived nor
+        // abandoned. So a live change wins over the finished ones sharing its
+        // name, which is what someone naming a slug while working means.
+        [first, ..] if is_live(first.status) => Some(first.id),
+        finished => {
+            refuse_ambiguous(reference, finished, out);
+            None
+        }
     }
+}
+
+/// Whether a change is still in flight — the statuses [`Store::open_changes`]
+/// keeps, spelled here as the complement of the two it drops.
+fn is_live(status: ChangeStatus) -> bool {
+    !matches!(status, ChangeStatus::Archived | ChangeStatus::Abandoned)
+}
+
+/// The two messages for a slug nothing here answers to: one for a profile with
+/// nothing in it, which is usually a fresh install rather than a typo, and one
+/// that hands back the slugs there are to choose from.
+fn refuse_unknown(store: &Store, context: &FactContext, reference: &str, out: &mut String) {
+    let open = match store.open_changes(context) {
+        Ok(open) => open,
+        Err(error) => {
+            let _ = writeln!(out, "cannot read the changes here: {error}");
+            return;
+        }
+    };
 
     if open.is_empty() {
         let _ = writeln!(
@@ -374,8 +414,41 @@ fn resolve(
             slugs.join(", ")
         );
     }
+}
 
-    None
+/// Several finished changes of one name, and no answer to which was meant.
+///
+/// A slug is free again once its change is archived, so a name can belong to
+/// several over time. This refuses to choose rather than taking the most
+/// recent, because the most recent is wrong exactly when the question matters —
+/// when work of the same name was done twice, and the reader is after the
+/// earlier one they only half remember. Refusing silently would be worse still:
+/// what gets them past this is the ids, and the date each change reached its
+/// end is what tells them which id is which.
+fn refuse_ambiguous(reference: &str, candidates: &[ChangeSummary], out: &mut String) {
+    let _ = writeln!(
+        out,
+        "{} changes here are called {reference} and none of them is open. \
+         Name the one you mean by its id:",
+        candidates.len()
+    );
+
+    let statuses: Vec<String> = candidates
+        .iter()
+        .map(|change| status_name(change.status))
+        .collect();
+    let width = statuses.iter().map(String::len).max().unwrap_or_default();
+
+    for (change, status) in candidates.iter().zip(&statuses) {
+        // `updated_at` rather than a column of its own: nothing touches a
+        // change after it is archived, so its last touch is when it ended.
+        let _ = writeln!(
+            out,
+            "  {}  {status:<width$}  {}",
+            change.id,
+            change.updated_at.format("%Y-%m-%d"),
+        );
+    }
 }
 
 /// What a task number sorts by: its leading integer first, then the whole

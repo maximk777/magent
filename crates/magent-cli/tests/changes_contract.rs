@@ -77,7 +77,10 @@ impl World {
     /// from the same directory, through the store rather than by writing rows:
     /// a fixture that bypasses `propose` and `plan` can hold a shape neither
     /// of them can produce.
-    fn plan_a_change(&self, slug: &str, why: &str, tasks: &[(&str, &str)]) {
+    ///
+    /// Returns the change's id, which is what archiving one takes — most
+    /// callers here only need it planned and drop it.
+    fn plan_a_change(&self, slug: &str, why: &str, tasks: &[(&str, &str)]) -> ChangeId {
         let store = Store::open(&self.database()).expect("open the store");
         let context = self.context(&store);
 
@@ -125,6 +128,8 @@ impl World {
                 &context,
             )
             .expect("plan");
+
+        change
     }
 
     /// Files a planned change carrying one requirement — `plan_a_change`
@@ -768,5 +773,82 @@ fn a_scenario_with_no_given_prints_no_given_line() {
         !block.iter().any(|line| line.contains("given")),
         "a scenario with no precondition prints no given at all, rather than an \
          empty label: {block:?}"
+    );
+}
+
+/// The proposal an archived change is read back for, and the one belonging to
+/// the second change filed under the same slug afterwards. Distinct, so a
+/// report can be checked for one of them and against the other.
+const ARCHIVED_WHY: &str = "Retries have no ceiling and can loop forever.";
+const SECOND_WHY: &str = "The ceiling is a constant, and the flaky dependency is not.";
+
+/// `magent_archive` promises the change is kept with its reasoning intact, and
+/// reasoning nobody can read back is not kept. The slug is how whoever comes
+/// looking still names it — the id went with the session that had it.
+#[test]
+fn an_archived_change_still_prints_under_its_slug() {
+    let world = World::new();
+    let change = world.plan_a_change_with_requirement(
+        "retry-budget",
+        ARCHIVED_WHY,
+        "worker/retry",
+        a_requirement_with_two_scenarios(),
+        &[("1", "Add the budget")],
+    );
+    world.close_task("1");
+    world.archive(change);
+
+    let (ok, report) = world.changes(&["retry-budget"]);
+
+    assert!(ok, "an archived change is still here to be read: {report}");
+    assert!(
+        report.contains(ARCHIVED_WHY),
+        "the proposal is what archiving keeps, so it is what the slug has to \
+         reach: {report}"
+    );
+    assert!(
+        report.contains("archived"),
+        "and the status has to say the work is finished, or a reader takes the \
+         change for one still in flight: {report}"
+    );
+}
+
+/// A slug is free for reuse once its change is archived, so one name can
+/// belong to several changes over time. Answering with the most recent is
+/// wrong exactly when it matters — when work of the same name was done twice —
+/// so the reader gets the candidates and picks.
+#[test]
+fn a_slug_two_archived_changes_share_prints_both_rather_than_choosing() {
+    let world = World::new();
+
+    let first = world.plan_a_change("retry-budget", ARCHIVED_WHY, &[("1", "Add the budget")]);
+    world.close_task("1");
+    world.archive(first);
+
+    let second = world.plan_a_change(
+        "retry-budget",
+        SECOND_WHY,
+        &[("2", "Take the ceiling from the dependency")],
+    );
+    world.close_task("2");
+    world.archive(second);
+
+    let (ok, report) = world.changes(&["retry-budget"]);
+
+    assert!(
+        !ok,
+        "the command could not say which change was meant, and an exit code \
+         that claims otherwise is the reader's problem later: {report}"
+    );
+    for change in [first, second] {
+        assert!(
+            report.contains(&change.to_string()),
+            "{change} is one of the two the reader has to choose between, and \
+             the id is what they choose with: {report}"
+        );
+    }
+    assert!(
+        !report.contains(ARCHIVED_WHY) && !report.contains(SECOND_WHY),
+        "printing either proposal would be the guess this refuses to make: {report}"
     );
 }
