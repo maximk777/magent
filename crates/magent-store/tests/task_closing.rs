@@ -116,7 +116,6 @@ impl Fixture {
                         rename_to: None,
                         reason: None,
                         migration: None,
-                        requirement_id: None,
                         scenarios: vec![ScenarioDraft {
                             name: "budget exhausted".into(),
                             given: None,

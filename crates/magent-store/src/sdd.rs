@@ -550,7 +550,7 @@ impl Store {
                     capability_id.as_deref(),
                     command,
                     requirement,
-                    requirement_id,
+                    requirement_id.as_deref(),
                     &now,
                 )?;
 
@@ -1868,53 +1868,60 @@ fn resolve_capability(
     }
 }
 
-/// The requirement a delta patches, checked to be a live one of this
-/// capability.
+/// The requirement a delta patches, looked up by the name the draft carries.
 ///
-/// `Added` names none: there is nothing yet to point at, so an id supplied
-/// alongside it is not written. For the other three `magent-core` has already
-/// insisted an id is present, and what is left is whether it is *this*
-/// capability's — a foreign key would happily accept another's — and whether
-/// it is still live. A retired requirement is kept rather than deleted, and
-/// none of the three ops means anything against one: modifying, removing or
-/// renaming something already withdrawn changes nothing that ships.
-fn resolve_requirement<'a>(
+/// `Added` names none: it introduces the name rather than pointing at one, so
+/// there is nothing to resolve. The other three address a live requirement of
+/// *this* capability, which `requirements_name` makes an address at all: it is
+/// UNIQUE on `(capability_id, name) WHERE status = 'live'`, so at most one row
+/// can answer. Nothing outside the store ever holds a requirement id — no tool,
+/// command or page returns one — and this is why nothing has to.
+///
+/// Missing, another capability's, and already retired all land in the same
+/// refusal, because they are the same fact from the caller's side: this
+/// capability holds no live requirement by that name. A retired requirement is
+/// kept rather than deleted, and none of the three ops means anything against
+/// one — modifying, removing or renaming something already withdrawn changes
+/// nothing that ships.
+fn resolve_requirement(
     tx: &Transaction<'_>,
     capability_id: Option<&str>,
-    requirement: &'a RequirementDraft,
+    requirement: &RequirementDraft,
     command: &SpecifyCommand,
-) -> Result<Option<&'a str>, StoreError> {
-    let requirement_id = match requirement.op {
-        // Nothing to resolve, and nothing dropped on the floor either:
-        // `RequirementDraft::validate` refuses an addition that carries an id
-        // at all, so by the time it reaches here there is none to lose.
-        DeltaOp::Added => return Ok(None),
-        DeltaOp::Modified | DeltaOp::Removed | DeltaOp::Renamed => {
-            requirement.requirement_id.as_deref()
-        }
-    };
-
-    if let Some(id) = requirement_id {
-        // `capability_id IS NULL` matches nothing, since the column is NOT
-        // NULL — so patching a requirement of a capability that does not exist
-        // yet is refused here too.
-        let belongs: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM requirements
-                 WHERE id = ?1 AND capability_id IS ?2 AND status = 'live'",
-                rusqlite::params![id, capability_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if belongs.is_none() {
-            return Err(StoreError::RequirementNotFound {
-                requirement_id: id.to_owned(),
-                capability_path: command.capability_path.clone(),
-            });
-        }
+) -> Result<Option<String>, StoreError> {
+    if matches!(requirement.op, DeltaOp::Added) {
+        return Ok(None);
     }
 
-    Ok(requirement_id)
+    // `capability_id IS NULL` matches nothing, the column being NOT NULL, so
+    // patching a requirement of a capability that does not exist yet is
+    // refused here as it was before.
+    let found: Option<String> = tx
+        .query_row(
+            "SELECT id FROM requirements
+             WHERE capability_id IS ?1 AND name = ?2 AND status = 'live'",
+            rusqlite::params![capability_id, &requirement.name],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if let Some(id) = found {
+        return Ok(Some(id));
+    }
+
+    let mut statement = tx.prepare(
+        "SELECT name FROM requirements
+         WHERE capability_id IS ?1 AND status = 'live' ORDER BY name",
+    )?;
+    let live = statement
+        .query_map(rusqlite::params![capability_id], |row| row.get(0))?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    Err(StoreError::RequirementNameNotLive {
+        name: requirement.name.clone(),
+        capability_path: command.capability_path.clone(),
+        live,
+    })
 }
 
 /// Refuses a requirement name this change has already proposed for this

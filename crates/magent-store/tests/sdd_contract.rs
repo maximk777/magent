@@ -73,7 +73,6 @@ fn added(name: &str) -> RequirementDraft {
         rename_to: None,
         reason: None,
         migration: None,
-        requirement_id: None,
         scenarios: vec![scenario("first"), scenario("second")],
     }
 }
@@ -87,7 +86,6 @@ fn modified(name: &str) -> RequirementDraft {
         rename_to: None,
         reason: None,
         migration: None,
-        requirement_id: None,
         scenarios: vec![scenario("first")],
     }
 }
@@ -101,7 +99,6 @@ fn removed(name: &str) -> RequirementDraft {
         rename_to: None,
         reason: Some("The budget subsumes it.".into()),
         migration: Some("Set the budget to 1 for the old behaviour.".into()),
-        requirement_id: None,
         scenarios: Vec::new(),
     }
 }
@@ -115,7 +112,6 @@ fn renamed(name: &str, rename_to: &str) -> RequirementDraft {
         rename_to: Some(rename_to.into()),
         reason: None,
         migration: None,
-        requirement_id: None,
         scenarios: Vec::new(),
     }
 }
@@ -648,10 +644,10 @@ fn a_rejected_requirement_takes_the_whole_specify_with_it() {
     assert!(
         matches!(
             &result,
-            Err(StoreError::RequirementNotFound { requirement_id, .. })
-                if requirement_id == "requirement-that-never-existed"
+            Err(StoreError::RequirementNameNotLive { name, .. })
+                if name == "the budget is configurable"
         ),
-        "expected the dangling requirement id to be named, got {result:?}"
+        "expected the name that resolved to nothing to be reported, got {result:?}"
     );
 
     assert_eq!(
@@ -783,8 +779,10 @@ fn a_modified_delta_naming_another_capabilitys_requirement_is_rejected() {
     assert!(
         matches!(
             &result,
-            Err(StoreError::RequirementNotFound { requirement_id, capability_path })
-                if requirement_id == "req-queue-depth" && capability_path == "worker/retry"
+            Err(StoreError::RequirementNameNotLive { name, capability_path, live })
+                if name == "the queue has a depth"
+                    && capability_path == "worker/retry"
+                    && live.is_empty()
         ),
         "a requirement of another capability must be named as not belonging here, got {result:?}"
     );
@@ -1009,8 +1007,8 @@ fn a_modified_delta_naming_a_removed_requirement_is_rejected() {
     assert!(
         matches!(
             &result,
-            Err(StoreError::RequirementNotFound { requirement_id, .. })
-                if requirement_id == "req-retired"
+            Err(StoreError::RequirementNameNotLive { name, live, .. })
+                if name == "retries are unbounded" && live.is_empty()
         ),
         "a requirement already retired cannot be patched, got {result:?}"
     );

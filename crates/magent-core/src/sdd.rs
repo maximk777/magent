@@ -59,19 +59,20 @@ pub enum ChangeStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeltaOp {
-    /// A new requirement. Needs `text` and at least one scenario; carries no
-    /// `requirement_id` because there is nothing yet to point at.
+    /// A new requirement. Needs `text` and at least one scenario; its `name`
+    /// is the one being introduced, not one the capability already holds.
     Added,
-    /// Replaces an existing requirement's text. Needs `requirement_id`,
-    /// `text` and at least one scenario — the whole requirement, not a
-    /// diff, so nothing is lost if only part of it is supplied.
+    /// Replaces an existing requirement's text. `name` must be a live
+    /// requirement of the capability; needs `text` and at least one scenario
+    /// — the whole requirement, not a diff, so nothing is lost if only part
+    /// of it is supplied.
     Modified,
-    /// Retires an existing requirement. Needs `requirement_id`, `reason`
-    /// and `migration`: a removal without a path forward is a break nobody
-    /// explained.
+    /// Retires an existing requirement. `name` must be a live requirement of
+    /// the capability; needs `reason` and `migration`, because a removal
+    /// without a path forward is a break nobody explained.
     Removed,
-    /// Renames an existing requirement without changing its text. Needs
-    /// `requirement_id` and `rename_to`.
+    /// Renames an existing requirement without changing its text. `name` must
+    /// be a live requirement of the capability; needs `rename_to`.
     Renamed,
 }
 
@@ -125,11 +126,6 @@ pub struct RequirementDraft {
     /// forward is a break nobody explained.
     #[serde(default)]
     pub migration: Option<String>,
-    /// Addresses an existing requirement by id. Required for everything but
-    /// `Added`, because `Modified`, `Removed` and `Renamed` all patch a
-    /// requirement that already exists rather than re-pasting its text.
-    #[serde(default)]
-    pub requirement_id: Option<String>,
     /// Required, and must be non-empty, for `Added` and `Modified`: a
     /// requirement with no scenario can only be asserted, never checked
     /// against. `OpenSpec` states the same rule in prose, where a scenario
@@ -167,25 +163,6 @@ impl Validate for RequirementDraft {
                     return Err(DomainError::MissingRenameTarget);
                 }
             }
-        }
-
-        if matches!(
-            self.op,
-            DeltaOp::Modified | DeltaOp::Removed | DeltaOp::Renamed
-        ) && self.requirement_id.is_none()
-        {
-            return Err(DomainError::MissingRequirementId);
-        }
-
-        // Checked after the missing pieces above, so a draft with two faults
-        // is told what it lacks before what it carries in excess. An addition
-        // names nothing yet, so an id here is a leftover from a copied draft:
-        // the store has no row to point it at and would drop it, which is the
-        // one outcome this crate refuses everywhere else. The caller would go
-        // on believing it had patched something while a second requirement
-        // appeared beside the first.
-        if matches!(self.op, DeltaOp::Added) && self.requirement_id.is_some() {
-            return Err(DomainError::UnexpectedRequirementId);
         }
 
         for scenario in &self.scenarios {

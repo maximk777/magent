@@ -142,6 +142,17 @@ pub enum StoreError {
         capability_path: String,
     },
 
+    /// A patch delta named a requirement that is not live in the capability it
+    /// was filed under. The live names come with it: a caller that named
+    /// something it cannot find is handed the list it should have named from,
+    /// which is the rule the change lookup already follows.
+    #[error("no live requirement of capability {capability_path:?} is called {name:?}; it holds: {}", .live.join(", "))]
+    RequirementNameNotLive {
+        name: String,
+        capability_path: String,
+        live: Vec<String>,
+    },
+
     /// A change accumulates deltas: a second `specify` for the same capability
     /// adds to what is already proposed rather than replacing it, so a
     /// requirement name it has used once cannot be used again. The
@@ -376,6 +387,7 @@ impl StoreError {
             Self::CapabilityPurposeRequired(_) => "capability_purpose_required",
             Self::CapabilityPurposeRedundant(_) => "capability_purpose_redundant",
             Self::RequirementNotFound { .. } => "requirement_not_found",
+            Self::RequirementNameNotLive { .. } => "requirement_name_not_live",
             Self::DeltaAlreadyProposed { .. } => "delta_already_proposed",
             Self::ChangeNotSpecified { .. } => "change_not_specified",
             Self::RequirementsUncovered(_) => "requirements_uncovered",

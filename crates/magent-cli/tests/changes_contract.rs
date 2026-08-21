@@ -299,7 +299,6 @@ fn a_requirement_with_two_scenarios() -> RequirementDraft {
         rename_to: None,
         reason: None,
         migration: None,
-        requirement_id: None,
         scenarios: vec![
             ScenarioDraft {
                 name: "budget exhausted".to_owned(),

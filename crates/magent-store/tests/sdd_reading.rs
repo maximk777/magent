@@ -157,7 +157,6 @@ impl Fixture {
                             rename_to: None,
                             reason: None,
                             migration: None,
-                            requirement_id: None,
                             // Two scenarios whose names also sort the other way
                             // round from their sequence, so an `ORDER BY name`
                             // here would swap them visibly.
@@ -183,7 +182,6 @@ impl Fixture {
                             rename_to: None,
                             reason: None,
                             migration: None,
-                            requirement_id: None,
                             scenarios: vec![ScenarioDraft {
                                 name: "one attempt".into(),
                                 given: None,
@@ -279,8 +277,6 @@ impl Fixture {
     /// Hands the change back so a test can read the removal delta itself, not
     /// only its effect on the live base.
     fn retire(&self, name: &str) -> ChangeId {
-        let requirement_id = self.live_requirement_id(name);
-
         let change = self
             .store
             .propose(
@@ -316,7 +312,6 @@ impl Fixture {
                         rename_to: None,
                         reason: Some("The budget subsumes it.".into()),
                         migration: Some("Set the budget to one for the old behaviour.".into()),
-                        requirement_id: Some(requirement_id),
                         scenarios: Vec::new(),
                     }],
                 },
@@ -348,23 +343,6 @@ impl Fixture {
             .expect("archive");
 
         change
-    }
-
-    /// The id of a live requirement, read straight off the row.
-    ///
-    /// Off the row because there is nowhere else to read it from:
-    /// `CapabilityDetail` carries no ids, so a change meaning to modify, remove
-    /// or rename a requirement — all three of which `magent-core` refuses
-    /// without one — cannot address it from anything these two methods return.
-    /// Worth closing somewhere, but not here.
-    fn live_requirement_id(&self, name: &str) -> String {
-        self.raw()
-            .query_row(
-                "SELECT id FROM requirements WHERE name = ?1 AND status = 'live'",
-                [name],
-                |row| row.get(0),
-            )
-            .expect("live requirement id")
     }
 
     /// A second connection to the same file, for the assertions the store's own

@@ -68,17 +68,6 @@ pub enum DomainError {
     #[error("a renamed requirement needs a new name")]
     MissingRenameTarget,
 
-    #[error("a modified, removed or renamed requirement needs a requirement_id")]
-    MissingRequirementId,
-
-    /// The store would ignore it, and ignoring it is the wrong answer: a
-    /// caller that reused a draft and forgot to clear the field believes it
-    /// is patching a requirement while a new one is being added beside the
-    /// old. Refusing costs one retry; dropping it costs a duplicate nobody
-    /// went looking for.
-    #[error("an added requirement names nothing yet, so it must not carry a requirement_id")]
-    UnexpectedRequirementId,
-
     #[error("a scenario's when and then must not be blank")]
     InvalidScenario,
 
@@ -147,8 +136,6 @@ impl DomainError {
             Self::MissingRemovalReason => "missing_removal_reason",
             Self::MissingRemovalMigration => "missing_removal_migration",
             Self::MissingRenameTarget => "missing_rename_target",
-            Self::MissingRequirementId => "missing_requirement_id",
-            Self::UnexpectedRequirementId => "unexpected_requirement_id",
             Self::InvalidScenario => "invalid_scenario",
             Self::MissingTasks => "missing_tasks",
             Self::DuplicateTaskNumber => "duplicate_task_number",

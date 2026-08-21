@@ -42,7 +42,6 @@ fn valid_requirement() -> RequirementDraft {
         rename_to: None,
         reason: None,
         migration: None,
-        requirement_id: None,
         scenarios: vec![valid_scenario()],
     }
 }
@@ -255,7 +254,6 @@ fn added_or_modified_requirements_need_at_least_one_scenario() {
         let command = SpecifyCommand {
             requirements: vec![RequirementDraft {
                 op,
-                requirement_id: Some("req-1".into()),
                 scenarios: vec![],
                 ..valid_requirement()
             }],
@@ -277,7 +275,6 @@ fn added_or_modified_requirements_need_text() {
         let command = SpecifyCommand {
             requirements: vec![RequirementDraft {
                 op,
-                requirement_id: Some("req-1".into()),
                 text: None,
                 ..valid_requirement()
             }],
@@ -292,7 +289,6 @@ fn added_or_modified_requirements_need_text() {
         let command = SpecifyCommand {
             requirements: vec![RequirementDraft {
                 op,
-                requirement_id: Some("req-1".into()),
                 text: Some("   ".into()),
                 ..valid_requirement()
             }],
@@ -312,7 +308,6 @@ fn added_or_modified_requirements_need_text() {
 fn removed_requirements_need_a_reason_and_a_migration() {
     let base = RequirementDraft {
         op: DeltaOp::Removed,
-        requirement_id: Some("req-1".into()),
         text: None,
         scenarios: vec![],
         reason: Some("Superseded by the retry budget.".into()),
@@ -357,7 +352,6 @@ fn renamed_requirements_need_a_new_name() {
     let command = SpecifyCommand {
         requirements: vec![RequirementDraft {
             op: DeltaOp::Renamed,
-            requirement_id: Some("req-1".into()),
             text: None,
             scenarios: vec![],
             rename_to: None,
@@ -369,52 +363,6 @@ fn renamed_requirements_need_a_new_name() {
     assert_eq!(
         command.validate().unwrap_err().code(),
         "missing_rename_target"
-    );
-}
-
-/// MODIFIED, REMOVED and RENAMED all address an existing requirement by id
-/// rather than re-pasting its text, so all three need one.
-#[test]
-fn modified_removed_and_renamed_requirements_need_a_requirement_id() {
-    for op in [DeltaOp::Modified, DeltaOp::Removed, DeltaOp::Renamed] {
-        let command = SpecifyCommand {
-            requirements: vec![RequirementDraft {
-                op,
-                requirement_id: None,
-                text: Some("Updated text.".into()),
-                reason: Some("Because.".into()),
-                migration: Some("Do the thing.".into()),
-                rename_to: Some("new-name".into()),
-                ..valid_requirement()
-            }],
-            ..valid_specify()
-        };
-        assert_eq!(
-            command.validate().unwrap_err().code(),
-            "missing_requirement_id",
-            "{op:?} without a requirement_id should be rejected"
-        );
-    }
-}
-
-/// The mirror of the rule above, and the reason it is a rule rather than a
-/// shrug: the store has nothing to point an id at for an addition, so it
-/// would drop one silently, and a caller that reused a draft would believe
-/// it had patched a requirement while a second one appeared beside it.
-#[test]
-fn an_added_requirement_must_not_carry_a_requirement_id() {
-    let command = SpecifyCommand {
-        requirements: vec![RequirementDraft {
-            op: DeltaOp::Added,
-            requirement_id: Some("left-over-from-a-copied-draft".into()),
-            ..valid_requirement()
-        }],
-        ..valid_specify()
-    };
-
-    assert_eq!(
-        command.validate().unwrap_err().code(),
-        "unexpected_requirement_id"
     );
 }
 
