@@ -702,7 +702,11 @@ impl Store {
     /// that is incomplete and a plan that is unfinished need different fixes,
     /// [`StoreError::NothingToArchive`] when it proposes no deltas and did not
     /// declare `skip_specs`, [`StoreError::CapabilityPurposeRequired`] when a
-    /// delta creating a capability carries no purpose, or a database error.
+    /// delta creating a capability carries no purpose,
+    /// [`StoreError::RequirementNotFound`] when a patch delta's requirement
+    /// stopped being live between `specify` and here — this is the only method
+    /// that raises it, because it is the only one that patches by an id the
+    /// store itself resolved — or a database error.
     pub fn archive(
         &self,
         command: &ArchiveCommand,
