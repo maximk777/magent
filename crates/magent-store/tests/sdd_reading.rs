@@ -457,6 +457,35 @@ fn an_archived_change_shows_up_as_live_specification() {
     );
 }
 
+/// A reader meets a requirement while deciding what to propose against it, and
+/// what they want is why it says what it says. The change that wrote it is the
+/// shortest way to that, and until now the row did not record one.
+#[test]
+fn a_live_requirement_names_the_change_that_last_wrote_it() {
+    let fixture = Fixture::new();
+    fixture.archived_change();
+
+    let detail = fixture
+        .store
+        .capability_detail(CAPABILITY, &fixture.context)
+        .expect("capability detail")
+        .expect("the capability is this workspace's");
+
+    let requirement = detail
+        .requirements
+        .iter()
+        .find(|requirement| requirement.name == BUDGET)
+        .expect("the budget requirement is live");
+
+    let origin = requirement
+        .origin
+        .as_ref()
+        .expect("a requirement archived under a change names that change");
+
+    assert_eq!(origin.slug, SLUG);
+    assert_eq!(origin.title, "Add a retry budget");
+}
+
 /// A requirement a later change retired is that change's history, not the
 /// product's specification — and nothing deletes it, so the `status = 'live'`
 /// filter is the only thing keeping it out of either answer.
