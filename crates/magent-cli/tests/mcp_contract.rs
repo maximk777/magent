@@ -2466,6 +2466,93 @@ async fn a_slug_naming_two_archived_changes_and_no_live_one_is_refused() {
     client.cancel().await.expect("shutdown");
 }
 
+/// Puts a change in `abandoned` by hand, because no tool writes it: archiving
+/// is the only ending `magent_archive` offers, and nothing else in the
+/// codebase sets the status either. That is exactly why the branch below needs
+/// it — `is_open` counts abandoned as finished alongside archived, so an
+/// abandoned change reaches the candidate list of a refusal that no fixture
+/// built out of tool calls can produce.
+fn abandon(fixture: &Fixture, change: &str) {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open the store");
+    connection
+        .busy_timeout(Duration::from_secs(10))
+        .expect("busy timeout");
+    let moved = connection
+        .execute(
+            "UPDATE sdd_changes SET status = 'abandoned' WHERE id = ?1",
+            [change],
+        )
+        .expect("abandon the change");
+    assert_eq!(moved, 1, "one row, the change being abandoned");
+}
+
+/// Each candidate of that refusal is rendered with the status its own row
+/// holds. `archived` is only one of the two that can get a change into the
+/// list — `is_open` calls abandoned finished too — so a candidate line that
+/// says `archived` because the code says `archived` tells the reader a change
+/// ended somewhere it never went, in the one line they were given to choose
+/// with.
+///
+/// The pair here therefore differs, and both halves are asserted: hardcode
+/// `archived` and the abandoned candidate fails, hardcode `abandoned` and the
+/// archived one does.
+#[tokio::test]
+async fn each_candidate_of_the_refusal_carries_its_own_status_not_the_word_archived() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let first = call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    let first_id = first["id"].as_str().expect("an id").to_owned();
+    call(&client, "magent_specify", deltas("add-retry-budget")).await;
+    call(&client, "magent_plan", tasks("add-retry-budget")).await;
+    finish_tasks(&fixture);
+    call(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "add-retry-budget" }),
+    )
+    .await;
+
+    // No deltas of its own, for the reason the archived-pair test gives: the
+    // requirement the first change added is live now, and re-adding it would
+    // be refused for something this test is not about.
+    let second = call(
+        &client,
+        "magent_propose",
+        json!({
+            "operation_id": uuid(),
+            "slug": "add-retry-budget",
+            "title": "Add a retry budget, the second time",
+            "classification": "bounded",
+            "why": "the budget was reverted and the work came back under its old name",
+            "what_changes": ["restore the budget"],
+            "skip_specs": true
+        }),
+    )
+    .await;
+    let second_id = second["id"].as_str().expect("an id").to_owned();
+    abandon(&fixture, &second_id);
+
+    let error = call_expecting_error(
+        &client,
+        "magent_changes",
+        json!({ "change": "add-retry-budget" }),
+    )
+    .await;
+
+    assert!(
+        error.contains(&format!("{first_id} (archived")),
+        "the archived candidate has to read as archived: {error}"
+    );
+    assert!(
+        error.contains(&format!("{second_id} (abandoned")),
+        "and the abandoned one as abandoned, which is the half a hardcoded \
+         `archived` gets wrong: {error}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
 /// Proposing the same slug twice rewrites the proposal, and that is the
 /// ordinary way to widen a change's scope. A bare identifier back would leave
 /// the caller unable to tell that from having opened something new.

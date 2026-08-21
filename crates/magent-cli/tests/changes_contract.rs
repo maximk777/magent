@@ -298,6 +298,23 @@ impl World {
         assert_eq!(closed, 1, "no task numbered {number} to close");
     }
 
+    /// Puts a change in `abandoned`, the row being set directly for the same
+    /// reason `close_task` sets its own: the store offers no verb for it, and
+    /// nothing in the codebase writes the status at all. It still has to be
+    /// reachable here, because `is_open` counts abandoned as finished beside
+    /// archived — so an abandoned change lands among the candidates of a
+    /// refusal, and no fixture built out of the store's verbs can show that.
+    fn abandon(&self, change: ChangeId) {
+        let connection = rusqlite::Connection::open(self.database()).expect("open the store");
+        let moved = connection
+            .execute(
+                "UPDATE sdd_changes SET status = 'abandoned' WHERE id = ?1",
+                [change.to_string()],
+            )
+            .expect("abandon the change");
+        assert_eq!(moved, 1, "one row, the change being abandoned");
+    }
+
     /// A tick in the journal, written directly rather than through a
     /// checkpoint: closing a task properly needs a run bound to the change and
     /// a plan whose command it can quote, and what this file tests is what the
@@ -933,5 +950,47 @@ fn a_slug_two_archived_changes_share_prints_both_rather_than_choosing() {
     assert!(
         !report.contains(ARCHIVED_WHY) && !report.contains(SECOND_WHY),
         "printing either proposal would be the guess this refuses to make: {report}"
+    );
+}
+
+/// Each candidate that refusal lists carries the status of the row it came
+/// from. `archived` is only one of the two statuses that get a change into
+/// the list — `is_open` counts abandoned as finished as well — so a candidate
+/// line reading `archived` because the code says `archived` tells the reader a
+/// change ended somewhere it never went, in the one line they were given to
+/// choose with.
+///
+/// The pair here differs for that reason and both halves are asserted: a
+/// hardcoded `archived` fails on the abandoned candidate, a hardcoded
+/// `abandoned` on the archived one.
+#[test]
+fn each_candidate_of_the_refusal_carries_its_own_status_not_the_word_archived() {
+    let world = World::new();
+
+    let archived = world.plan_a_change("retry-budget", ARCHIVED_WHY, &[("1", "Add the budget")]);
+    world.close_task("1");
+    world.archive(archived);
+
+    // Abandoning needs no task closed: it is an `UPDATE`, not an ending the
+    // store walks a change through.
+    let abandoned = world.plan_a_change(
+        "retry-budget",
+        SECOND_WHY,
+        &[("2", "Take the ceiling from the dependency")],
+    );
+    world.abandon(abandoned);
+
+    // The exit code is the neighbouring test's subject; this one is about
+    // what the two lines under the refusal say.
+    let (_, report) = world.changes(&["retry-budget"]);
+
+    assert!(
+        report.contains(&format!("{archived}  archived")),
+        "the archived candidate has to read as archived: {report}"
+    );
+    assert!(
+        report.contains(&format!("{abandoned}  abandoned")),
+        "and the abandoned one as abandoned, which is the half a hardcoded \
+         `archived` gets wrong: {report}"
     );
 }
