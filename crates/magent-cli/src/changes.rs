@@ -12,7 +12,7 @@
 use std::{fmt::Write as _, path::Path};
 
 use magent_core::{ChangeId, ChangeStatus};
-use magent_store::{ChangeDetail, ChangeSummary, FactContext, Store};
+use magent_store::{ChangeDetail, ChangeSummary, DeltaSummary, FactContext, Store};
 
 /// Writes the report, returning false when the command could not answer.
 ///
@@ -160,13 +160,7 @@ fn write_detail(detail: &ChangeDetail, out: &mut String) {
     if !detail.deltas.is_empty() {
         let _ = writeln!(out, "\nrequirements  {}", detail.deltas.len());
         for delta in &detail.deltas {
-            let _ = writeln!(
-                out,
-                "  {}  {}  {}",
-                delta_op_name(delta.op),
-                delta.capability_path,
-                delta.name,
-            );
+            write_delta(delta, out);
         }
     }
 
@@ -211,6 +205,69 @@ fn write_detail(detail: &ChangeDetail, out: &mut String) {
     }
 
     push_journal(out, detail);
+}
+
+/// One requirement delta, in the words a reviewer has to judge.
+///
+/// The header line — op, capability, name — is enough to look a requirement
+/// up, and looking it up is exactly what the `sdd-brainstorm` skill's closing
+/// question does not leave room for: it asks a person to approve a
+/// specification in the terminal, and a name approved on trust is the model
+/// reviewing its own work. So the text comes with it, printed line for line at
+/// an indent the way the proposal's `why` is, rather than reflowed — the
+/// author's paragraph breaks are part of what they wrote.
+///
+/// The scenarios carry a `scenario` label, and a blank line above them where
+/// there is prose to separate them from, because a requirement's text is a
+/// paragraph the terminal wraps back to the left margin — an indent alone
+/// stops telling the reader where the prose ended and the list began. `given`
+/// is dropped when the scenario has none instead of printed empty, because an
+/// empty label reads as a scenario missing its precondition rather than as one
+/// that needs none.
+fn write_delta(delta: &DeltaSummary, out: &mut String) {
+    let _ = writeln!(
+        out,
+        "\n  {}  {}  {}",
+        delta_op_name(delta.op),
+        delta.capability_path,
+        delta.name,
+    );
+
+    let mut prose = false;
+
+    if let Some(text) = &delta.text {
+        for line in text.lines() {
+            let _ = writeln!(out, "    {line}");
+        }
+        prose = true;
+    }
+
+    if let Some(rename_to) = &delta.rename_to {
+        let _ = writeln!(out, "    renamed to  {rename_to}");
+        prose = true;
+    }
+
+    // A removed requirement has no text at all, so these two are the whole of
+    // what a reviewer gets to judge the removal by.
+    for (label, value) in [("reason", &delta.reason), ("migration", &delta.migration)] {
+        if let Some(value) = value {
+            let _ = writeln!(out, "    {label:<9}  {value}");
+            prose = true;
+        }
+    }
+
+    if prose && !delta.scenarios.is_empty() {
+        let _ = writeln!(out);
+    }
+
+    for scenario in &delta.scenarios {
+        let _ = writeln!(out, "    scenario  {}", scenario.name);
+        if let Some(given) = &scenario.given {
+            let _ = writeln!(out, "      {:<5}  {}", "given", given);
+        }
+        let _ = writeln!(out, "      {:<5}  {}", "when", scenario.when);
+        let _ = writeln!(out, "      {:<5}  {}", "then", scenario.then);
+    }
 }
 
 /// What the plan has already proved, under the plan itself.
