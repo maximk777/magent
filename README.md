@@ -9,7 +9,7 @@ all of that; Magent remembers what the context window forgets.
 
 ## What works today
 
-Slice 1: context survival.
+Context survival.
 
 - A task is recorded from your first prompt, whether or not the model announces
   it.
@@ -21,7 +21,7 @@ Slice 1: context survival.
 - Reasoning the model alone knows (decisions, alternatives rejected, what was
   verified) is distilled from the transcript in the background.
 
-Slice 2: durable memory.
+Durable memory.
 
 - Facts carry where they apply, how they may conflict, how far they are
   trusted, and what they were learned from. A new value supersedes the old one
@@ -33,7 +33,7 @@ Slice 2: durable memory.
 - The existing corpus imports and exports losslessly, so the store is not a
   one-way door.
 
-Slice 3, in progress: workspaces.
+Workspaces.
 
 - A repository's toolchain is read from its manifests on first sight: language
   and version, package manager, declared scripts, linter configuration. All of
@@ -44,7 +44,7 @@ Slice 3, in progress: workspaces.
 - Each repository carries a role, so infrastructure that deploys a dozen
   services is not treated like the service being worked on.
 
-Slice 4: the console.
+The console.
 
 ```bash
 magent web
