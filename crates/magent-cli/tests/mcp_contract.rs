@@ -2246,12 +2246,54 @@ async fn an_unknown_slug_names_the_open_ones() {
 /// slug resolver only ever looked among what was open, so the name the change
 /// was archived under stopped answering the moment it was archived — and the
 /// slug is the only handle a caller still has after a compaction.
+///
+/// What comes back is asserted whole — proposal, deltas, tasks and ticks —
+/// because "still readable" is not the promise: a caller that gets the slug to
+/// resolve but reads back a change stripped of the evidence its tasks were
+/// closed on has lost exactly what archiving said it was keeping.
+///
+/// The fixture is carried by hand rather than through `archive_one_capability`,
+/// which closes its tasks with a direct `UPDATE` and so leaves no tick behind.
+/// Here the task is closed the way an executing agent closes one — a checkpoint
+/// carrying `task_done` — which is both what writes the tick and what lets the
+/// change be archived at all, since a change with an open task cannot be.
 #[tokio::test]
 async fn an_archived_change_is_still_read_by_its_slug() {
     let fixture = Fixture::new();
     let client = connect(&fixture).await;
 
-    archive_one_capability(&client, &fixture).await;
+    call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    call(&client, "magent_specify", deltas("add-retry-budget")).await;
+    call(&client, "magent_plan", tasks("add-retry-budget")).await;
+    call(
+        &client,
+        "magent_start",
+        json!({ "operation_id": uuid(), "task": "add a retry budget" }),
+    )
+    .await;
+    call(
+        &client,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "the worker stops once the budget is spent",
+            "spec_change_id": "add-retry-budget",
+            "current_task": "1: cap the attempts in the worker",
+            "task_done": {
+                "number": "1",
+                "verify_command": "cargo test -p worker budget",
+                "output": "running 1 test\ntest budget_caps_retries ... ok\n"
+            }
+        }),
+    )
+    .await;
+    call(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "add-retry-budget" }),
+    )
+    .await;
 
     let opened = call(
         &client,
@@ -2272,14 +2314,34 @@ async fn an_archived_change_is_still_read_by_its_slug() {
         "an archived change is read back under its own name: {opened}"
     );
     assert_eq!(
+        change["why"].as_str(),
+        Some("retries currently loop forever and starve the queue of capacity"),
+        "whole, not just findable — the reasoning is what archiving kept: {opened}"
+    );
+    assert_eq!(
+        change["what_changes"],
+        json!(["add a budget type", "wire it into the client"]),
+        "{opened}"
+    );
+    assert_eq!(
         change["deltas"][0]["name"].as_str(),
         Some("budget-caps-retries"),
-        "whole, not just findable — the reasoning is what archiving kept: {opened}"
+        "{opened}"
     );
     assert_eq!(
         change["tasks"][0]["verify_command"].as_str(),
         Some("cargo test -p worker budget"),
         "{opened}"
+    );
+    assert_eq!(
+        change["ticks"][0]["number"].as_str(),
+        Some("1"),
+        "the evidence the task was closed on outlives the archive: {opened}"
+    );
+    assert_eq!(
+        change["ticks"][0]["output"].as_str(),
+        Some("running 1 test\ntest budget_caps_retries ... ok\n"),
+        "a tick without what the command printed proves nothing: {opened}"
     );
     client.cancel().await.expect("shutdown");
 }
