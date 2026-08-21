@@ -301,14 +301,14 @@ tests rather than intent.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-./scripts/check-isolation.sh    # no test may touch the real ~/.magent
-./scripts/check-plugin.sh       # the plugin would work on a clean clone
+./scripts/test.sh                # the suite, under a throwaway HOME
+./scripts/check-plugin.sh        # the plugin would work on a clean clone
 ```
 
-All five before a commit. Tests never touch a real profile: they direct all
-state at temporary directories through `MAGENT_STATE_DIR`, and
-`check-isolation.sh` exists because that rule was once nearly broken.
+All four before a commit. Tests never touch a real profile: they direct all
+state at temporary directories through `MAGENT_STATE_DIR`, and `scripts/test.sh`
+runs them under a throwaway `HOME`, so a test that forgets one cannot reach a
+real profile without the run going red.
 
 One test needs an authenticated `claude` and a network, so it is excluded by
 default:
