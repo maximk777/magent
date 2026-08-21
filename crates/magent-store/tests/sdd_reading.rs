@@ -345,6 +345,88 @@ impl Fixture {
         change
     }
 
+    /// A second change, taken the same way to `archived`, that rewrites one
+    /// requirement of the live capability rather than retiring it — copied from
+    /// `retire` with the three fields a modification needs that a removal does
+    /// not: `op`, `text`, and one `ScenarioDraft`.
+    ///
+    /// Reuses `RETIRE_SLUG` and its title: the fixture only ever needs one
+    /// second change on stage at a time, and giving the rewrite its own slug
+    /// would just be a second constant nothing reads differently.
+    fn rewrite(&self, name: &str) -> ChangeId {
+        let change = self
+            .store
+            .propose(
+                &ProposeCommand {
+                    operation_id: OperationId::new(),
+                    slug: RETIRE_SLUG.into(),
+                    title: "Retire the per-attempt rule".into(),
+                    classification: Classification::Bounded,
+                    why: "The budget subsumes counting every attempt separately.".into(),
+                    what_changes: vec!["Drop the per-attempt requirement".into()],
+                    capabilities: vec![CAPABILITY.into()],
+                    impact: None,
+                    skip_specs: false,
+                },
+                &self.context,
+            )
+            .expect("propose")
+            .id;
+
+        self.store
+            .specify(
+                &SpecifyCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    capability_path: CAPABILITY.into(),
+                    // No purpose: the capability is live by now, and `specify`
+                    // refuses one it is not being asked to create.
+                    purpose: None,
+                    requirements: vec![RequirementDraft {
+                        op: DeltaOp::Modified,
+                        name: name.into(),
+                        text: Some("The worker SHALL stop retrying once the budget runs out, counted in whole units.".into()),
+                        rename_to: None,
+                        reason: None,
+                        migration: None,
+                        scenarios: vec![ScenarioDraft {
+                            name: "budget exhausted".into(),
+                            given: None,
+                            when: "the budget runs out".into(),
+                            then: "the job is parked".into(),
+                        }],
+                    }],
+                },
+                &self.context,
+            )
+            .expect("specify");
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![task("Drop the per-attempt rule", &[name])],
+                },
+                &self.context,
+            )
+            .expect("plan");
+
+        self.close_the_task(RETIRE_SLUG);
+
+        self.store
+            .archive(
+                &ArchiveCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                },
+                &self.context,
+            )
+            .expect("archive");
+
+        change
+    }
+
     /// A second connection to the same file, for the assertions the store's own
     /// reading cannot make.
     fn raw(&self) -> Connection {
@@ -881,5 +963,47 @@ fn a_change_with_no_ticks_reads_an_empty_journal() {
         detail.ticks.is_empty(),
         "nothing has closed a task of this change: {:?}",
         detail.ticks
+    );
+}
+
+/// The change a reader wants is the one that made the requirement read as it
+/// does now, which after a rewrite is not the one that introduced it.
+#[test]
+fn a_rewritten_requirement_names_the_change_that_rewrote_it() {
+    let fixture = Fixture::new();
+    fixture.archived_change();
+    fixture.rewrite(BUDGET);
+
+    let detail = fixture
+        .store
+        .capability_detail(CAPABILITY, &fixture.context)
+        .expect("capability detail")
+        .expect("the capability is this workspace's");
+
+    let requirement = detail
+        .requirements
+        .iter()
+        .find(|requirement| requirement.name == BUDGET)
+        .expect("the budget requirement is still live");
+    let origin = requirement.origin.as_ref().expect("an origin");
+
+    assert_eq!(
+        origin.slug, RETIRE_SLUG,
+        "the change that last wrote it, not the one that introduced it"
+    );
+
+    // The rewrite named only BUDGET, so ATTEMPT's origin has to survive it
+    // unchanged — a stamp that re-marked every requirement of the capability
+    // would pass the assertion above and still be wrong.
+    let attempt = detail
+        .requirements
+        .iter()
+        .find(|requirement| requirement.name == ATTEMPT)
+        .expect("the attempt requirement is untouched by the rewrite");
+    let attempt_origin = attempt.origin.as_ref().expect("an origin");
+
+    assert_eq!(
+        attempt_origin.slug, SLUG,
+        "the rewrite named only BUDGET, so ATTEMPT still names the change that introduced it"
     );
 }
