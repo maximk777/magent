@@ -26,6 +26,11 @@ const CAPABILITY: &str = "worker/retry";
 const BUDGET: &str = "The worker stops retrying once its budget is spent";
 const ATTEMPT: &str = "Each attempt spends one unit of the budget";
 
+/// What `Fixture::rename` moves `BUDGET` to: the same rule under a different
+/// name, so that a test looking the requirement up by this one is proving the
+/// rename landed rather than finding the row it started as.
+const RENAMED_BUDGET: &str = "Retrying stops once the budget is spent";
+
 const BUDGET_TEXT: &str = "The worker SHALL stop retrying once the budget is spent.";
 const ATTEMPT_TEXT: &str = "The worker SHALL spend one unit of the budget per attempt.";
 
@@ -396,6 +401,87 @@ impl Fixture {
                             when: "the budget runs out".into(),
                             then: "the job is parked".into(),
                         }],
+                    }],
+                },
+                &self.context,
+            )
+            .expect("specify");
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![task("Drop the per-attempt rule", &[name])],
+                },
+                &self.context,
+            )
+            .expect("plan");
+
+        self.close_the_task(RETIRE_SLUG);
+
+        self.store
+            .archive(
+                &ArchiveCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                },
+                &self.context,
+            )
+            .expect("archive");
+
+        change
+    }
+
+    /// A second change, taken the same way to `archived`, that renames one
+    /// requirement of the live capability rather than rewriting it — copied
+    /// from `rewrite` with `text` and the scenario dropped and `rename_to`
+    /// added, because a rename proposes neither: `apply_delta` moves the name
+    /// and leaves everything the requirement says exactly where it was.
+    ///
+    /// The draft still names the requirement by its *live* name, which is what
+    /// `specify` resolves the delta against; `rename_to` is where the new one
+    /// goes. The plan covers the live name too — a task's `covers` is matched
+    /// against `spec_deltas.name`, which a rename never moves.
+    ///
+    /// Reuses `RETIRE_SLUG` and its title for the reason `rewrite` gives.
+    fn rename(&self, name: &str, rename_to: &str) -> ChangeId {
+        let change = self
+            .store
+            .propose(
+                &ProposeCommand {
+                    operation_id: OperationId::new(),
+                    slug: RETIRE_SLUG.into(),
+                    title: "Retire the per-attempt rule".into(),
+                    classification: Classification::Bounded,
+                    why: "The budget subsumes counting every attempt separately.".into(),
+                    what_changes: vec!["Drop the per-attempt requirement".into()],
+                    capabilities: vec![CAPABILITY.into()],
+                    impact: None,
+                    skip_specs: false,
+                },
+                &self.context,
+            )
+            .expect("propose")
+            .id;
+
+        self.store
+            .specify(
+                &SpecifyCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    capability_path: CAPABILITY.into(),
+                    // No purpose: the capability is live by now, and `specify`
+                    // refuses one it is not being asked to create.
+                    purpose: None,
+                    requirements: vec![RequirementDraft {
+                        op: DeltaOp::Renamed,
+                        name: name.into(),
+                        text: None,
+                        rename_to: Some(rename_to.into()),
+                        reason: None,
+                        migration: None,
+                        scenarios: Vec::new(),
                     }],
                 },
                 &self.context,
@@ -1051,7 +1137,9 @@ fn a_rewritten_requirement_names_the_change_that_rewrote_it() {
 /// change the fresher of the two would take an `UPDATE` no store method
 /// offers, so the assertion below pins the order without isolating the status
 /// term from the timestamp — the direction of the status term is what it
-/// catches.
+/// catches. Isolating it is
+/// `changes_named_puts_the_live_change_first_even_when_the_archived_one_is_fresher`,
+/// which writes that `UPDATE` by hand.
 #[test]
 fn changes_named_finds_the_archived_change_beside_the_open_one() {
     let fixture = Fixture::new();
@@ -1079,6 +1167,166 @@ fn changes_named_finds_the_archived_change_beside_the_open_one() {
         found[1].updated_at <= found[0].updated_at,
         "the open change is the fresher of the two, which is the only way round \
          this fixture can produce: {:?} then {:?}",
+        found[0].updated_at,
+        found[1].updated_at
+    );
+}
+
+/// A requirement archived before `0014_requirement_origin.sql` has no origin
+/// recorded, and it is still the specification: dropping it from the
+/// capability because the join found no change would hide live behaviour, and
+/// filling the gap from the columns the join left empty would hand a reader
+/// two empty strings dressed as provenance. The migration chose the absence,
+/// on the grounds that a reader can see an absence and cannot see a guess.
+///
+/// Nothing else here can produce that state — every requirement the fixture
+/// writes is stamped by the change that archived it — so the null is made the
+/// only way it can be, by clearing the column the way the pre-migration rows
+/// already are.
+#[test]
+fn a_requirement_with_no_origin_recorded_stays_live_and_claims_none() {
+    let fixture = Fixture::new();
+    fixture.archived_change();
+
+    let cleared = fixture
+        .raw()
+        .execute("UPDATE requirements SET origin_change_id = NULL", [])
+        .expect("clear the origins");
+    assert_eq!(
+        cleared, 2,
+        "both live requirements were stamped, so both are being un-stamped here"
+    );
+
+    let detail = fixture
+        .store
+        .capability_detail(CAPABILITY, &fixture.context)
+        .expect("capability detail")
+        .expect("the capability is this workspace's");
+
+    let names: Vec<&str> = detail
+        .requirements
+        .iter()
+        .map(|requirement| requirement.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec![ATTEMPT, BUDGET],
+        "a requirement whose origin was never recorded is still part of the capability"
+    );
+
+    for requirement in &detail.requirements {
+        assert_eq!(
+            requirement.origin, None,
+            "an unrecorded origin reads as absent, not as an origin with nothing in it: {:?}",
+            requirement.name
+        );
+    }
+}
+
+/// A reader who meets a requirement under a name it was not introduced with is
+/// asking why it is called that, and the change that renamed it is the answer
+/// — so a rename has to move the origin along with the name.
+///
+/// The only other rename test asserts the name, the text, the status and the
+/// scenarios, all of which a rename that forgot to stamp the origin would
+/// still get right. This reads the origin back, which is the half nothing was
+/// checking.
+#[test]
+fn a_renamed_requirement_names_the_change_that_renamed_it() {
+    let fixture = Fixture::new();
+    fixture.archived_change();
+    fixture.rename(BUDGET, RENAMED_BUDGET);
+
+    let detail = fixture
+        .store
+        .capability_detail(CAPABILITY, &fixture.context)
+        .expect("capability detail")
+        .expect("the capability is this workspace's");
+
+    let requirement = detail
+        .requirements
+        .iter()
+        .find(|requirement| requirement.name == RENAMED_BUDGET)
+        .expect("the renamed requirement is live under its new name");
+    let origin = requirement
+        .origin
+        .as_ref()
+        .expect("a renamed requirement names the change that renamed it");
+
+    assert_eq!(
+        origin.slug, RETIRE_SLUG,
+        "the change that moved the name, not the one that introduced it"
+    );
+    assert_eq!(origin.title, "Retire the per-attempt rule");
+
+    // The rename named only BUDGET, so ATTEMPT's origin has to survive it
+    // unchanged — a stamp that re-marked every requirement of the capability
+    // would pass the assertion above and still be wrong.
+    let attempt = detail
+        .requirements
+        .iter()
+        .find(|requirement| requirement.name == ATTEMPT)
+        .expect("the attempt requirement is untouched by the rename");
+    let attempt_origin = attempt.origin.as_ref().expect("an origin");
+
+    assert_eq!(
+        attempt_origin.slug, SLUG,
+        "the rename named only BUDGET, so ATTEMPT still names the change that introduced it"
+    );
+}
+
+/// `changes_named` sorts on the status before the timestamp, and both callers
+/// depend on it: each takes `named[0]` as the live change whenever a live one
+/// exists. Order by the timestamp alone and MCP refuses with "every one of
+/// them is archived" while a change is open, and the CLI prints "none of them
+/// is open" above a listing that contains one.
+///
+/// Nothing in normal use can reach that, which is why the status term looks
+/// droppable: a slug is free for reuse only once its predecessor is archived,
+/// and archiving is that predecessor's last write, so the open change is
+/// always the fresher row. Do not read the term as dead weight and remove it —
+/// what keeps it honest is this test, which backdates the open change so the
+/// timestamp argues for the archived one and the status term has to win
+/// anyway.
+#[test]
+fn changes_named_puts_the_live_change_first_even_when_the_archived_one_is_fresher() {
+    let fixture = Fixture::new();
+    let archived = fixture.archived_change();
+    let open = fixture.propose_again();
+
+    // The one thing the store offers no method for, and the only thing that
+    // separates the status term from the timestamp: an open change touched
+    // longer ago than an archived one.
+    let backdated = fixture
+        .raw()
+        .execute(
+            "UPDATE sdd_changes SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params!["2020-01-01T00:00:00+00:00", open.to_string()],
+        )
+        .expect("backdate the open change");
+    assert_eq!(backdated, 1, "one row, the open change");
+
+    let found = fixture
+        .store
+        .changes_named(&fixture.context, SLUG)
+        .expect("changes named");
+
+    assert_eq!(
+        found
+            .iter()
+            .map(|change| (change.id, change.status))
+            .collect::<Vec<_>>(),
+        vec![
+            (open, ChangeStatus::Drafting),
+            (archived, ChangeStatus::Archived)
+        ],
+        "the live change leads whatever the timestamps say"
+    );
+
+    assert!(
+        found[0].updated_at < found[1].updated_at,
+        "the timestamps run the other way here, which is what makes the order above \
+         a statement about the status: {:?} then {:?}",
         found[0].updated_at,
         found[1].updated_at
     );
