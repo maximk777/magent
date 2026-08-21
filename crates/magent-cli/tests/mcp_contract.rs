@@ -407,6 +407,36 @@ async fn every_mutating_tool_requires_an_operation_id() {
     client.cancel().await.expect("shutdown");
 }
 
+/// The id was the one thing no reader returned, so asking for it in the schema
+/// made three of the four delta operations unreachable through the tools.
+#[tokio::test]
+async fn specify_asks_for_a_name_rather_than_a_requirement_id() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let specify = client
+        .list_all_tools()
+        .await
+        .expect("list tools")
+        .into_iter()
+        .find(|tool| tool.name.as_ref() == "magent_specify")
+        .expect("magent_specify is served");
+
+    let schema = serde_json::to_string(&specify.input_schema).expect("schema");
+    assert!(
+        !schema.contains("requirement_id"),
+        "the schema still asks for an identifier no reader returns: {schema}"
+    );
+
+    let description = specify.description.expect("a description");
+    assert!(
+        !description.contains("requirement_id"),
+        "the description still promises an identifier: {description}"
+    );
+
+    client.cancel().await.expect("shutdown");
+}
+
 /// The key is demanded of every call, not only of the ones that apply
 /// something. Spelled out as the whole required set rather than as "contains
 /// the key", because the other half of the decision — that nothing else is
