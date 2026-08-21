@@ -9,8 +9,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use magent_core::{
-    ArchiveCommand, ChangeId, CheckpointCommand, CheckpointOrigin, Classification, Fact,
-    FinishAction, FinishRunCommand, HarnessKind, OperationId, PlanCommand, ProposeCommand,
+    ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, Classification,
+    Fact, FinishAction, FinishRunCommand, HarnessKind, OperationId, PlanCommand, ProposeCommand,
     RememberCommand, RequirementDraft, RunId, SessionId, SpecBinding, SpecifyCommand,
     StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
 };
@@ -586,9 +586,21 @@ impl MagentMcp {
     /// Anything that parses as a UUID is taken as an identifier and passed
     /// through: the store is the one that knows whether it names a change of
     /// this workspace, and it says so in its own terms. Anything else is a
-    /// slug, looked up among the open changes here — an archived change's slug
-    /// is free to be reused, so resolving one would hand back whichever change
-    /// happened to hold it.
+    /// slug, and [`Store::changes_named`] hands back every change that has ever
+    /// held it, live ones first. The first is what the caller means: a name
+    /// that is currently open names the open change, and an archived one
+    /// answers only once nothing live has taken the name back — which is what
+    /// lets a finished change still be read under the name it was archived
+    /// under, the only handle a caller has left after a compaction.
+    ///
+    /// Several archived changes and nothing live is the one case with no
+    /// answer. The slug says nothing about which of them was meant, and the
+    /// most recent is the wrong guess exactly when the question matters — when
+    /// work of the same name was done twice. So it refuses and lists them by
+    /// id, which is unambiguous, with the date each was archived as the only
+    /// thing that tells them apart from outside. (`updated_at` is that date:
+    /// archiving is the last thing that touches such a change, and there is no
+    /// separate column for it.)
     ///
     /// A slug that matches nothing is refused with the open slugs in the
     /// message. The alternative — "no such change" and nothing else — sends the
@@ -599,15 +611,40 @@ impl MagentMcp {
             return Ok(change);
         }
 
+        let named = self
+            .store
+            .changes_named(context, reference)
+            .map_err(|error| render_error(&error))?;
+
+        if let Some(first) = named.first() {
+            if named.len() == 1 || is_live(first) {
+                return Ok(first.id);
+            }
+
+            let candidates: Vec<String> = named
+                .iter()
+                .map(|change| {
+                    format!(
+                        "{} (archived {})",
+                        change.id,
+                        change.updated_at.date_naive()
+                    )
+                })
+                .collect();
+            return Err(fail(
+                "slug_names_several_archived_changes",
+                &format!(
+                    "{reference} has named {} changes here and every one of them is archived, so the name does not say which you mean. Ask again by id: {}",
+                    named.len(),
+                    candidates.join(", ")
+                ),
+            ));
+        }
+
         let open = self
             .store
             .open_changes(context)
             .map_err(|error| render_error(&error))?;
-
-        if let Some(found) = open.iter().find(|change| change.slug == reference) {
-            return Ok(found.id);
-        }
-
         let slugs: Vec<&str> = open.iter().map(|change| change.slug.as_str()).collect();
         Err(fail(
             "change_not_found",
@@ -1107,6 +1144,17 @@ fn render<T: Serialize>(value: &T) -> Result<String, String> {
         })
         .to_string()
     })
+}
+
+/// Whether a change is still in flight, in the same terms
+/// [`Store::open_changes`] uses: everything but the two statuses that end a
+/// change. Written as an exclusion rather than a list of the live ones so a
+/// status added mid-process is treated as open without an edit here.
+fn is_live(change: &ChangeSummary) -> bool {
+    !matches!(
+        change.status,
+        ChangeStatus::Archived | ChangeStatus::Abandoned
+    )
 }
 
 /// Renders a failure as a tool error carrying a stable code.

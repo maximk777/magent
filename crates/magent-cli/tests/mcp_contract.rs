@@ -2242,6 +2242,168 @@ async fn an_unknown_slug_names_the_open_ones() {
     client.cancel().await.expect("shutdown");
 }
 
+/// Archiving promises the change is kept with its reasoning intact, but the
+/// slug resolver only ever looked among what was open, so the name the change
+/// was archived under stopped answering the moment it was archived — and the
+/// slug is the only handle a caller still has after a compaction.
+#[tokio::test]
+async fn an_archived_change_is_still_read_by_its_slug() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    archive_one_capability(&client, &fixture).await;
+
+    let opened = call(
+        &client,
+        "magent_changes",
+        json!({ "change": "add-retry-budget" }),
+    )
+    .await;
+    let change = &opened["change"];
+
+    assert_eq!(
+        change["slug"].as_str(),
+        Some("add-retry-budget"),
+        "{opened}"
+    );
+    assert_eq!(
+        change["status"].as_str(),
+        Some("archived"),
+        "an archived change is read back under its own name: {opened}"
+    );
+    assert_eq!(
+        change["deltas"][0]["name"].as_str(),
+        Some("budget-caps-retries"),
+        "whole, not just findable — the reasoning is what archiving kept: {opened}"
+    );
+    assert_eq!(
+        change["tasks"][0]["verify_command"].as_str(),
+        Some("cargo test -p worker budget"),
+        "{opened}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Archiving frees the slug, so the same name can be proposed again and then
+/// belongs to two changes. The live one is the one the caller means: work
+/// addressed to a name that is currently open is work on what is open, and the
+/// archived change is history that happens to share a title.
+#[tokio::test]
+async fn a_live_change_wins_over_an_archived_one_of_the_same_slug() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    archive_one_capability(&client, &fixture).await;
+    let reopened = call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    assert_eq!(
+        reopened["rewritten"].as_bool(),
+        Some(false),
+        "the archived change must not have been rewritten in place: {reopened}"
+    );
+
+    let opened = call(
+        &client,
+        "magent_changes",
+        json!({ "change": "add-retry-budget" }),
+    )
+    .await;
+
+    assert_eq!(
+        opened["change"]["id"].as_str(),
+        reopened["id"].as_str(),
+        "the slug resolved to the archived change rather than the open one: {opened}"
+    );
+    assert_eq!(
+        opened["change"]["status"].as_str(),
+        Some("drafting"),
+        "{opened}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
+/// Two finished changes of one name are told apart by nothing a caller can see
+/// from the name, and the most recent is the wrong guess exactly when it
+/// matters — when work of the same name was done twice. The refusal hands back
+/// both, addressed by the id that is unambiguous.
+#[tokio::test]
+async fn a_slug_naming_two_archived_changes_and_no_live_one_is_refused() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let first = call(&client, "magent_propose", proposal("add-retry-budget")).await;
+    let first_id = first["id"].as_str().expect("an id").to_owned();
+    call(&client, "magent_specify", deltas("add-retry-budget")).await;
+    call(&client, "magent_plan", tasks("add-retry-budget")).await;
+    finish_tasks(&fixture);
+    call(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": "add-retry-budget" }),
+    )
+    .await;
+
+    // The second change carries no deltas of its own: the requirement the
+    // first one added is live now, and re-adding it would be refused for a
+    // reason that has nothing to do with what this test is about.
+    let second = call(
+        &client,
+        "magent_propose",
+        json!({
+            "operation_id": uuid(),
+            "slug": "add-retry-budget",
+            "title": "Add a retry budget, the second time",
+            "classification": "bounded",
+            "why": "the budget was reverted and the work came back under its old name",
+            "what_changes": ["restore the budget"],
+            "skip_specs": true
+        }),
+    )
+    .await;
+    let second_id = second["id"].as_str().expect("an id").to_owned();
+    call(
+        &client,
+        "magent_archive",
+        json!({ "operation_id": uuid(), "change": second_id.clone() }),
+    )
+    .await;
+
+    let read = call(
+        &client,
+        "magent_changes",
+        json!({ "change": second_id.clone() }),
+    )
+    .await;
+    let archived_on = read["change"]["updated_at"]
+        .as_str()
+        .expect("an archiving date")[..10]
+        .to_owned();
+
+    let error = call_expecting_error(
+        &client,
+        "magent_changes",
+        json!({ "change": "add-retry-budget" }),
+    )
+    .await;
+
+    assert!(
+        error.contains("slug_names_several_archived_changes"),
+        "expected a stable code in: {error}"
+    );
+    assert!(
+        error.contains("add-retry-budget"),
+        "the refusal has to name the slug it will not resolve: {error}"
+    );
+    assert!(
+        error.contains(&first_id) && error.contains(&second_id),
+        "both candidates have to be addressable from the refusal: {error}"
+    );
+    assert!(
+        error.contains(&archived_on),
+        "the date is what tells the two apart: {error}"
+    );
+    client.cancel().await.expect("shutdown");
+}
+
 /// Proposing the same slug twice rewrites the proposal, and that is the
 /// ordinary way to widen a change's scope. A bare identifier back would leave
 /// the caller unable to tell that from having opened something new.
