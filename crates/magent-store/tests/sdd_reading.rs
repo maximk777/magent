@@ -1227,3 +1227,89 @@ fn changes_named_puts_the_live_change_first_even_when_the_archived_one_is_freshe
         found[1].updated_at
     );
 }
+
+/// Every status a change can be in, spelled as `sdd_changes.status` stores it.
+///
+/// `stored_as` below is what keeps this list honest: it matches on the status
+/// with no `_` arm, so a variant added to `ChangeStatus` stops this file
+/// compiling until it is written down here as well. Without that, the test
+/// underneath would quietly go on walking the seven statuses that existed when
+/// it was written while calling itself a statement about all of them — which
+/// is the one thing it must not do, since a status nobody thought about is
+/// precisely the status the drift arrives on.
+const EVERY_STATUS: [ChangeStatus; 7] = [
+    ChangeStatus::Drafting,
+    ChangeStatus::Specified,
+    ChangeStatus::Planned,
+    ChangeStatus::Executing,
+    ChangeStatus::Ready,
+    ChangeStatus::Archived,
+    ChangeStatus::Abandoned,
+];
+
+/// The string the `CHECK` on `sdd_changes.status` accepts for a status. A
+/// spelling that drifts from the schema fails the `UPDATE` rather than passing
+/// quietly, so this needs no test of its own.
+fn stored_as(status: ChangeStatus) -> &'static str {
+    match status {
+        ChangeStatus::Drafting => "drafting",
+        ChangeStatus::Specified => "specified",
+        ChangeStatus::Planned => "planned",
+        ChangeStatus::Executing => "executing",
+        ChangeStatus::Ready => "ready",
+        ChangeStatus::Archived => "archived",
+        ChangeStatus::Abandoned => "abandoned",
+    }
+}
+
+/// `ChangeStatus::is_open` and the `status NOT IN ('archived', 'abandoned')`
+/// filters say the same thing in two languages — three of those filters in
+/// `sdd.rs` and a fourth in `sdd_changes_live_slug`'s `WHERE` — and nothing
+/// but this test holds them together.
+///
+/// Both directions of the drift are silent and both are damaging. Add a
+/// terminal status to the enum, free the slug for it in the index, and forget
+/// the filter, and `changes_named` comes back with two changes that both
+/// answer `is_open`, after which the resolver takes the first and never says
+/// it chose — the guess this whole surface exists to refuse. Forget the index
+/// instead and live work vanishes from "where did I leave off", which is the
+/// question `open_changes` exists to answer.
+///
+/// So this pins the equivalence rather than either side of it: every variant
+/// in turn, and `open_changes` returns the change exactly when `is_open` says
+/// it is open. The status is set by `UPDATE` because no store method reaches
+/// most of them from here — nothing in the codebase writes `abandoned` at all
+/// — and a status the store cannot produce is exactly the one a filter would
+/// be left out of unnoticed.
+#[test]
+fn open_changes_lists_a_change_exactly_when_is_open_calls_it_open() {
+    let fixture = Fixture::new();
+    let change = fixture.specified_change();
+    let raw = fixture.raw();
+
+    for status in EVERY_STATUS {
+        let moved = raw
+            .execute(
+                "UPDATE sdd_changes SET status = ?1 WHERE id = ?2",
+                rusqlite::params![stored_as(status), change.to_string()],
+            )
+            .expect("move the change to the status under test");
+        assert_eq!(moved, 1, "one row, the change under test");
+
+        let listed = fixture
+            .store
+            .open_changes(&fixture.context)
+            .expect("open changes")
+            .iter()
+            .any(|summary| summary.id == change);
+
+        assert_eq!(
+            listed,
+            status.is_open(),
+            "the SQL filter and `is_open` disagree about {status:?}: \
+             `open_changes` {}, `is_open` says {}",
+            if listed { "lists it" } else { "drops it" },
+            status.is_open()
+        );
+    }
+}
