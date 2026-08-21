@@ -220,6 +220,29 @@ for event in SessionStart UserPromptSubmit PreCompact PostToolUse SessionEnd; do
   fi
 done
 
+# --- the suite has one way to be run ----------------------------------------
+
+# CI compiled and ran the whole workspace twice: once in release for the
+# latency budget, and once again in debug inside the isolation script. That
+# second cargo contended for target/, and the gate then failed with E0463 in a
+# doctest -- a red that means nothing teaches people to ignore reds that do.
+# One step now, so isolation is proved on the binaries that ship.
+workflow=.github/workflows/ci.yml
+if [ -f "$workflow" ]; then
+  if grep -qE '^[[:space:]]*- run: cargo test' "$workflow"; then
+    fail "$workflow runs cargo test directly; the suite goes through ./scripts/test.sh, which is what makes it isolated"
+  fi
+  if ! grep -q 'scripts/test.sh' "$workflow"; then
+    fail "$workflow never invokes ./scripts/test.sh, so nothing proves the suite cannot reach a real profile"
+  fi
+fi
+
+if [ ! -x scripts/test.sh ]; then
+  fail "scripts/test.sh is missing or not executable; it is how this repository runs its suite"
+elif ! "$git" ls-files --error-unmatch scripts/test.sh >/dev/null 2>&1; then
+  fail "scripts/test.sh exists but is not tracked; a clone would not get it"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo >&2
   echo "$failures problem(s): a clean install of this plugin would not work." >&2
