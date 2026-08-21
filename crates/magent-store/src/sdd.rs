@@ -816,6 +816,51 @@ impl Store {
             .collect()
     }
 
+    /// Every change of this workspace and namespace carrying `slug`, live ones
+    /// first and archived ones after, most recently touched first within each.
+    ///
+    /// A list rather than one change, because `sdd_changes_live_slug` is unique
+    /// only among changes that are neither archived nor abandoned: a slug is
+    /// free for reuse once its change is archived, so a name can belong to
+    /// several of them over time. Deciding between those is the caller's, and
+    /// there is no defensible default — guessing the most recent is wrong
+    /// exactly when it matters, which is when work of the same name was done
+    /// twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::NoWorkspace`] when the context names no
+    /// workspace, or a database error.
+    pub fn changes_named(
+        &self,
+        context: &FactContext,
+        slug: &str,
+    ) -> Result<Vec<ChangeSummary>, StoreError> {
+        let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
+
+        let connection = self.lock()?;
+        // The first `ORDER BY` term is a predicate, which SQLite evaluates to
+        // 0 or 1 — so live changes sort ahead of finished ones without naming
+        // every status in a `CASE`, and adding a status to the finished set
+        // means editing the same list `open_changes` already keeps.
+        let sql = format!(
+            "SELECT {CHANGE_SUMMARY_COLUMNS} FROM sdd_changes
+             WHERE workspace_id = ?1 AND namespace IS ?2 AND slug = ?3
+             ORDER BY (status IN ('archived', 'abandoned')), updated_at DESC"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![workspace_id.to_string(), context.namespace.as_deref(), slug],
+                row_to_change_summary_row,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(ChangeSummaryRow::into_summary)
+            .collect()
+    }
+
     /// The full content of one change, or `None` if this workspace has none
     /// by that id.
     ///

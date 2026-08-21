@@ -8,9 +8,10 @@
 //! back the way that session would.
 
 use magent_core::{
-    ArchiveCommand, ChangeId, CheckpointCommand, CheckpointOrigin, Classification, DeltaOp,
-    HarnessKind, OperationId, PlanCommand, ProposeCommand, RequirementDraft, ScenarioDraft,
-    SpecBinding, SpecifyCommand, StartRunCommand, TaskClosed, TaskDone, TaskDraft, WorkflowStage,
+    ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, Classification,
+    DeltaOp, HarnessKind, OperationId, PlanCommand, ProposeCommand, RequirementDraft,
+    ScenarioDraft, SpecBinding, SpecifyCommand, StartRunCommand, TaskClosed, TaskDone, TaskDraft,
+    WorkflowStage,
 };
 use magent_store::{FactContext, Store};
 use rusqlite::Connection;
@@ -425,6 +426,30 @@ impl Fixture {
             .expect("archive");
 
         change
+    }
+
+    /// A second change proposed under `SLUG` and left where `propose` leaves
+    /// it, which only an archived predecessor makes legal:
+    /// `sdd_changes_live_slug` is unique among changes that are neither
+    /// archived nor abandoned, so archiving the first hands the name back.
+    fn propose_again(&self) -> ChangeId {
+        self.store
+            .propose(
+                &ProposeCommand {
+                    operation_id: OperationId::new(),
+                    slug: SLUG.into(),
+                    title: "Add a retry budget, again".into(),
+                    classification: Classification::Bounded,
+                    why: "The budget shipped without a ceiling on the ceiling.".into(),
+                    what_changes: vec!["Bound the configurable retry budget".into()],
+                    capabilities: vec![CAPABILITY.into()],
+                    impact: None,
+                    skip_specs: false,
+                },
+                &self.context,
+            )
+            .expect("propose")
+            .id
     }
 
     /// A second connection to the same file, for the assertions the store's own
@@ -1005,5 +1030,56 @@ fn a_rewritten_requirement_names_the_change_that_rewrote_it() {
     assert_eq!(
         attempt_origin.slug, SLUG,
         "the rewrite named only BUDGET, so ATTEMPT still names the change that introduced it"
+    );
+}
+
+/// Asked for a slug, the store has to answer with the archived change too.
+/// `magent_archive` promises the change is kept with its reasoning intact, and
+/// `change_detail` never filtered by status — but both slug resolvers went
+/// through `open_changes`, so a finished change read back as one that had never
+/// existed, which is precisely when its reasoning is worth reading.
+///
+/// Both changes here carry `SLUG`, which is a state the schema allows rather
+/// than a contrivance: `sdd_changes_live_slug` is unique only among changes
+/// that are neither archived nor abandoned, so a name is free again once its
+/// change is archived and can belong to several changes over time. That is why
+/// this answers with a list.
+///
+/// The `updated_at` of the two runs the way round the fixture forces and not
+/// the other: the archived change has to be archived before the slug is free,
+/// so the open one is always the more recently touched. Making an archived
+/// change the fresher of the two would take an `UPDATE` no store method
+/// offers, so the assertion below pins the order without isolating the status
+/// term from the timestamp — the direction of the status term is what it
+/// catches.
+#[test]
+fn changes_named_finds_the_archived_change_beside_the_open_one() {
+    let fixture = Fixture::new();
+    let archived = fixture.archived_change();
+    let open = fixture.propose_again();
+
+    let found = fixture
+        .store
+        .changes_named(&fixture.context, SLUG)
+        .expect("changes named");
+
+    assert_eq!(
+        found
+            .iter()
+            .map(|change| (change.id, change.status))
+            .collect::<Vec<_>>(),
+        vec![
+            (open, ChangeStatus::Drafting),
+            (archived, ChangeStatus::Archived)
+        ],
+        "one slug, two changes: the live one first and the archived one after"
+    );
+
+    assert!(
+        found[1].updated_at <= found[0].updated_at,
+        "the open change is the fresher of the two, which is the only way round \
+         this fixture can produce: {:?} then {:?}",
+        found[0].updated_at,
+        found[1].updated_at
     );
 }
