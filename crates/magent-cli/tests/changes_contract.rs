@@ -12,8 +12,8 @@ use std::{
 };
 
 use magent_core::{
-    Classification, DeltaOp, OperationId, PlanCommand, ProposeCommand, RequirementDraft,
-    ScenarioDraft, SpecifyCommand, TaskDraft,
+    ArchiveCommand, ChangeId, Classification, DeltaOp, OperationId, PlanCommand, ProposeCommand,
+    RequirementDraft, ScenarioDraft, SpecifyCommand, TaskDraft,
 };
 use magent_store::{FactContext, Store};
 
@@ -79,19 +79,7 @@ impl World {
     /// of them can produce.
     fn plan_a_change(&self, slug: &str, why: &str, tasks: &[(&str, &str)]) {
         let store = Store::open(&self.database()).expect("open the store");
-        let context = FactContext {
-            workspace_id: Some(
-                store
-                    .resolve_workspace_for(&self.project)
-                    .expect("resolve the workspace")
-                    .workspace_id,
-            ),
-            namespace: self
-                .project
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
-            ..FactContext::default()
-        };
+        let context = self.context(&store);
 
         let change = store
             .propose(
@@ -150,23 +138,42 @@ impl World {
         capability_path: &str,
         requirement: RequirementDraft,
         tasks: &[(&str, &str)],
-    ) {
-        let store = Store::open(&self.database()).expect("open the store");
-        let context = FactContext {
-            workspace_id: Some(
-                store
-                    .resolve_workspace_for(&self.project)
-                    .expect("resolve the workspace")
-                    .workspace_id,
-            ),
-            namespace: self
-                .project
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
-            ..FactContext::default()
-        };
+    ) -> ChangeId {
+        self.plan_a_change_with_requirements(
+            slug,
+            why,
+            capability_path,
+            Some(CAPABILITY_PURPOSE),
+            vec![requirement],
+            tasks,
+        )
+    }
 
-        let requirement_name = requirement.name.clone();
+    /// The same, for a change proposing several requirements against one
+    /// capability.
+    ///
+    /// Three of the four delta operations only exist against a requirement
+    /// that is already live, so a fixture that can file exactly one delta can
+    /// only ever file an `added` one — which is how `removed` and `renamed`
+    /// came to be rendered by code no test ran. The first task covers every
+    /// requirement named, `plan` refusing a change whose requirements no task
+    /// covers.
+    fn plan_a_change_with_requirements(
+        &self,
+        slug: &str,
+        why: &str,
+        capability_path: &str,
+        purpose: Option<&str>,
+        requirements: Vec<RequirementDraft>,
+        tasks: &[(&str, &str)],
+    ) -> ChangeId {
+        let store = Store::open(&self.database()).expect("open the store");
+        let context = self.context(&store);
+
+        let requirement_names: Vec<String> = requirements
+            .iter()
+            .map(|requirement| requirement.name.clone())
+            .collect();
 
         let change = store
             .propose(
@@ -192,12 +199,10 @@ impl World {
                     operation_id: OperationId::new(),
                     change,
                     capability_path: capability_path.to_owned(),
-                    purpose: Some(
-                        "Retries a worker makes against a flaky dependency, and the ceiling \
-                         put on how many it may attempt."
-                            .to_owned(),
-                    ),
-                    requirements: vec![requirement],
+                    // Only where the capability is new: `specify` refuses a
+                    // purpose for one that already has one.
+                    purpose: purpose.map(ToOwned::to_owned),
+                    requirements,
                 },
                 &context,
             )
@@ -220,11 +225,11 @@ impl World {
                             produces: None,
                             verify_command: "cargo test -p magent-cli".to_owned(),
                             expected_output: vec!["test result: ok".to_owned()],
-                            // The first task covers the one requirement this
+                            // The first task covers the requirements this
                             // fixture adds — `plan` refuses a change whose
                             // requirements no task names.
                             covers: if index == 0 {
-                                vec![requirement_name.clone()]
+                                requirement_names.clone()
                             } else {
                                 Vec::new()
                             },
@@ -234,6 +239,44 @@ impl World {
                 &context,
             )
             .expect("plan");
+
+        change
+    }
+
+    /// Archives a change, which is what makes its requirements live: a
+    /// `removed` or `renamed` delta resolves the requirement it patches from
+    /// the capability and the name, and is refused where nothing live answers
+    /// to that name.
+    fn archive(&self, change: ChangeId) {
+        let store = Store::open(&self.database()).expect("open the store");
+        let context = self.context(&store);
+
+        store
+            .archive(
+                &ArchiveCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                },
+                &context,
+            )
+            .expect("archive");
+    }
+
+    /// The context the command itself will resolve from this directory.
+    fn context(&self, store: &Store) -> FactContext {
+        FactContext {
+            workspace_id: Some(
+                store
+                    .resolve_workspace_for(&self.project)
+                    .expect("resolve the workspace")
+                    .workspace_id,
+            ),
+            namespace: self
+                .project
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+            ..FactContext::default()
+        }
     }
 
     /// Closes one task the way executing the plan would leave it. The store
@@ -283,6 +326,11 @@ impl World {
 fn uuid_like(seed: &str) -> String {
     format!("{seed:0>8}-0000-4000-8000-000000000000")
 }
+
+/// What the capability is for, supplied by whichever change creates it and
+/// refused from any change after that.
+const CAPABILITY_PURPOSE: &str = "Retries a worker makes against a flaky dependency, and the \
+                                  ceiling put on how many it may attempt.";
 
 /// The requirement's own words — what a reader is owed and a bare line of op,
 /// capability and name cannot give them.
@@ -513,5 +561,212 @@ fn the_bare_form_does_not_print_requirement_text() {
     assert!(
         !report.contains(REQUIREMENT_TEXT),
         "the bare form must stay a summary, not grow the requirement's text: {report}"
+    );
+}
+
+/// What a `removed` delta gives a reviewer in place of text: it changes no
+/// wording, so these two are the whole of what there is to judge it by.
+const REMOVAL_REASON: &str = "The ceiling moved into the scheduler, which counts attempts anyway.";
+const REMOVAL_MIGRATION: &str = "Read the scheduler's attempt count instead of the worker's.";
+
+/// The name a `renamed` delta proposes. A reviewer who is shown only the old
+/// one is being asked to approve a rename without being told what to.
+const RENAME_TO: &str = "Retry ceiling";
+
+/// Files two changes: one archived, so that two requirements are live against
+/// `worker/retry`, and one still open that amends them — removing the first,
+/// renaming the second and adding a third.
+///
+/// The archived change is what the fixture is really for. `specify` resolves a
+/// `removed` or `renamed` delta from the capability and the requirement's
+/// name, and refuses a name nothing live answers to, so there is no way to file
+/// one of those against a capability no change has ever been archived into.
+fn a_change_amending_live_requirements(world: &World) {
+    let founding = world.plan_a_change_with_requirements(
+        "retry-budget",
+        "Retries have no ceiling and can loop forever.",
+        "worker/retry",
+        Some(CAPABILITY_PURPOSE),
+        vec![
+            RequirementDraft {
+                op: DeltaOp::Added,
+                name: "Retry budget".to_owned(),
+                text: Some(REQUIREMENT_TEXT.to_owned()),
+                rename_to: None,
+                reason: None,
+                migration: None,
+                scenarios: vec![ScenarioDraft {
+                    name: "budget exhausted".to_owned(),
+                    given: Some("a job with no retries left".to_owned()),
+                    when: "the worker asks to retry".to_owned(),
+                    then: "the retry is refused".to_owned(),
+                }],
+            },
+            RequirementDraft {
+                op: DeltaOp::Added,
+                name: "Retry window".to_owned(),
+                text: Some(
+                    "Retries are spread over a window rather than attempted at once.".to_owned(),
+                ),
+                rename_to: None,
+                reason: None,
+                migration: None,
+                scenarios: vec![ScenarioDraft {
+                    name: "two attempts in a row".to_owned(),
+                    given: Some("a job that has just failed".to_owned()),
+                    when: "the worker retries".to_owned(),
+                    then: "it waits out the window first".to_owned(),
+                }],
+            },
+        ],
+        &[("1", "Add the budget")],
+    );
+    world.close_task("1");
+    world.archive(founding);
+
+    world.plan_a_change_with_requirements(
+        "amend-the-budget",
+        "The scheduler counts attempts, so the worker's own ceiling is a second answer.",
+        "worker/retry",
+        // The founding change created the capability, and a purpose given
+        // twice is refused.
+        None,
+        vec![
+            RequirementDraft {
+                op: DeltaOp::Removed,
+                name: "Retry budget".to_owned(),
+                text: None,
+                rename_to: None,
+                reason: Some(REMOVAL_REASON.to_owned()),
+                migration: Some(REMOVAL_MIGRATION.to_owned()),
+                scenarios: Vec::new(),
+            },
+            RequirementDraft {
+                op: DeltaOp::Renamed,
+                name: "Retry window".to_owned(),
+                text: None,
+                rename_to: Some(RENAME_TO.to_owned()),
+                reason: None,
+                migration: None,
+                scenarios: Vec::new(),
+            },
+            RequirementDraft {
+                op: DeltaOp::Added,
+                name: "Retry log".to_owned(),
+                text: Some("Every refused retry is written to the run's log.".to_owned()),
+                rename_to: None,
+                reason: None,
+                migration: None,
+                // No precondition, because there is none: the rule holds
+                // whatever state the worker is in. What the command does with
+                // that is what `a_scenario_with_no_given_prints_no_given_line`
+                // is about.
+                scenarios: vec![ScenarioDraft {
+                    name: "a refusal".to_owned(),
+                    given: None,
+                    when: "a retry is refused".to_owned(),
+                    then: "the refusal is logged".to_owned(),
+                }],
+            },
+        ],
+        &[("1", "Retire the budget")],
+    );
+}
+
+/// The lines one delta owns: its header, and everything indented under it up
+/// to the next header or the next heading.
+///
+/// Asserting on the whole report cannot say what is *absent* from a delta —
+/// text the neighbouring delta legitimately carries would answer for it — and
+/// absence is half of what a delta with no text has to be checked for.
+fn delta_block<'a>(report: &'a str, op: &str, name: &str) -> Vec<&'a str> {
+    let header = format!("  {op}  ");
+    let mut lines = report.lines();
+
+    assert!(
+        lines.any(|line| line.starts_with(&header) && line.trim_end().ends_with(name)),
+        "no {op} delta named {name} in: {report}"
+    );
+
+    lines
+        .take_while(|line| line.trim().is_empty() || line.starts_with("    "))
+        .collect()
+}
+
+/// A `removed` delta changes no wording, so it has no text — and a renderer
+/// that reached for one anyway would have to invent it. What it does carry is
+/// the reason and the migration, which is what a reviewer judges a removal by.
+#[test]
+fn a_removed_requirement_prints_its_reason_and_its_migration() {
+    let world = World::new();
+    a_change_amending_live_requirements(&world);
+
+    let (ok, report) = world.changes(&["amend-the-budget"]);
+
+    assert!(ok, "{report}");
+    let block = delta_block(&report, "removed", "Retry budget");
+    let written: Vec<&&str> = block
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    assert!(
+        block.iter().any(|line| line.contains(REMOVAL_REASON)),
+        "why the requirement is going away is half of what there is to review: {report}"
+    );
+    assert!(
+        block.iter().any(|line| line.contains(REMOVAL_MIGRATION)),
+        "and what to do instead is the other half: {report}"
+    );
+    assert_eq!(
+        written.len(),
+        2,
+        "a removed delta carries a reason and a migration and nothing else — a \
+         third line under it is text invented for a requirement that has none: {written:?}"
+    );
+}
+
+/// A rename shown as the old name alone asks the reviewer to approve a change
+/// of name without telling them what to.
+#[test]
+fn a_renamed_requirement_prints_its_new_name() {
+    let world = World::new();
+    a_change_amending_live_requirements(&world);
+
+    let (ok, report) = world.changes(&["amend-the-budget"]);
+
+    assert!(ok, "{report}");
+    let block = delta_block(&report, "renamed", "Retry window");
+
+    assert!(
+        block.iter().any(|line| line.contains(RENAME_TO)),
+        "the name a rename proposes is the whole of what it proposes: {report}"
+    );
+}
+
+/// A scenario that needs no precondition and a scenario whose precondition
+/// went missing are different things, and a `given` label with nothing after
+/// it says the second about the first.
+#[test]
+fn a_scenario_with_no_given_prints_no_given_line() {
+    let world = World::new();
+    a_change_amending_live_requirements(&world);
+
+    let (ok, report) = world.changes(&["amend-the-budget"]);
+
+    assert!(ok, "{report}");
+    let block = delta_block(&report, "added", "Retry log");
+
+    assert!(
+        block.iter().any(|line| line.contains("a retry is refused"))
+            && block
+                .iter()
+                .any(|line| line.contains("the refusal is logged")),
+        "the scenario is still printed, given or no given: {report}"
+    );
+    assert!(
+        !block.iter().any(|line| line.contains("given")),
+        "a scenario with no precondition prints no given at all, rather than an \
+         empty label: {block:?}"
     );
 }
