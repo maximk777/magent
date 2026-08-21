@@ -262,6 +262,45 @@ if [ -f README.md ]; then
   done < <(grep -niE '(in progress|slice [0-9]|coming soon|not yet)' README.md)
 fi
 
+# --- the Development section names commands that exist ----------------------
+
+# The block listed five commands, two of which were the suite: once plainly and
+# once again under a throwaway HOME. Those are one command now. A block listing
+# four steps under a sentence that says five is the same drift as a stale slice
+# number - nobody edits it, and it quietly stops being true.
+if [ -f README.md ]; then
+  if grep -q 'check-isolation.sh' README.md; then
+    fail "README.md still names check-isolation.sh; the script is scripts/test.sh"
+  fi
+  if ! grep -q 'scripts/test.sh' README.md; then
+    fail "README.md never names ./scripts/test.sh, so nothing tells a contributor how to run the suite"
+  fi
+
+  # The first fenced block under ## Development only. The section carries a
+  # second one, for the ignored distill test, and counting it would make the
+  # total answer to a different question than the sentence does.
+  listed=$(awk '
+    /^## Development$/ { section = 1 }
+    section && /^```bash$/ && !seen { seen = 1; block = 1; next }
+    block && /^```$/ { block = 0 }
+    block && NF { n++ }
+    END { print n + 0 }
+  ' README.md)
+
+  case "$listed" in
+    3) word=three ;;
+    4) word=four ;;
+    5) word=five ;;
+    *) word= ;;
+  esac
+
+  if [ -z "$word" ]; then
+    fail "README.md's Development block lists $listed commands, a count no sentence in it can be checked against"
+  elif ! grep -q "All $word before a commit" README.md; then
+    fail "README.md's Development block lists $listed commands but does not say \"All $word before a commit\""
+  fi
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo >&2
   echo "$failures problem(s): a clean install of this plugin would not work." >&2
