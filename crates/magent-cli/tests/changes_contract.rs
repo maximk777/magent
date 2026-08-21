@@ -782,9 +782,23 @@ fn a_scenario_with_no_given_prints_no_given_line() {
 const ARCHIVED_WHY: &str = "Retries have no ceiling and can loop forever.";
 const SECOND_WHY: &str = "The ceiling is a constant, and the flaky dependency is not.";
 
+/// The command a tick quotes and what that command printed, in the archived
+/// change's fixture. Distinct from the strings the live-change tests use, so a
+/// report can be checked for these without another test's journal answering
+/// for them.
+const ARCHIVED_TICK_COMMAND: &str = "cargo test retry_budget";
+const ARCHIVED_TICK_OUTPUT: &str = "test refuses_past_the_budget ... ok";
+
 /// `magent_archive` promises the change is kept with its reasoning intact, and
 /// reasoning nobody can read back is not kept. The slug is how whoever comes
 /// looking still names it — the id went with the session that had it.
+///
+/// Intact means the whole record, not the proposal on its own. The deltas are
+/// what the change settled, the tasks are how the work was cut up, and the
+/// ticks are the evidence each one was closed on. A reader handed the `why`
+/// alone is given the argument for work they can no longer check was done —
+/// which is the half of the record that has no other home once the run that
+/// produced it is gone.
 #[test]
 fn an_archived_change_still_prints_under_its_slug() {
     let world = World::new();
@@ -796,6 +810,7 @@ fn an_archived_change_still_prints_under_its_slug() {
         &[("1", "Add the budget")],
     );
     world.close_task("1");
+    world.journal_a_tick("1", ARCHIVED_TICK_COMMAND, ARCHIVED_TICK_OUTPUT);
     world.archive(change);
 
     let (ok, report) = world.changes(&["retry-budget"]);
@@ -810,6 +825,64 @@ fn an_archived_change_still_prints_under_its_slug() {
         report.contains("archived"),
         "and the status has to say the work is finished, or a reader takes the \
          change for one still in flight: {report}"
+    );
+
+    let block = delta_block(&report, "added", "Retry budget");
+    assert!(
+        block.iter().any(|line| line.contains(REQUIREMENT_TEXT)),
+        "the delta is what the change settled, and archiving is what made it \
+         live — reading it back by name has to reach it: {report}"
+    );
+    assert!(
+        report.contains("Add the budget"),
+        "the plan says how the work was cut up, and a change read back without \
+         one is a proposal nobody can tell was carried out: {report}"
+    );
+    assert!(
+        report.contains(ARCHIVED_TICK_COMMAND) && report.contains(ARCHIVED_TICK_OUTPUT),
+        "and the journal is the evidence under the closed task, which is worth \
+         keeping precisely because the run that produced it is over: {report}"
+    );
+}
+
+/// A slug is free again once its change is archived, so the next change can
+/// take the same name — and while that one is in flight it is what the slug
+/// means. Reading the finished one back instead answers a question about work
+/// in progress with work already done, and refusing to choose between them
+/// would put an id in front of the change somebody is holding right now.
+#[test]
+fn a_live_change_wins_the_slug_it_shares_with_an_archived_one() {
+    let world = World::new();
+
+    let archived = world.plan_a_change("retry-budget", ARCHIVED_WHY, &[("1", "Add the budget")]);
+    world.close_task("1");
+    world.archive(archived);
+
+    world.plan_a_change(
+        "retry-budget",
+        SECOND_WHY,
+        &[("2", "Take the ceiling from the dependency")],
+    );
+
+    let (ok, report) = world.changes(&["retry-budget"]);
+
+    assert!(
+        ok,
+        "one of the two is open, so there is nothing here for the reader to \
+         settle: {report}"
+    );
+    assert!(
+        report.contains(SECOND_WHY),
+        "the open change is what the slug names while it is open: {report}"
+    );
+    assert!(
+        !report.contains(ARCHIVED_WHY),
+        "and the finished change it took the name from is not: {report}"
+    );
+    assert!(
+        !report.contains("archived"),
+        "the status printed belongs to the change printed, and `archived` \
+         there says the wrong one was chosen: {report}"
     );
 }
 
