@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Fails if the test suite writes to a real Magent profile.
+# Runs this repository's test suite, isolated.
 #
-# Test isolation is otherwise unenforced: a test that forgets
-# MAGENT_STATE_DIR would silently write to working memory, and the damage
-# would only surface later as facts that were never learned. Running the
-# suite under a throwaway HOME makes that mistake impossible to miss.
+# Isolation is not a separate audit here - it is a property of the only way the
+# suite is run. A test that forgets MAGENT_STATE_DIR would silently write to
+# working memory, and the damage would surface later as facts that were never
+# learned. Under a throwaway HOME that mistake is impossible to miss.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,12 +17,6 @@ trap 'rm -rf "$sandbox"' EXIT
 # rebuilt them from scratch, minutes per run for a check that reads one path.
 # Nothing here weakens it: the check is whether the suite creates $HOME/.magent,
 # and a cargo cache is not a Magent profile.
-#
-# `target/` is deliberately still shared, so the build stays incremental. The
-# cost is that this must not run beside another cargo against the same
-# directory: rustdoc then resolves rlibs that are being rebuilt underneath it
-# and the doctests fail with E0463, which looks like an isolation failure and is
-# not one. Run it on its own.
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
 

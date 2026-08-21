@@ -17,12 +17,11 @@ jobs:
       - run: rustup default 1.96.0
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      # Release, so the PreCompact latency budget is asserted against what
-      # actually ships rather than a debug build.
-      - run: cargo test --workspace --release
-      # Isolation is otherwise unenforced: a test missing MAGENT_STATE_DIR
-      # would silently write to a real profile.
-      - run: ./scripts/check-isolation.sh
+      # The one way this repository runs its suite: a throwaway HOME, so a test
+      # that forgets MAGENT_STATE_DIR cannot reach a real profile. Release, so
+      # the PreCompact latency budget is asserted against what actually ships
+      # rather than a debug build.
+      - run: ./scripts/test.sh --release
       # Properties of the repository rather than the code: whether a clean
       # clone would actually install and run.
       - run: ./scripts/check-plugin.sh
