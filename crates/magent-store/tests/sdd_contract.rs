@@ -1014,6 +1014,79 @@ fn a_modified_delta_naming_a_removed_requirement_is_rejected() {
     );
 }
 
+/// The half of the refusal a caller acts on. Being told the name resolved to
+/// nothing leaves it guessing; the live names are what it should have written
+/// instead, and they are only useful if they are all there, in an order that
+/// does not move between runs, and free of names nothing may patch.
+#[test]
+fn the_refusal_lists_the_capabilitys_live_requirements_and_only_those() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose")
+        .id;
+
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    // Seeded out of alphabetical order, so that a list which merely echoes
+    // insertion order cannot pass for a sorted one.
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-counted",
+        "attempts are counted",
+        "live",
+    );
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-retired",
+        "retries are unbounded",
+        "removed",
+    );
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![modified("no such thing")],
+    );
+    let result = store.specify(&command, &ctx);
+
+    let Err(StoreError::RequirementNameNotLive {
+        name,
+        capability_path,
+        live,
+    }) = &result
+    else {
+        panic!("expected the name to resolve to nothing, got {result:?}");
+    };
+    assert_eq!(name, "no such thing");
+    assert_eq!(capability_path, "worker/retry");
+    assert_eq!(
+        live,
+        &vec![
+            "a budget caps retries".to_string(),
+            "attempts are counted".to_string()
+        ],
+        "the refusal must offer every live name, sorted, and no retired one"
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "no live requirement of capability \"worker/retry\" is called \"no such thing\"; \
+         it holds: a budget caps retries, attempts are counted",
+        "the names have to reach the caller, not just the variant"
+    );
+}
+
 /// Reached on the ordinary path: a model refining a spec calls `specify`
 /// again and repeats a requirement name it already sent. Left to
 /// `spec_deltas_identity`, the answer is "UNIQUE constraint failed", which is
