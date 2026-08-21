@@ -243,6 +243,25 @@ elif ! "$git" ls-files --error-unmatch scripts/test.sh >/dev/null 2>&1; then
   fail "scripts/test.sh exists but is not tracked; a clone would not get it"
 fi
 
+# --- the README makes no claim that expires on its own ----------------------
+
+# "Slice 3, in progress: workspaces" outlived the workspaces, the console and
+# two slices of the spec-driven loop, and nothing noticed for weeks. A claim of
+# incompleteness goes false without anybody editing it, which is exactly the
+# class of failure this file exists for.
+#
+# Case-insensitively, for the reason the openspec check above gives. The list
+# is deliberately short: it names claims Magent makes about itself, not every
+# word a cautious writer might reach for. The stub words the planning skill
+# forbids are kept out of it on purpose - the account of that skill quotes them
+# as things a plan must never contain, and a pattern that failed on that
+# quotation would be weakened at the first inconvenience.
+if [ -f README.md ]; then
+  while IFS= read -r hit; do
+    fail "README.md dates itself: $hit"
+  done < <(grep -niE '(in progress|slice [0-9]|coming soon|not yet)' README.md)
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo >&2
   echo "$failures problem(s): a clean install of this plugin would not work." >&2
