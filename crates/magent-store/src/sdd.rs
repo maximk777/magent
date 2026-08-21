@@ -170,8 +170,9 @@ pub struct ChangeSummary {
 /// that, which is what a reviewer needs to know.
 ///
 /// `requirement_id` stays in the database. It is the one field that addresses a
-/// row rather than describing the proposal, and reading a change back is not
-/// how a caller should be finding requirement ids to patch.
+/// row rather than describing the proposal, and nothing outside the store needs
+/// it any more: a patch delta names the requirement it patches, and `specify`
+/// resolves the id from the capability and that name.
 ///
 /// [`ScenarioDraft`] rather than [`LiveScenario`], the distinction that type's
 /// comment draws: these are what a change proposed, not what shipped.
