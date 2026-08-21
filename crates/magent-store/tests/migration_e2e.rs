@@ -47,6 +47,7 @@ fn migration(version: i64) -> String {
         11 => "0011_expected_output_is_a_list.sql",
         12 => "0012_task_ticks.sql",
         13 => "0013_session_notices.sql",
+        14 => "0014_requirement_origin.sql",
         other => panic!("no migration {other}"),
     };
 

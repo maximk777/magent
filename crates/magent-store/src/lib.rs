@@ -29,7 +29,8 @@ pub use grouping::{GroupingCommand, WorkspaceGrouping};
 pub use migrations::CURRENT_VERSION;
 pub use sdd::{
     ArchiveReport, CapabilityDetail, CapabilitySummary, ChangeDetail, ChangeSummary, DeltaSummary,
-    LiveRequirement, LiveScenario, PlanReport, ProposeReport, SpecifyReport, TaskSummary, TaskTick,
+    LiveRequirement, LiveScenario, PlanReport, ProposeReport, RequirementOrigin, SpecifyReport,
+    TaskSummary, TaskTick,
 };
 pub use sessions::{REASONING_EDIT_THRESHOLD, SessionBinding};
 pub use setup::{GroupingProposal, Sibling};

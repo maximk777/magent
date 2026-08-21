@@ -352,12 +352,24 @@ pub struct LiveScenario {
     pub then: String,
 }
 
+/// The change a requirement came from, as far as a reader needs it: enough to
+/// find the reasoning, not the reasoning itself.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RequirementOrigin {
+    pub slug: String,
+    pub title: String,
+}
+
 /// One live requirement of a capability, with the scenarios that make it
 /// checkable rather than merely asserted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveRequirement {
     pub name: String,
     pub text: String,
+    /// The change that last wrote this requirement, where the row records one.
+    /// `None` for a requirement archived before `0014_requirement_origin.sql`,
+    /// which that migration explains is left absent rather than guessed at.
+    pub origin: Option<RequirementOrigin>,
     /// In `seq` order, which is the order the change that last wrote them —
     /// the addition, or the modification that replaced them — sent them:
     /// `specify` numbers the drafts as they arrive and archiving copies the
@@ -732,6 +744,7 @@ impl Store {
                     tx,
                     &workspace,
                     namespace.as_deref(),
+                    &change_id,
                     delta,
                     &now,
                     &mut report,
@@ -1353,10 +1366,18 @@ fn load_deltas(tx: &Transaction<'_>, change_id: &str) -> Result<Vec<DeltaRow>, S
 }
 
 /// Folds one delta into the live base and counts it in the report.
+///
+/// `change_id` is stamped on every requirement this leaves live, so a reader
+/// can reach the reasoning behind it (`0014_requirement_origin.sql`) — threaded
+/// from the caller rather than re-queried, which is a row `load_deltas` has
+/// already been past.
+/// `Removed` does not stamp it: a retired requirement is history for the change
+/// that retired it, and nothing reads it back as part of the specification.
 fn apply_delta(
     tx: &Transaction<'_>,
     workspace_id: &str,
     namespace: Option<&str>,
+    change_id: &str,
     delta: &DeltaRow,
     now: &str,
     report: &mut ArchiveReport,
@@ -1373,14 +1394,16 @@ fn apply_delta(
             // silently filed with no text at all.
             tx.execute(
                 "INSERT INTO requirements
-                     (id, capability_id, name, text, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'live', ?5, ?5)",
+                     (id, capability_id, name, text, status, created_at, updated_at,
+                      origin_change_id)
+                 VALUES (?1, ?2, ?3, ?4, 'live', ?5, ?5, ?6)",
                 rusqlite::params![
                     &requirement_id,
                     &capability_id,
                     &delta.name,
                     delta.text.as_deref(),
                     now,
+                    change_id,
                 ],
             )?;
             copy_scenarios(tx, &delta.id, &requirement_id)?;
@@ -1395,9 +1418,9 @@ fn apply_delta(
             // requirement. Without the guard the update lands on the retired
             // row and leaves it carrying fresh text nobody agreed to ship.
             let patched = tx.execute(
-                "UPDATE requirements SET text = ?1, updated_at = ?2
-                 WHERE id = ?3 AND status = 'live'",
-                rusqlite::params![delta.text.as_deref(), now, requirement_id],
+                "UPDATE requirements SET text = ?1, updated_at = ?2, origin_change_id = ?3
+                 WHERE id = ?4 AND status = 'live'",
+                rusqlite::params![delta.text.as_deref(), now, change_id, requirement_id],
             )?;
             if patched == 0 {
                 return Err(StoreError::RequirementNotFound {
@@ -1430,9 +1453,9 @@ fn apply_delta(
             // retiring a requirement that another change already retired
             // changes nothing and needs no argument.
             let renamed = tx.execute(
-                "UPDATE requirements SET name = ?1, updated_at = ?2
-                 WHERE id = ?3 AND status = 'live'",
-                rusqlite::params![delta.rename_to.as_deref(), now, requirement_id],
+                "UPDATE requirements SET name = ?1, updated_at = ?2, origin_change_id = ?3
+                 WHERE id = ?4 AND status = 'live'",
+                rusqlite::params![delta.rename_to.as_deref(), now, change_id, requirement_id],
             )?;
             if renamed == 0 {
                 return Err(StoreError::RequirementNotFound {
@@ -2379,6 +2402,10 @@ struct LiveRequirementRow {
     id: String,
     name: String,
     text: String,
+    /// The change `origin_change_id` points at, `None` when it points at
+    /// nothing — which is what a row written before
+    /// `0014_requirement_origin.sql` gives.
+    origin: Option<RequirementOrigin>,
 }
 
 /// The capability's live requirements, each with its scenarios.
@@ -2403,16 +2430,30 @@ fn load_live_requirements(
     capability_id: &str,
 ) -> Result<Vec<LiveRequirement>, StoreError> {
     let mut statement = tx.prepare(
-        "SELECT id, name, text FROM requirements
-         WHERE capability_id = ?1 AND status = 'live'
-         ORDER BY created_at, name",
+        // A LEFT JOIN, not an inner one: a requirement whose origin was never
+        // recorded still belongs to the specification, and an inner join would
+        // quietly drop it from the capability rather than show it without one.
+        "SELECT requirements.id, requirements.name, requirements.text,
+                sdd_changes.slug, sdd_changes.title
+         FROM requirements
+         LEFT JOIN sdd_changes ON sdd_changes.id = requirements.origin_change_id
+         WHERE requirements.capability_id = ?1 AND requirements.status = 'live'
+         ORDER BY requirements.created_at, requirements.name",
     )?;
     let rows = statement
         .query_map([capability_id], |row| {
+            let slug: Option<String> = row.get(3)?;
+            let title: Option<String> = row.get(4)?;
             Ok(LiveRequirementRow {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 text: row.get(2)?,
+                // Zipped rather than unwrapped a column at a time: the join
+                // either matched a change or it did not, and a half-filled
+                // origin is not a state a row can be in.
+                origin: slug
+                    .zip(title)
+                    .map(|(slug, title)| RequirementOrigin { slug, title }),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2424,6 +2465,7 @@ fn load_live_requirements(
         .map(|row| LiveRequirement {
             name: row.name,
             text: row.text,
+            origin: row.origin,
             // `unwrap_or_default` rather than a refusal: every delta
             // `apply_delta` applies leaves a live requirement holding at least
             // one scenario — `magent-core` demands one of every addition and
