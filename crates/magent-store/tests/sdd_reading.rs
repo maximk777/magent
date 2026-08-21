@@ -17,8 +17,16 @@ use magent_store::{FactContext, Store};
 use rusqlite::Connection;
 
 const SLUG: &str = "add-retry-budget";
-const RETIRE_SLUG: &str = "retire-the-per-attempt-rule";
+const TITLE: &str = "Add a retry budget";
 const CAPABILITY: &str = "worker/retry";
+
+/// The second change every amendment test files: `Fixture::amend` proposes
+/// under this slug and title whichever of the three amending operations the
+/// caller hands it, because the fixture only ever needs one second change on
+/// stage at a time and a slug per operation would be three constants no test
+/// reads differently.
+const AMEND_SLUG: &str = "amend-the-retry-rules";
+const AMEND_TITLE: &str = "Amend a live retry requirement";
 
 /// Two requirements whose names sort the other way round from the order they
 /// are specified in, so the assertions below pin the order `capability_detail`
@@ -26,10 +34,15 @@ const CAPABILITY: &str = "worker/retry";
 const BUDGET: &str = "The worker stops retrying once its budget is spent";
 const ATTEMPT: &str = "Each attempt spends one unit of the budget";
 
-/// What `Fixture::rename` moves `BUDGET` to: the same rule under a different
-/// name, so that a test looking the requirement up by this one is proving the
-/// rename landed rather than finding the row it started as.
+/// What the renaming amendment moves `BUDGET` to: the same rule under a
+/// different name, so that a test looking the requirement up by this one is
+/// proving the rename landed rather than finding the row it started as.
 const RENAMED_BUDGET: &str = "Retrying stops once the budget is spent";
+
+/// What a removal carries in place of text. Spelled once because two tests
+/// file a removal and only one of them reads these back.
+const REMOVAL_REASON: &str = "The budget subsumes it.";
+const REMOVAL_MIGRATION: &str = "Set the budget to one for the old behaviour.";
 
 const BUDGET_TEXT: &str = "The worker SHALL stop retrying once the budget is spent.";
 const ATTEMPT_TEXT: &str = "The worker SHALL spend one unit of the budget per attempt.";
@@ -135,7 +148,7 @@ impl Fixture {
                 &ProposeCommand {
                     operation_id: OperationId::new(),
                     slug: SLUG.into(),
-                    title: "Add a retry budget".into(),
+                    title: TITLE.into(),
                     classification: Classification::Bounded,
                     why: "Retries currently have no ceiling and can loop forever.".into(),
                     what_changes: vec!["Add a configurable retry budget".into()],
@@ -272,27 +285,39 @@ impl Fixture {
             .expect("the checkpoint closed a task")
     }
 
-    /// A second change, taken the same way to `archived`, that retires one
-    /// requirement of the live capability.
+    /// A second change, taken the same way to `archived`, that amends one
+    /// requirement the first one left live. The `RequirementDraft` is the
+    /// caller's, because which of `Removed`, `Modified` and `Renamed` it
+    /// carries is the only thing that ever differs between the three
+    /// amendments the tests below need.
     ///
-    /// This is what `requirements.status` exists for: `apply_delta` sets the row
-    /// to `removed` and leaves it, and its scenarios, exactly where they are —
-    /// `0007_sdd.sql` keeps them as the record of the decision. Nothing but the
+    /// Amending is what `requirements.status` exists for: `apply_delta` never
+    /// deletes a row, and never moves the scenarios hanging off it —
+    /// `0007_sdd.sql` keeps both as the record of the decision. Nothing but the
     /// `status = 'live'` filter separates a retired requirement from a live one.
     ///
-    /// Hands the change back so a test can read the removal delta itself, not
-    /// only its effect on the live base.
-    fn retire(&self, name: &str) -> ChangeId {
+    /// The draft names the requirement by its *live* name whatever it does to
+    /// it, because that is what `specify` resolves the delta against; a rename
+    /// puts the new name in `rename_to`. The plan covers that live name for the
+    /// same reason — a task's `covers` is matched against `spec_deltas.name`,
+    /// which a rename never moves.
+    ///
+    /// Hands the change back so a test can read the delta itself, not only its
+    /// effect on the live base.
+    fn amend(&self, requirement: RequirementDraft) -> ChangeId {
+        let covers = requirement.name.clone();
+
         let change = self
             .store
             .propose(
                 &ProposeCommand {
                     operation_id: OperationId::new(),
-                    slug: RETIRE_SLUG.into(),
-                    title: "Retire the per-attempt rule".into(),
+                    slug: AMEND_SLUG.into(),
+                    title: AMEND_TITLE.into(),
                     classification: Classification::Bounded,
-                    why: "The budget subsumes counting every attempt separately.".into(),
-                    what_changes: vec!["Drop the per-attempt requirement".into()],
+                    why: "The rules the budget shipped with no longer say what the worker does."
+                        .into(),
+                    what_changes: vec!["Amend one live requirement of the retry capability".into()],
                     capabilities: vec![CAPABILITY.into()],
                     impact: None,
                     skip_specs: false,
@@ -311,15 +336,7 @@ impl Fixture {
                     // No purpose: the capability is live by now, and `specify`
                     // refuses one it is not being asked to create.
                     purpose: None,
-                    requirements: vec![RequirementDraft {
-                        op: DeltaOp::Removed,
-                        name: name.into(),
-                        text: None,
-                        rename_to: None,
-                        reason: Some("The budget subsumes it.".into()),
-                        migration: Some("Set the budget to one for the old behaviour.".into()),
-                        scenarios: Vec::new(),
-                    }],
+                    requirements: vec![requirement],
                 },
                 &self.context,
             )
@@ -330,176 +347,13 @@ impl Fixture {
                 &PlanCommand {
                     operation_id: OperationId::new(),
                     change,
-                    tasks: vec![task("Drop the per-attempt rule", &[name])],
+                    tasks: vec![task("Carry the amendment into the worker", &[&covers])],
                 },
                 &self.context,
             )
             .expect("plan");
 
-        self.close_the_task(RETIRE_SLUG);
-
-        self.store
-            .archive(
-                &ArchiveCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                },
-                &self.context,
-            )
-            .expect("archive");
-
-        change
-    }
-
-    /// A second change, taken the same way to `archived`, that rewrites one
-    /// requirement of the live capability rather than retiring it — copied from
-    /// `retire` with the three fields a modification needs that a removal does
-    /// not: `op`, `text`, and one `ScenarioDraft`.
-    ///
-    /// Reuses `RETIRE_SLUG` and its title: the fixture only ever needs one
-    /// second change on stage at a time, and giving the rewrite its own slug
-    /// would just be a second constant nothing reads differently.
-    fn rewrite(&self, name: &str) -> ChangeId {
-        let change = self
-            .store
-            .propose(
-                &ProposeCommand {
-                    operation_id: OperationId::new(),
-                    slug: RETIRE_SLUG.into(),
-                    title: "Retire the per-attempt rule".into(),
-                    classification: Classification::Bounded,
-                    why: "The budget subsumes counting every attempt separately.".into(),
-                    what_changes: vec!["Drop the per-attempt requirement".into()],
-                    capabilities: vec![CAPABILITY.into()],
-                    impact: None,
-                    skip_specs: false,
-                },
-                &self.context,
-            )
-            .expect("propose")
-            .id;
-
-        self.store
-            .specify(
-                &SpecifyCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                    capability_path: CAPABILITY.into(),
-                    // No purpose: the capability is live by now, and `specify`
-                    // refuses one it is not being asked to create.
-                    purpose: None,
-                    requirements: vec![RequirementDraft {
-                        op: DeltaOp::Modified,
-                        name: name.into(),
-                        text: Some("The worker SHALL stop retrying once the budget runs out, counted in whole units.".into()),
-                        rename_to: None,
-                        reason: None,
-                        migration: None,
-                        scenarios: vec![ScenarioDraft {
-                            name: "budget exhausted".into(),
-                            given: None,
-                            when: "the budget runs out".into(),
-                            then: "the job is parked".into(),
-                        }],
-                    }],
-                },
-                &self.context,
-            )
-            .expect("specify");
-
-        self.store
-            .plan(
-                &PlanCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                    tasks: vec![task("Drop the per-attempt rule", &[name])],
-                },
-                &self.context,
-            )
-            .expect("plan");
-
-        self.close_the_task(RETIRE_SLUG);
-
-        self.store
-            .archive(
-                &ArchiveCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                },
-                &self.context,
-            )
-            .expect("archive");
-
-        change
-    }
-
-    /// A second change, taken the same way to `archived`, that renames one
-    /// requirement of the live capability rather than rewriting it — copied
-    /// from `rewrite` with `text` and the scenario dropped and `rename_to`
-    /// added, because a rename proposes neither: `apply_delta` moves the name
-    /// and leaves everything the requirement says exactly where it was.
-    ///
-    /// The draft still names the requirement by its *live* name, which is what
-    /// `specify` resolves the delta against; `rename_to` is where the new one
-    /// goes. The plan covers the live name too — a task's `covers` is matched
-    /// against `spec_deltas.name`, which a rename never moves.
-    ///
-    /// Reuses `RETIRE_SLUG` and its title for the reason `rewrite` gives.
-    fn rename(&self, name: &str, rename_to: &str) -> ChangeId {
-        let change = self
-            .store
-            .propose(
-                &ProposeCommand {
-                    operation_id: OperationId::new(),
-                    slug: RETIRE_SLUG.into(),
-                    title: "Retire the per-attempt rule".into(),
-                    classification: Classification::Bounded,
-                    why: "The budget subsumes counting every attempt separately.".into(),
-                    what_changes: vec!["Drop the per-attempt requirement".into()],
-                    capabilities: vec![CAPABILITY.into()],
-                    impact: None,
-                    skip_specs: false,
-                },
-                &self.context,
-            )
-            .expect("propose")
-            .id;
-
-        self.store
-            .specify(
-                &SpecifyCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                    capability_path: CAPABILITY.into(),
-                    // No purpose: the capability is live by now, and `specify`
-                    // refuses one it is not being asked to create.
-                    purpose: None,
-                    requirements: vec![RequirementDraft {
-                        op: DeltaOp::Renamed,
-                        name: name.into(),
-                        text: None,
-                        rename_to: Some(rename_to.into()),
-                        reason: None,
-                        migration: None,
-                        scenarios: Vec::new(),
-                    }],
-                },
-                &self.context,
-            )
-            .expect("specify");
-
-        self.store
-            .plan(
-                &PlanCommand {
-                    operation_id: OperationId::new(),
-                    change,
-                    tasks: vec![task("Drop the per-attempt rule", &[name])],
-                },
-                &self.context,
-            )
-            .expect("plan");
-
-        self.close_the_task(RETIRE_SLUG);
+        self.close_the_task(AMEND_SLUG);
 
         self.store
             .archive(
@@ -676,7 +530,7 @@ fn a_live_requirement_names_the_change_that_last_wrote_it() {
         .expect("a requirement archived under a change names that change");
 
     assert_eq!(origin.slug, SLUG);
-    assert_eq!(origin.title, "Add a retry budget");
+    assert_eq!(origin.title, TITLE);
 }
 
 /// A requirement a later change retired is that change's history, not the
@@ -686,7 +540,15 @@ fn a_live_requirement_names_the_change_that_last_wrote_it() {
 fn a_retired_requirement_leaves_the_live_specification() {
     let fixture = Fixture::new();
     fixture.archived_change();
-    fixture.retire(ATTEMPT);
+    fixture.amend(RequirementDraft {
+        op: DeltaOp::Removed,
+        name: ATTEMPT.into(),
+        text: None,
+        rename_to: None,
+        reason: Some(REMOVAL_REASON.into()),
+        migration: Some(REMOVAL_MIGRATION.into()),
+        scenarios: Vec::new(),
+    });
 
     let retired: i64 = fixture
         .raw()
@@ -835,7 +697,15 @@ fn a_specified_change_reads_back_its_requirements() {
 fn a_removed_delta_reads_back_its_reason() {
     let fixture = Fixture::new();
     fixture.archived_change();
-    let change = fixture.retire(ATTEMPT);
+    let change = fixture.amend(RequirementDraft {
+        op: DeltaOp::Removed,
+        name: ATTEMPT.into(),
+        text: None,
+        rename_to: None,
+        reason: Some(REMOVAL_REASON.into()),
+        migration: Some(REMOVAL_MIGRATION.into()),
+        scenarios: Vec::new(),
+    });
 
     let detail = fixture
         .store
@@ -852,11 +722,8 @@ fn a_removed_delta_reads_back_its_reason() {
         removal.text, None,
         "a removal proposes no text, and inventing one would be a lie"
     );
-    assert_eq!(removal.reason.as_deref(), Some("The budget subsumes it."));
-    assert_eq!(
-        removal.migration.as_deref(),
-        Some("Set the budget to one for the old behaviour.")
-    );
+    assert_eq!(removal.reason.as_deref(), Some(REMOVAL_REASON));
+    assert_eq!(removal.migration.as_deref(), Some(REMOVAL_MIGRATION));
     assert!(
         removal.scenarios.is_empty(),
         "a removal writes no scenarios: {:?}",
@@ -1083,7 +950,26 @@ fn a_change_with_no_ticks_reads_an_empty_journal() {
 fn a_rewritten_requirement_names_the_change_that_rewrote_it() {
     let fixture = Fixture::new();
     fixture.archived_change();
-    fixture.rewrite(BUDGET);
+    // A modification is the one amendment that proposes wording, so it is the
+    // only one carrying `text` and a scenario to replace the ones BUDGET
+    // landed with.
+    fixture.amend(RequirementDraft {
+        op: DeltaOp::Modified,
+        name: BUDGET.into(),
+        text: Some(
+            "The worker SHALL stop retrying once the budget runs out, counted in whole units."
+                .into(),
+        ),
+        rename_to: None,
+        reason: None,
+        migration: None,
+        scenarios: vec![ScenarioDraft {
+            name: "budget exhausted".into(),
+            given: None,
+            when: "the budget runs out".into(),
+            then: "the job is parked".into(),
+        }],
+    });
 
     let detail = fixture
         .store
@@ -1099,7 +985,7 @@ fn a_rewritten_requirement_names_the_change_that_rewrote_it() {
     let origin = requirement.origin.as_ref().expect("an origin");
 
     assert_eq!(
-        origin.slug, RETIRE_SLUG,
+        origin.slug, AMEND_SLUG,
         "the change that last wrote it, not the one that introduced it"
     );
 
@@ -1235,7 +1121,17 @@ fn a_requirement_with_no_origin_recorded_stays_live_and_claims_none() {
 fn a_renamed_requirement_names_the_change_that_renamed_it() {
     let fixture = Fixture::new();
     fixture.archived_change();
-    fixture.rename(BUDGET, RENAMED_BUDGET);
+    // A rename proposes neither text nor scenarios: `apply_delta` moves the
+    // name and leaves everything the requirement says exactly where it was.
+    fixture.amend(RequirementDraft {
+        op: DeltaOp::Renamed,
+        name: BUDGET.into(),
+        text: None,
+        rename_to: Some(RENAMED_BUDGET.into()),
+        reason: None,
+        migration: None,
+        scenarios: Vec::new(),
+    });
 
     let detail = fixture
         .store
@@ -1254,10 +1150,10 @@ fn a_renamed_requirement_names_the_change_that_renamed_it() {
         .expect("a renamed requirement names the change that renamed it");
 
     assert_eq!(
-        origin.slug, RETIRE_SLUG,
+        origin.slug, AMEND_SLUG,
         "the change that moved the name, not the one that introduced it"
     );
-    assert_eq!(origin.title, "Retire the per-attempt rule");
+    assert_eq!(origin.title, AMEND_TITLE);
 
     // The rename named only BUDGET, so ATTEMPT's origin has to survive it
     // unchanged — a stamp that re-marked every requirement of the capability
