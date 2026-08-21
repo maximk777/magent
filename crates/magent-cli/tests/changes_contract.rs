@@ -678,8 +678,18 @@ fn a_change_amending_live_requirements(world: &World) {
     );
 }
 
-/// The lines one delta owns: its header, and everything indented under it up
-/// to the next header or the next heading.
+/// The lines one delta owns: everything indented under its header, up to the
+/// next header or the next heading. Not the header itself — see below.
+///
+/// Blank lines stay in the block rather than ending it, which is what lets a
+/// delta's prose and the scenarios printed under it come back as one block:
+/// the report separates them with a blank line, and both belong to the delta.
+/// Only a line at the left margin closes the block.
+///
+/// The `assert!` is also the seek. `Iterator::any` stops at the line it
+/// matched and leaves `lines` positioned just past it, so the `take_while`
+/// below resumes on the first line under the header; there is no skip step to
+/// go looking for, and the header is consumed rather than collected.
 ///
 /// Asserting on the whole report cannot say what is *absent* from a delta —
 /// text the neighbouring delta legitimately carries would answer for it — and
