@@ -78,8 +78,8 @@ fn added(name: &str) -> RequirementDraft {
     }
 }
 
-/// A `Modified` requirement pointing at `requirement_id`.
-fn modified(name: &str, requirement_id: &str) -> RequirementDraft {
+/// A `Modified` requirement, addressed by name.
+fn modified(name: &str) -> RequirementDraft {
     RequirementDraft {
         op: DeltaOp::Modified,
         name: name.into(),
@@ -87,13 +87,13 @@ fn modified(name: &str, requirement_id: &str) -> RequirementDraft {
         rename_to: None,
         reason: None,
         migration: None,
-        requirement_id: Some(requirement_id.into()),
+        requirement_id: None,
         scenarios: vec![scenario("first")],
     }
 }
 
-/// A `Removed` requirement pointing at `requirement_id`.
-fn removed(name: &str, requirement_id: &str) -> RequirementDraft {
+/// A `Removed` requirement, addressed by name.
+fn removed(name: &str) -> RequirementDraft {
     RequirementDraft {
         op: DeltaOp::Removed,
         name: name.into(),
@@ -101,13 +101,13 @@ fn removed(name: &str, requirement_id: &str) -> RequirementDraft {
         rename_to: None,
         reason: Some("The budget subsumes it.".into()),
         migration: Some("Set the budget to 1 for the old behaviour.".into()),
-        requirement_id: Some(requirement_id.into()),
+        requirement_id: None,
         scenarios: Vec::new(),
     }
 }
 
-/// A `Renamed` requirement pointing at `requirement_id`.
-fn renamed(name: &str, requirement_id: &str, rename_to: &str) -> RequirementDraft {
+/// A `Renamed` requirement, addressed by name.
+fn renamed(name: &str, rename_to: &str) -> RequirementDraft {
     RequirementDraft {
         op: DeltaOp::Renamed,
         name: name.into(),
@@ -115,7 +115,7 @@ fn renamed(name: &str, requirement_id: &str, rename_to: &str) -> RequirementDraf
         rename_to: Some(rename_to.into()),
         reason: None,
         migration: None,
-        requirement_id: Some(requirement_id.into()),
+        requirement_id: None,
         scenarios: Vec::new(),
     }
 }
@@ -640,10 +640,7 @@ fn a_rejected_requirement_takes_the_whole_specify_with_it() {
         None,
         vec![
             added("a spent budget parks the job"),
-            modified(
-                "the budget is configurable",
-                "requirement-that-never-existed",
-            ),
+            modified("the budget is configurable"),
         ],
     );
     let result = store.specify(&command, &ctx);
@@ -732,7 +729,7 @@ fn a_modified_delta_naming_a_requirement_of_this_capability_is_accepted() {
         change,
         "worker/retry",
         None,
-        vec![modified("a budget caps retries", "req-budget")],
+        vec![modified("a budget caps retries")],
     );
     let report = store.specify(&command, &ctx).expect("specify");
 
@@ -779,7 +776,7 @@ fn a_modified_delta_naming_another_capabilitys_requirement_is_rejected() {
         change,
         "worker/retry",
         None,
-        vec![modified("a budget caps retries", "req-queue-depth")],
+        vec![modified("the queue has a depth")],
     );
     let result = store.specify(&command, &ctx);
 
@@ -790,6 +787,49 @@ fn a_modified_delta_naming_another_capabilitys_requirement_is_rejected() {
                 if requirement_id == "req-queue-depth" && capability_path == "worker/retry"
         ),
         "a requirement of another capability must be named as not belonging here, got {result:?}"
+    );
+}
+
+#[test]
+fn a_modified_delta_resolves_its_requirement_by_name() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = store
+        .propose(&propose_command("add-retry-budget"), &ctx)
+        .expect("propose")
+        .id;
+
+    let raw = Connection::open(&path).expect("raw connection");
+    seed_capability(&raw, &workspace_id(&ctx), "cap-retry", "worker/retry");
+    seed_requirement(
+        &raw,
+        "cap-retry",
+        "req-budget",
+        "a budget caps retries",
+        "live",
+    );
+
+    let command = specify_command(
+        change,
+        "worker/retry",
+        None,
+        vec![modified("a budget caps retries")],
+    );
+    let report = store.specify(&command, &ctx).expect("specify");
+
+    assert_eq!(report.modified, 1);
+
+    let stored: Option<String> = raw
+        .query_row(
+            "SELECT requirement_id FROM spec_deltas WHERE change_id = ?1",
+            [change.to_string()],
+            |row| row.get(0),
+        )
+        .expect("delta row");
+    assert_eq!(
+        stored.as_deref(),
+        Some("req-budget"),
+        "the delta still stores the id it resolved to; only the caller stopped supplying it"
     );
 }
 
@@ -962,7 +1002,7 @@ fn a_modified_delta_naming_a_removed_requirement_is_rejected() {
         change,
         "worker/retry",
         None,
-        vec![modified("retries are unbounded", "req-retired")],
+        vec![modified("retries are unbounded")],
     );
     let result = store.specify(&command, &ctx);
 
@@ -1939,7 +1979,7 @@ fn archiving_a_modified_delta_replaces_the_text_and_the_scenarios_wholesale() {
         &raw,
         "add-retry-budget",
         None,
-        vec![modified("a budget caps retries", "req-budget")],
+        vec![modified("a budget caps retries")],
     );
 
     let report = store
@@ -2052,7 +2092,7 @@ fn archiving_a_modified_delta_whose_target_was_retired_meanwhile_is_refused() {
         &raw,
         "add-retry-budget",
         None,
-        vec![modified("a budget caps retries", "req-budget")],
+        vec![modified("a budget caps retries")],
     );
 
     // Another change got there first.
@@ -2103,7 +2143,7 @@ fn archiving_a_removed_delta_retires_the_requirement_without_deleting_it() {
         &raw,
         "add-retry-budget",
         None,
-        vec![removed("a budget caps retries", "req-budget")],
+        vec![removed("a budget caps retries")],
     );
 
     let report = store
@@ -2144,7 +2184,6 @@ fn archiving_a_renamed_delta_moves_the_name_and_leaves_the_text_and_scenarios() 
         None,
         vec![renamed(
             "a budget caps retries",
-            "req-budget",
             "retries are capped by a budget",
         )],
     );
