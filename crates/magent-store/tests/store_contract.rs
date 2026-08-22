@@ -669,3 +669,46 @@ fn a_run_with_only_a_deterministic_checkpoint_is_still_reported() {
         "a snapshot is not an account of the work"
     );
 }
+
+#[test]
+fn the_session_heard_from_most_recently_wins_however_late_the_other_started() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+
+    let live = store
+        .start_run(&start_command("parallel work"), HarnessKind::ClaudeCode)
+        .expect("start");
+    let corpse = store
+        .bind_session(
+            "corpse-hint",
+            &std::env::temp_dir(),
+            "joined later",
+            HarnessKind::ClaudeCode,
+        )
+        .expect("bind");
+    assert_eq!(corpse.run_id, live.run_id, "both sessions must share one run");
+
+    // The corpse started last and then died: its stamp stays where it was. The
+    // live session is heard from now.
+    let connection = rusqlite::Connection::open(&path).expect("reopen");
+    connection
+        .execute(
+            "UPDATE sessions SET last_seen_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            [corpse.session_id.to_string()],
+        )
+        .expect("age the corpse");
+    connection
+        .execute(
+            "UPDATE sessions SET last_seen_at = '2099-01-01T00:00:00Z' WHERE id = ?1",
+            [live.session_id.to_string()],
+        )
+        .expect("stamp the live one");
+    drop(connection);
+
+    let resolved = store.latest_open_session(live.run_id).expect("resolve");
+    assert_eq!(
+        resolved,
+        Some(live.session_id),
+        "the session heard from most recently must win, not the one that started last"
+    );
+}
