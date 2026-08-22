@@ -2930,3 +2930,93 @@ async fn the_whole_loop_closes() {
     );
     client.cancel().await.expect("shutdown");
 }
+
+/// A server that has been told which harness session it belongs to.
+async fn connect_with_session(fixture: &Fixture, session: &str) -> Client {
+    let state_dir = fixture.state_dir.clone();
+    let repo = fixture.repo.clone();
+    let session = session.to_owned();
+
+    let transport = TokioChildProcess::new(Command::new(MAGENT).configure(|command| {
+        command
+            .arg("mcp")
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .env("MAGENT_SESSION_ID", &session)
+            .current_dir(&repo);
+    }))
+    .expect("spawn magent mcp");
+
+    tokio::time::timeout(Duration::from_secs(10), ().serve(transport))
+        .await
+        .expect("initialize did not time out")
+        .expect("initialize")
+}
+
+/// The session the most recent checkpoint was recorded against.
+fn latest_checkpoint_session(fixture: &Fixture) -> String {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open the store");
+    connection
+        .query_row(
+            "SELECT session_id FROM checkpoints ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("a checkpoint")
+}
+
+/// Two agents share one run, and the one that started last is not the caller.
+///
+/// Without the environment the server guesses, and the guess is whichever
+/// session was heard from most recently — which is the other agent.
+#[tokio::test]
+async fn a_server_told_its_session_records_against_that_session() {
+    let fixture = Fixture::new();
+    let client = connect(&fixture).await;
+
+    let earlier = call(
+        &client,
+        "magent_start",
+        json!({
+            "operation_id": uuid(),
+            "task": "the earlier agent",
+            "external_session_hint": "session-a",
+        }),
+    )
+    .await;
+    let later = call(
+        &client,
+        "magent_start",
+        json!({
+            "operation_id": uuid(),
+            "task": "the later agent",
+            "external_session_hint": "session-b",
+        }),
+    )
+    .await;
+    assert_eq!(
+        earlier["run_id"], later["run_id"],
+        "both sessions must share one run"
+    );
+    client.cancel().await.expect("shutdown");
+
+    let told = connect_with_session(&fixture, "session-a").await;
+    call(
+        &told,
+        "magent_checkpoint",
+        json!({
+            "operation_id": uuid(),
+            "stage": "executing",
+            "handoff_summary": "written by the earlier agent",
+        }),
+    )
+    .await;
+    told.cancel().await.expect("shutdown");
+
+    assert_eq!(
+        latest_checkpoint_session(&fixture),
+        earlier["session_id"].as_str().expect("a session id"),
+        "a server told which session it is must not record against the one that started last"
+    );
+}
