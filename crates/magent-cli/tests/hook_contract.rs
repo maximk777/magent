@@ -1268,3 +1268,46 @@ fn the_notice_and_the_memory_index_stay_separate() {
         run.stdout
     );
 }
+
+/// The stamp is what makes the ordering in `latest_open_session` mean anything.
+///
+/// Without it every session keeps the stamp it was inserted with, and the order
+/// is the old one wearing a new column's name — so this asserts the stamp moves
+/// on an event that is not the one that created the session.
+#[test]
+fn every_hook_event_records_that_its_session_was_heard_from() {
+    let fixture = Fixture::new();
+    let session = "11111111-2222-4333-8444-555555555555";
+
+    fixture.hook(
+        "user-prompt-submit",
+        &fixture.base("UserPromptSubmit", session),
+    );
+
+    let stamp_after_first = last_seen_of(&fixture, session);
+
+    // Far enough apart that the two stamps cannot land in the same instant.
+    std::thread::sleep(Duration::from_millis(20));
+    fixture.hook("session-start", &fixture.base("SessionStart", session));
+
+    let stamp_after_second = last_seen_of(&fixture, session);
+    assert!(
+        stamp_after_second > stamp_after_first,
+        "a later hook event must advance last_seen_at: {stamp_after_first} then {stamp_after_second}"
+    );
+}
+
+/// The newest stamp held for `session`, read straight from the profile.
+fn last_seen_of(fixture: &Fixture, session: &str) -> String {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open profile");
+    connection
+        .query_row(
+            "SELECT last_seen_at FROM sessions
+             WHERE external_session_hint = ?1
+             ORDER BY started_at DESC LIMIT 1",
+            [session],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("a session for this hint, carrying a stamp")
+}

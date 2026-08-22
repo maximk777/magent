@@ -686,7 +686,10 @@ fn the_session_heard_from_most_recently_wins_however_late_the_other_started() {
             HarnessKind::ClaudeCode,
         )
         .expect("bind");
-    assert_eq!(corpse.run_id, live.run_id, "both sessions must share one run");
+    assert_eq!(
+        corpse.run_id, live.run_id,
+        "both sessions must share one run"
+    );
 
     // The corpse started last and then died: its stamp stays where it was. The
     // live session is heard from now.

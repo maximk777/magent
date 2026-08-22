@@ -316,11 +316,44 @@ impl Store {
         run_id.map(|run_id| self.get_run(run_id)).transpose()
     }
 
-    /// The session most recently opened against `run_id` and not yet ended.
+    /// Records that the harness session behind `hint` was just heard from.
+    ///
+    /// Called once per hook event, from the one place every event passes
+    /// through, so a path added later is stamped without anybody remembering
+    /// to. It is free: hooks already write on every prompt and every tool
+    /// result.
+    ///
+    /// A hint with no session yet — the first event of a session — updates
+    /// nothing and is not an error; `insert_session` stamps that row when it
+    /// creates it.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn touch_external_session(&self, hint: &str) -> Result<(), StoreError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "UPDATE sessions SET last_seen_at = ?1
+             WHERE id = (SELECT id FROM sessions
+                         WHERE external_session_hint = ?2
+                         ORDER BY started_at DESC LIMIT 1)",
+            (Utc::now().to_rfc3339(), hint),
+        )?;
+        Ok(())
+    }
+
+    /// The session on `run_id` heard from most recently and not yet ended.
     ///
     /// A checkpoint belongs to a session, but the model has no way to learn its
     /// own session id: the server issued it. Rather than make it ask, the
     /// server answers that question itself.
+    ///
+    /// Ordered by `last_seen_at`, not `started_at`. A session whose process
+    /// died keeps the stamp it had when it died, so any session still working
+    /// overtakes it however much earlier it began; before this a corpse
+    /// outranked a working agent forever on the strength of having started
+    /// later. There is deliberately no timeout: the longest silence in normal
+    /// work belongs to an agent running one long command, and a constant large
+    /// enough to spare it is too large to catch anything worth catching.
     ///
     /// # Errors
     /// Fails on a database error.
@@ -330,7 +363,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM sessions
                  WHERE run_id = ?1 AND ended_at IS NULL
-                 ORDER BY started_at DESC, rowid DESC
+                 ORDER BY last_seen_at DESC, rowid DESC
                  LIMIT 1",
                 [run_id.to_string()],
                 |row| row.get::<_, String>(0),

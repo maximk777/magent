@@ -93,6 +93,12 @@ pub fn handle(event: Event, input: &Value, state_dir: &Path) -> anyhow::Result<S
     let store = Store::open(&crate::paths::database_path(state_dir))?;
     let cwd = cwd_of(input);
 
+    // Before the match rather than inside a handler: this is the one place
+    // every event passes through, so a handler added later is stamped without
+    // anybody remembering to. The stamp is what lets a session that stopped
+    // reporting fall behind one that has not.
+    store.touch_external_session(&session)?;
+
     match event {
         Event::SessionStart => session_start(&store, &session, &cwd),
         Event::UserPromptSubmit => user_prompt_submit(&store, &session, &cwd, input),
