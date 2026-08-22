@@ -4,6 +4,9 @@
     "command": "${CLAUDE_PLUGIN_ROOT}/bin/magent",
     "args": [
       "mcp"
-    ]
+    ],
+    "env": {
+      "MAGENT_SESSION_ID": "${CLAUDE_CODE_SESSION_ID:-}"
+    }
   }
 }
