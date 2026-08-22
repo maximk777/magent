@@ -715,3 +715,51 @@ fn the_session_heard_from_most_recently_wins_however_late_the_other_started() {
         "the session heard from most recently must win, not the one that started last"
     );
 }
+
+#[test]
+fn each_session_reads_back_the_checkpoint_it_wrote() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+
+    let first = store
+        .start_run(&start_command("two agents"), HarnessKind::ClaudeCode)
+        .expect("start");
+    let second = store
+        .bind_session(
+            "second-agent",
+            &std::env::temp_dir(),
+            "two agents",
+            HarnessKind::ClaudeCode,
+        )
+        .expect("bind");
+    assert_eq!(
+        second.run_id, first.run_id,
+        "both sessions must share one run"
+    );
+
+    store
+        .save_checkpoint(&checkpoint_command(
+            first.run_id,
+            first.session_id,
+            "the earlier agent, on its own task",
+        ))
+        .expect("first checkpoint");
+    store
+        .save_checkpoint(&checkpoint_command(
+            second.run_id,
+            second.session_id,
+            "the later agent, on a different one",
+        ))
+        .expect("second checkpoint");
+
+    let seen = store
+        .snapshot_for_session(first.run_id, Some(first.session_id))
+        .expect("snapshot")
+        .latest_checkpoint
+        .expect("a checkpoint");
+
+    assert_eq!(
+        seen.session_id, first.session_id,
+        "a session must read back its own checkpoint, not whichever landed last on the run"
+    );
+}
