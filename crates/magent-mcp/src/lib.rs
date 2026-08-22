@@ -470,6 +470,15 @@ struct StatusReport {
     run: Option<magent_core::RunSnapshot>,
 }
 
+/// The harness session this server belongs to, as the harness named it.
+///
+/// One neutral name, never a harness's own. The whole split between hooks and
+/// MCP rests on this layer being portable, and a harness name compiled in here
+/// would make that claim false in the code rather than merely aspirational.
+/// The plugin manifest is where the harness is named, beside the plugin-root
+/// substitution that already lives there.
+pub const SESSION_ID_ENV: &str = "MAGENT_SESSION_ID";
+
 /// The MCP server. Holds the store and the identity the server was launched
 /// with; it never learns either from the client.
 #[derive(Clone)]
@@ -477,6 +486,10 @@ pub struct MagentMcp {
     store: Arc<Store>,
     harness: HarnessKind,
     workspace_roots: Vec<PathBuf>,
+    /// The harness session this server was launched for, from
+    /// [`SESSION_ID_ENV`]. `None` when the harness published nothing, which is
+    /// the case the guess in `in_flight` still exists for.
+    session_hint: Option<String>,
     /// Where reference checkouts are materialised. Held rather than derived so
     /// the server reports the same paths the CLI wrote.
     deps_root: PathBuf,
@@ -569,12 +582,16 @@ impl MagentMcp {
 
         let session_id = match session_id {
             Some(named) => named,
-            // Nothing open means the run was restored by a hook rather than
-            // opened here. Recording against the run itself still beats
-            // refusing: the checkpoint is what has to survive.
             None => self
-                .store
-                .latest_open_session(run_id)?
+                .session_hint
+                .as_deref()
+                .and_then(|hint| self.store.binding_for_external_session(hint).ok().flatten())
+                .map(|binding| binding.session_id)
+                // Nothing named and nothing in the environment: the run was
+                // restored by a hook rather than opened here, or the harness
+                // publishes no session. Recording against the run's own thread
+                // still beats refusing: the checkpoint is what has to survive.
+                .or(self.store.latest_open_session(run_id)?)
                 .ok_or(StoreError::NoOpenRun)?,
         };
 
@@ -673,6 +690,12 @@ impl MagentMcp {
             store,
             harness,
             workspace_roots: vec![workspace_root],
+            // Empty is treated as absent: the manifest expands the harness's
+            // variable with a `:-` default, so a harness that publishes nothing
+            // leaves an empty string here rather than an unset variable.
+            session_hint: std::env::var(SESSION_ID_ENV)
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
             deps_root,
             tool_router: Self::tool_router(),
         }
