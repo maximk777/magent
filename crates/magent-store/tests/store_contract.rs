@@ -763,3 +763,42 @@ fn each_session_reads_back_the_checkpoint_it_wrote() {
         "a session must read back its own checkpoint, not whichever landed last on the run"
     );
 }
+
+/// The deliberate compromise: a session with nothing of its own is shown the
+/// run's latest rather than nothing at all.
+#[test]
+fn a_session_with_no_checkpoint_of_its_own_is_shown_the_runs() {
+    let (_dir, path) = temp_db();
+    let store = Store::open(&path).expect("open");
+
+    let writer = store
+        .start_run(&start_command("work in flight"), HarnessKind::ClaudeCode)
+        .expect("start");
+    store
+        .save_checkpoint(&checkpoint_command(
+            writer.run_id,
+            writer.session_id,
+            "where things stand",
+        ))
+        .expect("checkpoint");
+
+    let joiner = store
+        .bind_session(
+            "joined-late",
+            &std::env::temp_dir(),
+            "work in flight",
+            HarnessKind::ClaudeCode,
+        )
+        .expect("bind");
+
+    let seen = store
+        .snapshot_for_session(joiner.run_id, Some(joiner.session_id))
+        .expect("snapshot")
+        .latest_checkpoint
+        .expect("a session joining work in flight must be shown the run's checkpoint");
+
+    assert_eq!(
+        seen.handoff_summary, "where things stand",
+        "the fallback is the run's latest, not silence"
+    );
+}

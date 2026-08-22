@@ -402,7 +402,10 @@ impl Store {
     ) -> Result<(), StoreError> {
         use magent_core::{CheckpointCommand, OperationId};
 
-        let run = self.get_run(binding.run_id)?;
+        // This session's own previous checkpoint, not the run's. The reasoning
+        // a PreCompact carries forward belongs to the agent being compacted; a
+        // neighbour's decisions are not its to inherit.
+        let run = self.snapshot_for_session(binding.run_id, Some(binding.session_id))?;
 
         // `completed` is not a stage a checkpoint may claim; it is reached only
         // through magent_finish.

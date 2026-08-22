@@ -265,7 +265,7 @@ impl Store {
                 workspace_id,
                 task,
                 stage,
-                latest_checkpoint: latest_checkpoint(tx, run_id)?,
+                latest_checkpoint: latest_checkpoint(tx, run_id, Some(session_id))?,
                 instructions: Vec::new(),
             })
         })
@@ -418,10 +418,27 @@ impl Store {
     /// # Errors
     /// Returns [`StoreError::RunNotFound`] for an unknown run.
     pub fn get_run(&self, run_id: RunId) -> Result<RunSnapshot, StoreError> {
+        self.snapshot_for_session(run_id, None)
+    }
+
+    /// The run as one session should see it: carrying that session's own latest
+    /// checkpoint rather than whichever landed last on the run.
+    ///
+    /// Two agents sharing a run each read their own task back after a
+    /// compaction. A session that has written none of its own falls back to the
+    /// run's latest, which is what a session joining work in flight needs.
+    ///
+    /// # Errors
+    /// Returns [`StoreError::RunNotFound`] for an unknown run.
+    pub fn snapshot_for_session(
+        &self,
+        run_id: RunId,
+        session_id: Option<SessionId>,
+    ) -> Result<RunSnapshot, StoreError> {
         let mut connection = self.lock()?;
         let tx = connection.transaction()?;
         let row = load_run_row(&tx, run_id)?;
-        let latest_checkpoint = latest_checkpoint(&tx, run_id)?;
+        let latest_checkpoint = latest_checkpoint(&tx, run_id, session_id)?;
         drop(tx);
 
         Ok(RunSnapshot {
@@ -1082,28 +1099,61 @@ fn assert_session_exists(tx: &Transaction<'_>, session_id: SessionId) -> Result<
 
 /// Most recent checkpoint for a run.
 ///
+/// The checkpoint a session should be shown, which is its own latest.
+///
+/// Falls back to the run's latest when this session has written none. That is a
+/// trade taken deliberately: a session joining work already in flight has
+/// nothing of its own and needs to know where things stand, and handing it
+/// nothing would be worse than handing it a neighbour's. The cost is that two
+/// agents see each other's task until each has checkpointed once.
+///
 /// Ordered by rowid, not `created_at`: several checkpoints can land in the same
 /// millisecond, and "latest" must never be ambiguous.
 fn latest_checkpoint(
     tx: &Transaction<'_>,
     run_id: RunId,
+    session_id: Option<SessionId>,
+) -> Result<Option<CheckpointSnapshot>, StoreError> {
+    if let Some(session_id) = session_id
+        && let Some(own) = checkpoint_row(
+            tx,
+            run_id,
+            "SELECT id, session_id, origin, payload_json, created_at
+             FROM checkpoints WHERE run_id = ?1 AND session_id = ?2
+             ORDER BY rowid DESC LIMIT 1",
+            rusqlite::params![run_id.to_string(), session_id.to_string()],
+        )?
+    {
+        return Ok(Some(own));
+    }
+
+    checkpoint_row(
+        tx,
+        run_id,
+        "SELECT id, session_id, origin, payload_json, created_at
+         FROM checkpoints WHERE run_id = ?1
+         ORDER BY rowid DESC LIMIT 1",
+        rusqlite::params![run_id.to_string()],
+    )
+}
+
+/// The half both queries above share: one row, decoded into a snapshot.
+fn checkpoint_row(
+    tx: &Transaction<'_>,
+    run_id: RunId,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
 ) -> Result<Option<CheckpointSnapshot>, StoreError> {
     let row = tx
-        .query_row(
-            "SELECT id, session_id, origin, payload_json, created_at
-             FROM checkpoints WHERE run_id = ?1
-             ORDER BY rowid DESC LIMIT 1",
-            [run_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            },
-        )
+        .query_row(sql, params, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
         .optional()?;
 
     let Some((id, session_id, origin, payload_json, created_at)) = row else {
