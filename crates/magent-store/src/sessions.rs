@@ -553,8 +553,12 @@ fn insert_session(
 ) -> Result<SessionId, StoreError> {
     let session_id = SessionId::new();
     tx.execute(
-        "INSERT INTO sessions (id, run_id, harness, external_session_hint, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        // `last_seen_at` takes the same `now` as `started_at`: a session that
+        // has only just been inserted was heard from at the moment it began,
+        // and leaving it NULL would put every fresh row last in an ordering
+        // that sorts on it.
+        "INSERT INTO sessions (id, run_id, harness, external_session_hint, started_at, last_seen_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
         (
             session_id.to_string(),
             run_id.to_string(),
