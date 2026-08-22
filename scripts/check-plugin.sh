@@ -301,6 +301,28 @@ if [ -f README.md ]; then
   fi
 fi
 
+# --- the harness is named in the manifest, and nowhere else -----------------
+
+# The server learns which session it is from MAGENT_SESSION_ID, and without it
+# it falls back to guessing: whichever session on the run was heard from last,
+# which with two agents is the other one. The harness's own variable is what
+# fills it, and that substitution belongs in the manifest beside the plugin-root
+# one -- the whole split between hooks and MCP rests on the MCP layer being
+# portable, so a harness name compiled into the core would make the README false
+# in the code rather than merely out of date.
+if [ -f plugin/.mcp.json ]; then
+  if ! grep -q 'MAGENT_SESSION_ID' plugin/.mcp.json; then
+    fail "plugin/.mcp.json does not set MAGENT_SESSION_ID; without it the server cannot tell which session is calling and falls back to guessing"
+  fi
+fi
+
+for source in crates/magent-mcp/src/*.rs; do
+  [ -f "$source" ] || continue
+  if grep -q 'CLAUDE_' "$source"; then
+    fail "$source names a harness environment variable; the harness is named in plugin/.mcp.json, and this layer reads MAGENT_SESSION_ID"
+  fi
+done
+
 if [ "$failures" -gt 0 ]; then
   echo >&2
   echo "$failures problem(s): a clean install of this plugin would not work." >&2
