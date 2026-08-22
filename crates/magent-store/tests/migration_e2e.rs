@@ -467,3 +467,28 @@ fn concurrent_opens_of_an_old_profile_migrate_once() {
     assert_eq!(store.schema_version().expect("version"), CURRENT_VERSION);
     assert_eq!(store.run_count().expect("runs"), 1);
 }
+
+#[test]
+fn sessions_carry_a_last_seen_stamp_backfilled_from_their_start() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 14);
+    seed_slice_one(&legacy);
+    drop(legacy);
+
+    Store::open(&path).expect("upgrade");
+
+    let connection = Connection::open(&path).expect("reopen");
+    let (started_at, last_seen_at): (String, Option<String>) = connection
+        .query_row(
+            "SELECT started_at, last_seen_at FROM sessions WHERE id = ?1",
+            ["44444444-4444-4444-8444-444444444444"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the sessions row must carry last_seen_at");
+
+    assert_eq!(
+        last_seen_at.as_deref(),
+        Some(started_at.as_str()),
+        "a session that predates the stamp is worth exactly the moment it started"
+    );
+}
