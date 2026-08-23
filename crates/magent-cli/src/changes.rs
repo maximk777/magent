@@ -204,7 +204,46 @@ fn write_detail(detail: &ChangeDetail, out: &mut String) {
         );
     }
 
+    push_shape_and_ready(out, detail);
     push_journal(out, detail);
+}
+
+/// How parallel the plan is, and what may be started right now.
+///
+/// The conflict line is what makes the ready list usable: a reader seeing three
+/// ready tasks and dispatching all three is exactly the collision this exists
+/// to prevent. A width of 1 is printed rather than hidden — it says the plan is
+/// a chain, which is a real answer and better than an offer that turns out
+/// empty after the agents have been briefed.
+fn push_shape_and_ready(out: &mut String, detail: &ChangeDetail) {
+    let _ = writeln!(
+        out,
+        "\nshape  width {}, longest chain {}",
+        detail.shape.width, detail.shape.longest_chain
+    );
+
+    if detail.ready.is_empty() {
+        let _ = writeln!(out, "ready  nothing — every task is closed or waiting");
+        return;
+    }
+
+    let mut ready: Vec<_> = detail.ready.iter().collect();
+    ready.sort_by(|left, right| order_of(&left.number).cmp(&order_of(&right.number)));
+
+    let numbers: Vec<&str> = ready.iter().map(|task| task.number.as_str()).collect();
+    let _ = writeln!(out, "ready  {}", numbers.join(", "));
+
+    for task in ready {
+        if task.conflicts_with.is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "       {} shares a file with {}",
+            task.number,
+            task.conflicts_with.join(", ")
+        );
+    }
 }
 
 /// One requirement delta, in the words a reviewer has to judge.

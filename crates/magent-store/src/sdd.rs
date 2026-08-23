@@ -309,6 +309,17 @@ pub struct ChangeDetail {
     /// Every tick this change has ever recorded, oldest first — including ones
     /// taken against tasks a later plan replaced.
     pub ticks: Vec<TaskTick>,
+    /// The tasks that may be started now, each naming the others it shares a
+    /// file with. Empty for a change with no plan yet.
+    ///
+    /// Carried here rather than fetched separately so one read answers the
+    /// whole question: both surfaces render this struct, and a caller that had
+    /// to make two more calls to learn whether the plan is parallel would be
+    /// doing the store's job.
+    pub ready: Vec<ReadyTask>,
+    /// How parallel the plan could ever be. Nought by nought for a change with
+    /// no plan yet.
+    pub shape: PlanShape,
 }
 
 /// One capability of the live specification, as [`Store::live_capabilities`]
@@ -704,36 +715,7 @@ impl Store {
         let tasks = load_task_summaries(&tx, &change.to_string())?;
         drop(tx);
 
-        let available: HashSet<&str> = tasks
-            .iter()
-            .filter(|task| task.status == "done")
-            .flat_map(|task| task.produces.iter())
-            .map(|artifact| artifact.trim())
-            .collect();
-
-        let ready: Vec<&TaskSummary> = tasks
-            .iter()
-            .filter(|task| task.status != "done" && task.status != "skipped")
-            .filter(|task| {
-                task.consumes
-                    .iter()
-                    .all(|artifact| available.contains(artifact.trim()))
-            })
-            .collect();
-
-        Ok(ready
-            .iter()
-            .map(|task| ReadyTask {
-                number: task.number.clone(),
-                title: task.title.clone(),
-                conflicts_with: ready
-                    .iter()
-                    .filter(|other| other.number != task.number)
-                    .filter(|other| other.files.iter().any(|path| task.files.contains(path)))
-                    .map(|other| other.number.clone())
-                    .collect(),
-            })
-            .collect())
+        Ok(ready_of(&tasks))
     }
 
     /// How parallel `change`'s plan could ever be.
@@ -759,29 +741,7 @@ impl Store {
         let tasks = load_task_summaries(&tx, &change.to_string())?;
         drop(tx);
 
-        let contracts: Vec<(&[String], &[String])> = tasks
-            .iter()
-            .map(|task| (task.consumes.as_slice(), task.produces.as_slice()))
-            .collect();
-
-        // A stored plan passed `require_acyclic_plan` on the way in, so every
-        // task has a level; `unwrap_or(0)` is for a row this crate did not
-        // write rather than for a case the process allows.
-        let levels: Vec<usize> = dependency_levels(&contracts)
-            .into_iter()
-            .map(|level| level.unwrap_or(0))
-            .collect();
-
-        let longest_chain = levels.iter().max().map_or(0, |deepest| deepest + 1);
-        let width = (0..longest_chain)
-            .map(|level| levels.iter().filter(|task| **task == level).count())
-            .max()
-            .unwrap_or(0);
-
-        Ok(PlanShape {
-            width,
-            longest_chain,
-        })
+        Ok(shape_of(&tasks))
     }
 
     /// Folds a change's deltas into the live base and moves it to `archived`.
@@ -1038,6 +998,8 @@ impl Store {
             capabilities: proposal.capabilities,
             impact: proposal.impact,
             deltas,
+            ready: ready_of(&tasks),
+            shape: shape_of(&tasks),
             tasks,
             ticks,
         }))
@@ -1832,6 +1794,85 @@ fn require_plannable_change(
     }
 
     Ok(())
+}
+
+/// The tasks of a loaded plan that may be started now.
+///
+/// Pure over the rows so `change_detail` can answer without a second read: it
+/// has already loaded the tasks, and asking the database again for what is in
+/// hand would be paying twice for one answer.
+fn ready_of(tasks: &[TaskSummary]) -> Vec<ReadyTask> {
+    let available: HashSet<&str> = tasks
+        .iter()
+        .filter(|task| task.status == "done")
+        .flat_map(|task| task.produces.iter())
+        .map(|artifact| artifact.trim())
+        .collect();
+
+    // Everything any task of this plan could ever make. An entry outside it is
+    // not a dependency at all: waiting for something nobody produces is waiting
+    // for ever, and the only plans that carry such an entry are ones written
+    // before the contract became a list, whose prose was migrated as a single
+    // entry that matches nothing. `Store::plan` refuses one from a new plan, so
+    // this cannot quietly excuse a promise somebody meant to keep.
+    let producible: HashSet<&str> = tasks
+        .iter()
+        .flat_map(|task| task.produces.iter())
+        .map(|artifact| artifact.trim())
+        .collect();
+
+    let ready: Vec<&TaskSummary> = tasks
+        .iter()
+        .filter(|task| task.status != "done" && task.status != "skipped")
+        .filter(|task| {
+            task.consumes.iter().all(|artifact| {
+                let artifact = artifact.trim();
+                available.contains(artifact) || !producible.contains(artifact)
+            })
+        })
+        .collect();
+
+    ready
+        .iter()
+        .map(|task| ReadyTask {
+            number: task.number.clone(),
+            title: task.title.clone(),
+            conflicts_with: ready
+                .iter()
+                .filter(|other| other.number != task.number)
+                .filter(|other| other.files.iter().any(|path| task.files.contains(path)))
+                .map(|other| other.number.clone())
+                .collect(),
+        })
+        .collect()
+}
+
+/// How parallel a loaded plan could ever be. Pure for the reason `ready_of`
+/// gives.
+fn shape_of(tasks: &[TaskSummary]) -> PlanShape {
+    let contracts: Vec<(&[String], &[String])> = tasks
+        .iter()
+        .map(|task| (task.consumes.as_slice(), task.produces.as_slice()))
+        .collect();
+
+    // A stored plan passed `require_acyclic_plan` on the way in, so every task
+    // has a level; `unwrap_or(0)` is for a row this crate did not write rather
+    // than for a case the process allows.
+    let levels: Vec<usize> = dependency_levels(&contracts)
+        .into_iter()
+        .map(|level| level.unwrap_or(0))
+        .collect();
+
+    let longest_chain = levels.iter().max().map_or(0, |deepest| deepest + 1);
+    let width = (0..longest_chain)
+        .map(|level| levels.iter().filter(|task| **task == level).count())
+        .max()
+        .unwrap_or(0);
+
+    PlanShape {
+        width,
+        longest_chain,
+    }
 }
 
 /// The level of each task in the dependency graph, or `None` for a task no

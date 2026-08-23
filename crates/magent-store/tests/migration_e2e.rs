@@ -545,3 +545,50 @@ fn a_tasks_prose_contract_survives_as_a_single_entry() {
     assert_eq!(consumes, "[\"RetryBudget::new(u32) from task 1\"]");
     assert_eq!(produces, "[\"nothing downstream\"]");
 }
+
+/// A plan written before the shape changed is still executable.
+///
+/// Its prose became a single entry that matches nothing, and a task waiting on
+/// an artifact no task in the plan produces would wait for ever — so the ready
+/// set must not count it as a dependency.
+#[test]
+fn a_migrated_plan_still_offers_its_open_tasks() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 15);
+    seed_slice_one(&legacy);
+    legacy
+        .execute(
+            "INSERT INTO sdd_changes
+                 (id, workspace_id, namespace, slug, title, classification, status,
+                  created_at, updated_at)
+             VALUES (?1, ?2, 'service', 'add-retry-budget', 'Give retries a ceiling',
+                     'bounded', 'planned', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (LEGACY_CHANGE, LEGACY_WORKSPACE),
+        )
+        .expect("seed change");
+    legacy
+        .execute(
+            "INSERT INTO tasks
+                 (id, change_id, number, title, files_json, consumes, produces,
+                  verify_command, expected_output_json, covers_json, status,
+                  created_at, updated_at)
+             VALUES ('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', ?1, '1', 'cap the retries',
+                     '[]', 'struct RetryConfig, from the task before this one', NULL,
+                     'cargo test', '[\"ok\"]', '[]', 'pending',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [LEGACY_CHANGE],
+        )
+        .expect("seed a prose contract");
+    drop(legacy);
+
+    let store = Store::open(&path).expect("upgrade");
+    let ready = store
+        .ready_tasks(LEGACY_CHANGE.parse().expect("a change id"))
+        .expect("ready set");
+
+    assert_eq!(
+        ready.len(),
+        1,
+        "a migrated task must still be offered: {ready:?}"
+    );
+}
