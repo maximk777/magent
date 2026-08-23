@@ -556,12 +556,24 @@ impl Store {
         // later close to refuse, and the row would carry an accusation nobody
         // reads. Scoped to the same change, because `files` is a contract
         // between the tasks of one plan.
+        //
+        // Ordered newest lease first, and the loop below stops at the first
+        // match, for the same reason the hold lookup above is ordered: two
+        // other sessions can each hold a different task that both declare the
+        // edited file — `ready_of` (`sdd.rs`) only hides a task that is
+        // itself held, not one whose files overlap another live hold, and
+        // `write_binding` claims whatever `current_task` names without
+        // checking for that overlap — so without an order the answer is
+        // whichever row SQLite happens to scan first. The freshest hold is
+        // the one actually in force, and that task number is what a later
+        // refusal quotes to a person as who to go and talk to.
         let trespass_on = match &held {
             Some((_, change_id)) => {
                 let mut statement = tx.prepare(
                     "SELECT number, files_json FROM tasks
                      WHERE change_id = ?1 AND claimed_by IS NOT NULL AND claimed_by != ?2
-                       AND lease_until IS NOT NULL AND lease_until > ?3",
+                       AND lease_until IS NOT NULL AND lease_until > ?3
+                     ORDER BY lease_until DESC",
                 )?;
                 let rows = statement.query_map(
                     rusqlite::params![change_id, session_id.to_string(), &observed_at],
@@ -1007,8 +1019,11 @@ fn task_number_in(current_task: &str) -> Option<&str> {
 /// `store.rs` matches any file so called, which is what declaring a bare
 /// name asks for. A leading `./` is trimmed, so `./src/store.rs` behaves
 /// exactly like `src/store.rs`. An empty declaration — `""`, or all
-/// whitespace — matches nothing, deliberately: a stray blank entry in
-/// `files` must not make every edit in the change a trespass.
+/// whitespace — matches nothing, deliberately: `format!("/{declared}")` on
+/// an empty string is `/`, which `ends_with` would only match against an
+/// edited path ending in a separator — a directory, which the hook never
+/// reports — so the guard closes that off outright rather than leaning on
+/// the hook never sending one.
 fn declares_path(declared: &str, edited: &str) -> bool {
     let declared = declared.trim().trim_start_matches("./");
 

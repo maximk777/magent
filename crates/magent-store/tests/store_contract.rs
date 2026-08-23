@@ -824,10 +824,15 @@ const HOLD_PURPOSE: &str = "Recording which task an edit was made for, so closin
 /// The two tasks the stamping tests hold in turn.
 const TASK_THREE: &str = "3";
 const TASK_FOUR: &str = "4";
+/// A third task, declaring the same file task 4 does — only planned by
+/// `planned_change_with_two_holders_of_store_rs`, for the test that needs a
+/// second live holder of that file.
+const TASK_FIVE: &str = "5";
 /// `current_task` as a checkpoint's binding carries it — free text after the
 /// number, the shape `task_number_in` (`store.rs`) parses.
 const TASK_THREE_NAMED: &str = "3: whatever";
 const TASK_FOUR_NAMED: &str = "4: next";
+const TASK_FIVE_NAMED: &str = "5: also touches store.rs";
 
 const EDIT_A: &str = "/tmp/project/src/a.rs";
 const EDIT_B: &str = "/tmp/project/src/b.rs";
@@ -869,6 +874,38 @@ impl HoldFixture {
     /// query by it: `tasks_number` is `UNIQUE(change_id, number)`
     /// (`0009_tasks.sql`), not unique on the number alone.
     fn planned_change(&self) -> ChangeId {
+        let change = self.proposed_and_specified();
+        self.plan_tasks(
+            change,
+            vec![
+                hold_task(TASK_THREE, &[HOLD_REQUIREMENT], &["src/a.rs"]),
+                hold_task(TASK_FOUR, &[], &["src/store.rs"]),
+            ],
+        );
+        change
+    }
+
+    /// Like `planned_change`, but with a third task, "5", declaring the same
+    /// file task 4 does — `src/store.rs`. For a test that needs two different
+    /// sessions holding two different tasks that both name the edited file,
+    /// so a trespass on that file has more than one live holder to pick
+    /// between.
+    fn planned_change_with_two_holders_of_store_rs(&self) -> ChangeId {
+        let change = self.proposed_and_specified();
+        self.plan_tasks(
+            change,
+            vec![
+                hold_task(TASK_THREE, &[HOLD_REQUIREMENT], &["src/a.rs"]),
+                hold_task(TASK_FOUR, &[], &["src/store.rs"]),
+                hold_task(TASK_FIVE, &[], &["src/store.rs"]),
+            ],
+        );
+        change
+    }
+
+    /// The propose-then-specify half both `planned_change` variants share —
+    /// the part that never differs between them.
+    fn proposed_and_specified(&self) -> ChangeId {
         let change = self
             .store
             .propose(
@@ -916,22 +953,23 @@ impl HoldFixture {
             )
             .expect("specify");
 
+        change
+    }
+
+    /// The plan half both `planned_change` variants share, replacing
+    /// whatever tasks the change had.
+    fn plan_tasks(&self, change: ChangeId, tasks: Vec<TaskDraft>) {
         self.store
             .plan(
                 &PlanCommand {
                     operation_id: OperationId::new(),
                     change,
-                    tasks: vec![
-                        hold_task(TASK_THREE, &[HOLD_REQUIREMENT], &["src/a.rs"]),
-                        hold_task(TASK_FOUR, &[], &["src/store.rs"]),
-                    ],
+                    tasks,
                     check_only: false,
                 },
                 &self.context,
             )
             .expect("plan");
-
-        change
     }
 
     /// A run of this workspace, bound to the change by its slug — but naming
@@ -1238,6 +1276,10 @@ fn an_edit_is_judged_by_the_lease_that_was_live_when_it_landed() {
 /// this file for an unrelated fixture.
 const TRESPASS_HINT: &str = "harness-session-trespasser";
 
+/// A third session's hint, for the test that needs two other sessions each
+/// holding a different task, both of which declare the edited file.
+const THIRD_HINT: &str = "harness-session-second-trespasser";
+
 /// An edit under session A, but on the file task 4 declares — an absolute
 /// path, not the relative one the plan recorded, because that is what a real
 /// harness hands the hook. A hook matching only identical strings would
@@ -1361,5 +1403,75 @@ fn an_edit_onto_your_own_declared_file_is_no_trespass() {
         trespass(&fixture.raw(), EDIT_A),
         None,
         "a session editing the file its own task declares is not trespassing"
+    );
+}
+
+/// Two other sessions, holding two different tasks that both declare the
+/// edited file — a state `ready_of` (`sdd.rs`) does not prevent, since it
+/// only hides a task that is itself held and not one whose files overlap
+/// another live hold, and `write_binding` claims whatever `current_task`
+/// names without checking for that overlap either. With two live holders the
+/// query in `append_ledger` must pick between them, and only the newest
+/// lease is the hold actually in force — the `ORDER BY lease_until DESC` this
+/// test exists to guard.
+#[test]
+fn a_trespass_names_the_freshest_of_two_holders() {
+    let fixture = HoldFixture::new();
+    let change = fixture.planned_change_with_two_holders_of_store_rs();
+    let (run_id, session_a) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    fixture.second_session(run_id, TRESPASS_HINT);
+    fixture.hold(run_id, TASK_FOUR_NAMED);
+
+    fixture.second_session(run_id, THIRD_HINT);
+    fixture.hold(run_id, TASK_FIVE_NAMED);
+
+    assert_ne!(
+        fixture.holder_of(change, TASK_FOUR),
+        fixture.holder_of(change, TASK_FIVE),
+        "two different sessions must hold task 4 and task 5, or this is not testing two holders at all"
+    );
+
+    // Pinned by hand rather than trusted to wall-clock order: task 4's lease
+    // set older, task 5's newer, both still live when the edit lands below.
+    // Task 4 is both the lower task number and the earlier row, so a scan
+    // that is not explicitly ordered — by rowid, or by an index walked
+    // ascending — would meet it first; only `ORDER BY lease_until DESC`
+    // reaches task 5, the one actually fresher, first.
+    let now = chrono::Utc::now();
+    fixture
+        .raw()
+        .execute(
+            "UPDATE tasks SET lease_until = ?1 WHERE number = ?2 AND change_id = ?3",
+            rusqlite::params![
+                (now + chrono::Duration::minutes(1)).to_rfc3339(),
+                TASK_FOUR,
+                change.to_string(),
+            ],
+        )
+        .expect("set task 4's lease older");
+    fixture
+        .raw()
+        .execute(
+            "UPDATE tasks SET lease_until = ?1 WHERE number = ?2 AND change_id = ?3",
+            rusqlite::params![
+                (now + chrono::Duration::minutes(9)).to_rfc3339(),
+                TASK_FIVE,
+                change.to_string(),
+            ],
+        )
+        .expect("set task 5's lease newer");
+
+    fixture
+        .store
+        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .expect("append ledger");
+
+    assert_eq!(
+        trespass(&fixture.raw(), TRESPASS_EDIT),
+        Some(TASK_FIVE.into()),
+        "task 5 holds the newer of the two leases, so it is the one named — \
+         not task 4, which an unordered scan would meet first"
     );
 }
