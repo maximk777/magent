@@ -229,6 +229,22 @@ fn push_shape_and_ready(out: &mut String, detail: &ChangeDetail) {
         return;
     }
 
+    let now = chrono::Utc::now();
+    let mut held: Vec<&str> = detail
+        .tasks
+        .iter()
+        .filter(|task| task.lease_until.is_some_and(|until| until > now))
+        .map(|task| task.number.as_str())
+        .collect();
+    held.sort_by(|left, right| order_of(left).cmp(&order_of(right)));
+    if !held.is_empty() {
+        // Printed rather than left to be inferred from what stopped being
+        // offered: a person watching a wave wants to see which agent is on
+        // which task. Nothing is printed when none are held, because a line
+        // saying so is right every time and read by nobody.
+        let _ = writeln!(out, "held   {}", held.join(", "));
+    }
+
     let mut ready: Vec<_> = detail.ready.iter().collect();
     ready.sort_by(|left, right| order_of(&left.number).cmp(&order_of(&right.number)));
 
