@@ -508,15 +508,46 @@ impl Store {
         entry: &FileLedgerEntry,
     ) -> Result<(), StoreError> {
         let connection = self.lock()?;
+        let observed_at = entry.observed_at.to_rfc3339();
+
+        // The task this session is holding at the moment of the edit. Stamped
+        // here rather than resolved when the ledger is read, because a session
+        // works several tasks in one run and 0017 keeps only the current hold:
+        // by the time anyone asks, the answer is gone.
+        //
+        // Ordered by lease, newest first, because a session can hold more than
+        // one task at once. Taking a hold on task 4 does not release task 3 —
+        // `write_binding` only touches the row it names — so an agent that
+        // moves on without closing leaves the old claim live for the rest of
+        // its ten minutes. The newest lease is the claim most recently taken
+        // or renewed, which is the task actually in hand; without the order
+        // SQLite returns whichever row it scans first, and the edit is filed
+        // under the task that was abandoned.
+        //
+        // A lapsed lease is not a hold, for the same reason the ready set
+        // offers that task to somebody else. The comparison is lexicographic
+        // on RFC 3339 in UTC, as `claim_job` already compares leases.
+        let held: Option<(String, String)> = connection
+            .query_row(
+                "SELECT id, change_id FROM tasks
+                 WHERE claimed_by = ?1 AND lease_until IS NOT NULL AND lease_until > ?2
+                 ORDER BY lease_until DESC
+                 LIMIT 1",
+                rusqlite::params![session_id.to_string(), &observed_at],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
         connection.execute(
-            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 run_id.to_string(),
                 session_id.to_string(),
                 entry.path.to_string_lossy().to_string(),
                 &entry.tool,
-                entry.observed_at.to_rfc3339(),
+                &observed_at,
+                held.as_ref().map(|(id, _)| id),
             ),
         )?;
         Ok(())
