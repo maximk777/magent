@@ -336,6 +336,9 @@ if [ -f plugin/skills/sdd-plan/SKILL.md ]; then
   if ! grep -q 'consumes: \[' plugin/skills/sdd-plan/SKILL.md; then
     fail "sdd-plan no longer shows consumes as a list, so nothing teaches the shape magent_plan accepts"
   fi
+  if ! grep -q 'check_only' plugin/skills/sdd-plan/SKILL.md; then
+    fail "sdd-plan never mentions check_only, so nothing tells a planner it can find a coverage mistake before writing a paragraph per task"
+  fi
 fi
 
 # The instruction this change makes false. A skill is read before the work, so a
