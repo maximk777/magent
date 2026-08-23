@@ -35,3 +35,10 @@ ALTER TABLE file_ledger ADD COLUMN trespass_on TEXT;
 -- the index lands ahead of its reader the way 0009's task_reviews note
 -- describes, on the strength that the query is coming, not that it exists.
 CREATE INDEX file_ledger_task ON file_ledger(task_id);
+
+-- `append_ledger` resolving the editing session's hold, on the hot path:
+-- every edit looks up the newest live lease by `claimed_by`, and the only
+-- index touching `lease_until` (`tasks_change_lease`, 0017) leads with
+-- `change_id`, not `claimed_by`, so that query would otherwise scan and sort
+-- the whole table. Partial, because most rows have `claimed_by IS NULL`.
+CREATE INDEX tasks_claimed_lease ON tasks(claimed_by, lease_until) WHERE claimed_by IS NOT NULL;

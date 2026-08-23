@@ -507,7 +507,8 @@ impl Store {
         session_id: SessionId,
         entry: &FileLedgerEntry,
     ) -> Result<(), StoreError> {
-        let connection = self.lock()?;
+        let mut connection = self.lock()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let observed_at = entry.observed_at.to_rfc3339();
 
         // The task this session is holding at the moment of the edit. Stamped
@@ -527,7 +528,19 @@ impl Store {
         // A lapsed lease is not a hold, for the same reason the ready set
         // offers that task to somebody else. The comparison is lexicographic
         // on RFC 3339 in UTC, as `claim_job` already compares leases.
-        let held: Option<(String, String)> = connection
+        //
+        // The SELECT and the INSERT share one Immediate transaction, the
+        // pattern `claim_job` and `resolve_workspace_for` already use.
+        // `self.lock()` only excludes other callers in this process; a
+        // concurrent replan in a second process (`DELETE FROM tasks WHERE
+        // change_id = ?1`, `sdd.rs`) between the two statements would either
+        // stamp a task that no longer exists, or — since `task_id` references
+        // `tasks(id)` with foreign keys on — fail the INSERT outright, and the
+        // hook that calls this swallows any error, so the edit would vanish
+        // from the ledger rather than being misattributed. Immediate takes
+        // the write lock up front, so a concurrent replan blocks on the busy
+        // timeout instead of interleaving.
+        let held: Option<(String, String)> = tx
             .query_row(
                 "SELECT id, change_id FROM tasks
                  WHERE claimed_by = ?1 AND lease_until IS NOT NULL AND lease_until > ?2
@@ -538,7 +551,7 @@ impl Store {
             )
             .optional()?;
 
-        connection.execute(
+        tx.execute(
             "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
@@ -550,6 +563,7 @@ impl Store {
                 held.as_ref().map(|(id, _)| id),
             ),
         )?;
+        tx.commit()?;
         Ok(())
     }
 
