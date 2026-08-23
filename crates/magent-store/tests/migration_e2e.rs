@@ -688,3 +688,69 @@ fn the_ledger_knows_its_task_after_0018() {
     assert_eq!(task_id, None, "an old row has no task_id to backfill");
     assert_eq!(trespass_on, None, "an old row recorded no trespass");
 }
+
+/// A replan deletes and reinserts a change's tasks (`sdd.rs`'s
+/// `DELETE FROM tasks WHERE change_id = ?1`). An edit already recorded against
+/// one of those tasks must not turn that delete into a foreign-key failure —
+/// `task_id` is `ON DELETE SET NULL`, so the ledger row survives and loses
+/// only who it was for.
+#[test]
+fn a_replan_frees_the_ledger_rather_than_being_refused() {
+    let (_dir, path) = temp();
+    let database = database_at(&path, CURRENT_VERSION);
+    seed_slice_one(&database);
+    database
+        .execute(
+            "INSERT INTO sdd_changes
+                 (id, workspace_id, namespace, slug, title, classification, status,
+                  created_at, updated_at)
+             VALUES (?1, ?2, 'service', 'add-retry-budget', 'Give retries a ceiling',
+                     'bounded', 'planned', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (LEGACY_CHANGE, LEGACY_WORKSPACE),
+        )
+        .expect("seed change");
+    database
+        .execute(
+            "INSERT INTO tasks
+                 (id, change_id, number, title, files_json, consumes_json, produces_json,
+                  verify_command, expected_output_json, covers_json, status,
+                  created_at, updated_at)
+             VALUES ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', ?1, '1', 'cap the retries',
+                     '[]', '[]', '[]', 'cargo test -p worker retry', '[\"ok\"]', '[]',
+                     'pending', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [LEGACY_CHANGE],
+        )
+        .expect("seed task");
+    database
+        .execute(
+            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                LEGACY_RUN,
+                "44444444-4444-4444-8444-444444444444",
+                "crates/worker/src/retry.rs",
+                "Edit",
+                "2026-01-01T00:00:00Z",
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            ),
+        )
+        .expect("seed a ledger row against the task");
+
+    database
+        .execute("DELETE FROM tasks WHERE change_id = ?1", [LEGACY_CHANGE])
+        .expect("a replan must not be refused by the ledger left behind");
+
+    let (recorded_path, recorded_task_id): (String, Option<String>) = database
+        .query_row(
+            "SELECT path, task_id FROM file_ledger WHERE path = ?1",
+            ["crates/worker/src/retry.rs"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the ledger row must survive a replan");
+
+    assert_eq!(recorded_path, "crates/worker/src/retry.rs");
+    assert_eq!(
+        recorded_task_id, None,
+        "the ledger keeps its history but loses attribution to a task the replan deleted"
+    );
+}
