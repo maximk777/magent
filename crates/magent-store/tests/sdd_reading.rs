@@ -632,7 +632,7 @@ fn a_specified_change_reads_back_its_requirements() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -714,7 +714,7 @@ fn a_removed_delta_reads_back_its_reason() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -748,7 +748,7 @@ fn a_planned_task_reads_back_whole() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -794,7 +794,7 @@ fn a_closed_task_carries_its_evidence() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -824,7 +824,7 @@ fn a_change_reads_back_its_ticks() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -906,7 +906,7 @@ fn a_tick_survives_the_plan_it_was_made_against() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -940,7 +940,7 @@ fn a_change_with_no_ticks_reads_an_empty_journal() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("change detail")
         .expect("the change is this workspace's");
 
@@ -1352,7 +1352,7 @@ fn a_chain_of_two_tasks_reads_its_contract_back() {
 
     let detail = fixture
         .store
-        .change_detail(change, &fixture.context)
+        .change_detail(change, &fixture.context, None)
         .expect("detail")
         .expect("the change");
     let consumer = detail
@@ -1423,7 +1423,7 @@ fn a_task_whose_producer_is_open_is_not_ready() {
     let fixture = Fixture::new();
     let change = ready_fixture(&fixture);
 
-    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    let ready = fixture.store.ready_tasks(change, None).expect("ready set");
     assert_eq!(
         ready_numbers(&ready),
         ["1", "3", "4"],
@@ -1436,7 +1436,7 @@ fn two_ready_tasks_sharing_a_file_name_each_other() {
     let fixture = Fixture::new();
     let change = ready_fixture(&fixture);
 
-    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    let ready = fixture.store.ready_tasks(change, None).expect("ready set");
     let of = |number: &str| {
         ready
             .iter()
@@ -1460,7 +1460,7 @@ fn closing_the_producer_makes_the_waiter_ready() {
     let change = ready_fixture(&fixture);
     fixture.tick(SLUG, "1");
 
-    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    let ready = fixture.store.ready_tasks(change, None).expect("ready set");
     assert!(
         ready_numbers(&ready).contains(&"2"),
         "the artifact it waits for is produced by a task that is done now"
@@ -1479,7 +1479,7 @@ fn a_plan_with_every_task_closed_offers_nothing() {
         fixture.tick(SLUG, number);
     }
 
-    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    let ready = fixture.store.ready_tasks(change, None).expect("ready set");
     assert!(ready.is_empty(), "nothing is left to offer: {ready:?}");
 }
 
@@ -1562,6 +1562,25 @@ fn a_plan_with_nothing_connecting_it_is_as_wide_as_it_is_long() {
     assert_eq!(shape.longest_chain, 1);
 }
 
+/// A real session, because `tasks.claimed_by` references one: a hold by a
+/// session that never existed is not a state the store can hold.
+fn a_session(fixture: &Fixture) -> SessionId {
+    fixture
+        .store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "an agent taking work".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![fixture.root.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start")
+        .session_id
+}
+
 /// Sets a hold directly, so a test can put one in the past without waiting.
 fn hold(fixture: &Fixture, change: ChangeId, number: &str, session: &str, until: &str) {
     rusqlite::Connection::open(&fixture.path)
@@ -1578,8 +1597,8 @@ fn hold(fixture: &Fixture, change: ChangeId, number: &str, session: &str, until:
 fn a_task_another_session_holds_is_not_offered() {
     let fixture = Fixture::new();
     let change = ready_fixture(&fixture);
-    let mine = SessionId::new();
-    let theirs = SessionId::new();
+    let mine = a_session(&fixture);
+    let theirs = a_session(&fixture);
 
     hold(
         &fixture,
@@ -1608,7 +1627,7 @@ fn a_task_another_session_holds_is_not_offered() {
 fn the_session_holding_a_task_is_still_offered_it() {
     let fixture = Fixture::new();
     let change = ready_fixture(&fixture);
-    let mine = SessionId::new();
+    let mine = a_session(&fixture);
 
     hold(
         &fixture,
@@ -1632,8 +1651,8 @@ fn the_session_holding_a_task_is_still_offered_it() {
 fn a_lapsed_hold_offers_the_task_again() {
     let fixture = Fixture::new();
     let change = ready_fixture(&fixture);
-    let mine = SessionId::new();
-    let theirs = SessionId::new();
+    let mine = a_session(&fixture);
+    let theirs = a_session(&fixture);
 
     hold(
         &fixture,

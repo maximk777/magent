@@ -2744,7 +2744,7 @@ fn change_detail_reads_the_proposal_deltas_and_tasks() {
         .expect("plan");
 
     let detail = store
-        .change_detail(change, &ctx)
+        .change_detail(change, &ctx, None)
         .expect("change_detail")
         .expect("the change exists in this workspace");
 
@@ -2778,7 +2778,7 @@ fn change_detail_for_an_unknown_change_is_ok_none_not_an_error() {
     let missing = ChangeId::new();
 
     let result = store
-        .change_detail(missing, &ctx)
+        .change_detail(missing, &ctx, None)
         .expect("an unknown change must not be an error");
 
     assert!(
@@ -2812,7 +2812,7 @@ fn a_change_from_another_workspace_is_invisible_to_open_changes_and_change_detai
     );
 
     let detail = store
-        .change_detail(change, &other_ctx)
+        .change_detail(change, &other_ctx, None)
         .expect("change_detail in the other workspace");
     assert!(
         detail.is_none(),

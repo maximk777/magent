@@ -255,7 +255,7 @@ impl Fixture {
     /// know — fails here rather than passing as a string comparison.
     fn change_status(&self, change: ChangeId) -> ChangeStatus {
         self.store
-            .change_detail(change, &self.context)
+            .change_detail(change, &self.context, None)
             .expect("change detail")
             .expect("the change is this workspace's")
             .status

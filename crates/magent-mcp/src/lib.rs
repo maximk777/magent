@@ -569,6 +569,19 @@ impl MagentMcp {
         }
     }
 
+    /// The session this server was launched for, when the environment named
+    /// one and the store holds it.
+    ///
+    /// `None` is the honest answer for a server that was told nothing: it then
+    /// holds no task, and the ready set treats every live hold as somebody
+    /// else's, which is the safe way to be wrong.
+    fn own_session(&self) -> Option<SessionId> {
+        self.session_hint
+            .as_deref()
+            .and_then(|hint| self.store.binding_for_external_session(hint).ok().flatten())
+            .map(|binding| binding.session_id)
+    }
+
     /// Fills in the run and session a tool was not told about.
     ///
     /// An explicit id always wins: guessing is a convenience for the common
@@ -1113,7 +1126,9 @@ impl MagentMcp {
             Some(reference) => {
                 let change = self.resolve_change(&reference, &context)?;
                 self.store
-                    .change_detail(change, &context)
+                    // The session this server belongs to, so the ready set can
+                    // tell "somebody else is working it" from "you are".
+                    .change_detail(change, &context, self.own_session())
                     .map_err(|error| render_error(&error))?
             }
             None => None,

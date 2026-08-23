@@ -284,6 +284,7 @@ fn a_version_ten_profile_keeps_what_its_plan_expected() {
                 workspace_id: Some(LEGACY_WORKSPACE.parse().expect("a uuid")),
                 ..FactContext::default()
             },
+            None,
         )
         .expect("change_detail")
         .expect("the change must still be readable after migrating");
@@ -584,7 +585,7 @@ fn a_migrated_plan_still_offers_its_open_tasks() {
 
     let store = Store::open(&path).expect("upgrade");
     let ready = store
-        .ready_tasks(LEGACY_CHANGE.parse().expect("a change id"))
+        .ready_tasks(LEGACY_CHANGE.parse().expect("a change id"), None)
         .expect("ready set");
 
     assert_eq!(

@@ -9,7 +9,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use magent_core::{
     ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, PlanShape,
-    ProposeCommand, ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, Validate,
+    ProposeCommand, ReadyTask, RequirementDraft, ScenarioDraft, SessionId, SpecifyCommand,
+    Validate,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -244,6 +245,13 @@ pub struct TaskSummary {
     /// When that evidence was taken. Written with `evidence` and never without
     /// it (`0009_tasks.sql`), so a reader auditing a tick has both or neither.
     pub verified_at: Option<DateTime<Utc>>,
+    /// The session working this task, and when its hold lapses.
+    ///
+    /// A hold is taken by a checkpoint naming the task and pushed out by every
+    /// later one, so it is the signal a working agent produces and a stopped
+    /// one does not.
+    pub claimed_by: Option<String>,
+    pub lease_until: Option<DateTime<Utc>>,
 }
 
 /// One closing of a task, as [`Store::change_detail`] shows it: the command
@@ -725,13 +733,17 @@ impl Store {
     ///
     /// # Errors
     /// Fails on a database error.
-    pub fn ready_tasks(&self, change: ChangeId) -> Result<Vec<ReadyTask>, StoreError> {
+    pub fn ready_tasks(
+        &self,
+        change: ChangeId,
+        asking: Option<SessionId>,
+    ) -> Result<Vec<ReadyTask>, StoreError> {
         let mut connection = self.lock()?;
         let tx = connection.transaction()?;
         let tasks = load_task_summaries(&tx, &change.to_string())?;
         drop(tx);
 
-        Ok(ready_of(&tasks))
+        Ok(ready_of(&tasks, asking, Utc::now()))
     }
 
     /// How parallel `change`'s plan could ever be.
@@ -970,6 +982,7 @@ impl Store {
         &self,
         change: ChangeId,
         context: &FactContext,
+        asking: Option<SessionId>,
     ) -> Result<Option<ChangeDetail>, StoreError> {
         let workspace_id = context.workspace_id.ok_or(StoreError::NoWorkspace)?;
 
@@ -1014,7 +1027,7 @@ impl Store {
             capabilities: proposal.capabilities,
             impact: proposal.impact,
             deltas,
-            ready: ready_of(&tasks),
+            ready: ready_of(&tasks, asking, Utc::now()),
             shape: shape_of(&tasks),
             tasks,
             ticks,
@@ -1819,7 +1832,11 @@ fn require_plannable_change(
 /// Pure over the rows so `change_detail` can answer without a second read: it
 /// has already loaded the tasks, and asking the database again for what is in
 /// hand would be paying twice for one answer.
-fn ready_of(tasks: &[TaskSummary]) -> Vec<ReadyTask> {
+fn ready_of(
+    tasks: &[TaskSummary],
+    asking: Option<SessionId>,
+    now: DateTime<Utc>,
+) -> Vec<ReadyTask> {
     let available: HashSet<&str> = tasks
         .iter()
         .filter(|task| task.status == "done")
@@ -1842,6 +1859,17 @@ fn ready_of(tasks: &[TaskSummary]) -> Vec<ReadyTask> {
     let ready: Vec<&TaskSummary> = tasks
         .iter()
         .filter(|task| task.status != "done" && task.status != "skipped")
+        // A task somebody else is working is not on offer. The holder still
+        // sees its own: it is working on it, and hiding it would make its own
+        // next read look as though the task had gone. A lapsed hold is not a
+        // refusal — an agent that stopped reporting is indistinguishable from
+        // one that stopped, and the plan has to continue either way.
+        .filter(|task| match (&task.claimed_by, task.lease_until) {
+            (Some(holder), Some(until)) if until > now => {
+                asking.is_some_and(|session| session.to_string() == *holder)
+            }
+            _ => true,
+        })
         .filter(|task| {
             task.consumes.iter().all(|artifact| {
                 let artifact = artifact.trim();
@@ -2566,6 +2594,8 @@ struct TaskSummaryRow {
     expected_output_json: String,
     evidence: Option<String>,
     verified_at: Option<String>,
+    claimed_by: Option<String>,
+    lease_until: Option<String>,
 }
 
 /// The change's tasks, sorted lexicographically by number — the same `ORDER BY`
@@ -2577,7 +2607,8 @@ fn load_task_summaries(
 ) -> Result<Vec<TaskSummary>, StoreError> {
     let mut statement = tx.prepare(
         "SELECT number, title, status, verify_command, body, files_json, consumes_json,
-                produces_json, expected_output_json, evidence, verified_at
+                produces_json, expected_output_json, evidence, verified_at,
+                claimed_by, lease_until
          FROM tasks
          WHERE change_id = ?1 ORDER BY number",
     )?;
@@ -2595,6 +2626,8 @@ fn load_task_summaries(
                 expected_output_json: row.get(8)?,
                 evidence: row.get(9)?,
                 verified_at: row.get(10)?,
+                claimed_by: row.get(11)?,
+                lease_until: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2622,6 +2655,12 @@ fn load_task_summaries(
                 evidence: row.evidence,
                 verified_at: row
                     .verified_at
+                    .as_deref()
+                    .map(parse_timestamp)
+                    .transpose()?,
+                claimed_by: row.claimed_by,
+                lease_until: row
+                    .lease_until
                     .as_deref()
                     .map(parse_timestamp)
                     .transpose()?,

@@ -129,7 +129,9 @@ fn report_one(store: &Store, context: &FactContext, reference: &str, out: &mut S
         return false;
     };
 
-    let detail = match store.change_detail(change, context) {
+    // None: a person at a terminal holds no task, so every live hold is
+    // somebody else's and shows as taken.
+    let detail = match store.change_detail(change, context, None) {
         Ok(Some(detail)) => detail,
         Ok(None) => {
             let _ = writeln!(out, "no change here is called {reference}");
