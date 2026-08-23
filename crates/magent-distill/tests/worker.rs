@@ -366,3 +366,27 @@ fn the_engine_disables_the_integration_it_runs_under() {
     assert!(arguments.iter().any(|argument| argument == "-p"));
     assert_eq!(magent_distill::RECURSION_GUARD, "MAGENT_DISTILLING");
 }
+
+/// The lease exists so a dead worker's job is picked up. A lease shorter than
+/// the bound would do the opposite: hand the job to a second worker while the
+/// first is still running and still going to write its result.
+#[test]
+fn the_lease_outlasts_the_bound_it_exists_to_survive() {
+    let shipped = WorkerConfig::default();
+    assert!(
+        shipped.lease() > shipped.distillation_timeout,
+        "a lease shorter than the bound hands the same job to a second worker \
+         while the first is still running: {:?} vs {:?}",
+        shipped.lease(),
+        shipped.distillation_timeout
+    );
+
+    let tighter = WorkerConfig {
+        distillation_timeout: Duration::from_secs(7),
+        ..WorkerConfig::default()
+    };
+    assert!(
+        tighter.lease() > tighter.distillation_timeout,
+        "the relationship must hold for any bound, not only the shipped one"
+    );
+}
