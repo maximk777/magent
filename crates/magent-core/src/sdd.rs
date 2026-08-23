@@ -489,6 +489,15 @@ pub struct PlanCommand {
     /// requirement has a task — and submitting it piecemeal would let a plan
     /// go stale between calls before anyone ever saw the whole of it.
     pub tasks: Vec<TaskDraft>,
+    /// Run every gate and write nothing.
+    ///
+    /// The gates read `covers`, `consumes` and `produces` — short lists — and
+    /// never `body`, which is the paragraph per task that makes a plan
+    /// expensive to produce. So a skeleton answers the same question at a
+    /// fraction of the cost, and this is how it gets asked without the answer
+    /// being stored.
+    #[serde(default)]
+    pub check_only: bool,
 }
 
 impl Validate for PlanCommand {

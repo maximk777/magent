@@ -124,6 +124,7 @@ impl World {
                             covers: Vec::new(),
                         })
                         .collect(),
+                    check_only: false,
                 },
                 &context,
             )
@@ -240,6 +241,7 @@ impl World {
                             },
                         })
                         .collect(),
+                    check_only: false,
                 },
                 &context,
             )

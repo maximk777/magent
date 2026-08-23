@@ -93,6 +93,7 @@ impl Fixture {
                             covers: vec![],
                         })
                         .collect(),
+                    check_only: false,
                 },
                 &self.context,
             )

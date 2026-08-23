@@ -319,6 +319,14 @@ pub struct PlanToolInput {
     /// The whole plan in one call: a second call replaces these tasks rather
     /// than adding to them.
     pub tasks: Vec<TaskDraft>,
+    /// Run every gate and write nothing, so a mistake costs a skeleton rather
+    /// than the whole plan.
+    ///
+    /// The gates read `covers`, `consumes` and `produces` only, so the tasks
+    /// sent for a check need no `body` — which is the paragraph apiece that
+    /// makes a plan expensive to write. Check first, then send it for real.
+    #[serde(default)]
+    pub check_only: bool,
 }
 
 /// What the client may supply when archiving a change.
@@ -1060,6 +1068,7 @@ impl MagentMcp {
             operation_id: input.operation_id,
             change: self.resolve_change(&input.change, &context)?,
             tasks: input.tasks,
+            check_only: input.check_only,
         };
 
         render(

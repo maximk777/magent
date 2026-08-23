@@ -65,6 +65,7 @@ fn valid_plan() -> PlanCommand {
         operation_id: magent_core::OperationId::new(),
         change: magent_core::ChangeId::new(),
         tasks: vec![valid_task()],
+        check_only: false,
     }
 }
 

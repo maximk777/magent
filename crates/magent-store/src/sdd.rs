@@ -102,9 +102,14 @@ pub struct SpecifyReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanReport {
     pub tasks: usize,
-    /// Where the change now sits — `planned`, since that is what this call
-    /// moves it to.
+    /// Where the change now sits.
     pub status: ChangeStatus,
+    /// Whether the plan was stored.
+    ///
+    /// A caller that checked and believed it had planned would leave the change
+    /// `specified` with no tasks and find out at archiving, so the two answers
+    /// are told apart rather than sharing a shape.
+    pub written: bool,
 }
 
 /// What an `archive` folded into the live base, in terms the caller can check
@@ -641,7 +646,7 @@ impl Store {
 
         self.execute_operation("plan", command.operation_id, command, |tx| {
             let change_id = command.change.to_string();
-            require_plannable_change(tx, command.change, &workspace_id.to_string())?;
+            let current = require_plannable_change(tx, command.change, &workspace_id.to_string())?;
             require_full_coverage(tx, &change_id, command)?;
             // After coverage and before the DELETE: a refused plan leaves the
             // previous tasks untouched, and an uncovered requirement is the
@@ -651,6 +656,16 @@ impl Store {
             // more actionable of the two when both are true, and it is also
             // what would make a cycle report incomprehensible.
             require_acyclic_plan(command)?;
+
+            if command.check_only {
+                // Before the DELETE and before the status moves: a check that
+                // altered the change would be a plan wearing another name.
+                return Ok(PlanReport {
+                    tasks: command.tasks.len(),
+                    status: current,
+                    written: false,
+                });
+            }
 
             let now = Utc::now().to_rfc3339();
 
@@ -691,6 +706,7 @@ impl Store {
             Ok(PlanReport {
                 tasks: command.tasks.len(),
                 status: ChangeStatus::Planned,
+                written: true,
             })
         })
     }
@@ -1750,7 +1766,7 @@ fn require_plannable_change(
     tx: &Transaction<'_>,
     change: ChangeId,
     workspace_id: &str,
-) -> Result<(), StoreError> {
+) -> Result<ChangeStatus, StoreError> {
     let row: Option<(String, bool)> = tx
         .query_row(
             "SELECT status, skip_specs FROM sdd_changes
@@ -1793,7 +1809,9 @@ fn require_plannable_change(
         });
     }
 
-    Ok(())
+    // Handed back rather than dropped: a checked plan reports where the change
+    // still sits, and this call has already read it.
+    Ok(status)
 }
 
 /// The tasks of a loaded plan that may be started now.

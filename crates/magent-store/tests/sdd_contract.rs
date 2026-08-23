@@ -1414,6 +1414,7 @@ fn plan_command(change: ChangeId, tasks: Vec<TaskDraft>) -> PlanCommand {
         operation_id: OperationId::new(),
         change,
         tasks,
+        check_only: false,
     }
 }
 

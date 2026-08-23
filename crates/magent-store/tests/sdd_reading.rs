@@ -129,6 +129,7 @@ impl Fixture {
                     operation_id: OperationId::new(),
                     change,
                     tasks: vec![task("Cap the retry loop", &[BUDGET, ATTEMPT])],
+                    check_only: false,
                 },
                 &self.context,
             )
@@ -347,6 +348,7 @@ impl Fixture {
                     operation_id: OperationId::new(),
                     change,
                     tasks: vec![task("Carry the amendment into the worker", &[&covers])],
+                    check_only: false,
                 },
                 &self.context,
             )
@@ -878,6 +880,7 @@ fn a_tick_survives_the_plan_it_was_made_against() {
                         ..task("Wire the budget into the config", &[])
                     },
                 ],
+                check_only: false,
             },
             &fixture.context,
         )
@@ -895,6 +898,7 @@ fn a_tick_survives_the_plan_it_was_made_against() {
                     number: "9".into(),
                     ..task("Cap the retry loop", &[BUDGET, ATTEMPT])
                 }],
+                check_only: false,
             },
             &fixture.context,
         )
@@ -1340,6 +1344,7 @@ fn a_chain_of_two_tasks_reads_its_contract_back() {
                 operation_id: OperationId::new(),
                 change,
                 tasks: vec![first, second],
+                check_only: false,
             },
             &fixture.context,
         )
@@ -1400,6 +1405,7 @@ fn ready_fixture(fixture: &Fixture) -> ChangeId {
                 operation_id: OperationId::new(),
                 change,
                 tasks: vec![producer, waiter, sharer, other_sharer],
+                check_only: false,
             },
             &fixture.context,
         )
@@ -1503,6 +1509,7 @@ fn chain(fixture: &Fixture, count: usize) -> ChangeId {
                 operation_id: OperationId::new(),
                 change,
                 tasks,
+                check_only: false,
             },
             &fixture.context,
         )
@@ -1541,6 +1548,7 @@ fn a_plan_with_nothing_connecting_it_is_as_wide_as_it_is_long() {
                 operation_id: OperationId::new(),
                 change,
                 tasks,
+                check_only: false,
             },
             &fixture.context,
         )

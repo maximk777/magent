@@ -137,6 +137,7 @@ impl Fixture {
                         task("1.3", &[REQUIREMENT], markers),
                         task("2", &[], &[EXPECTED]),
                     ],
+                    check_only: false,
                 },
                 &self.context,
             )
@@ -1010,6 +1011,7 @@ fn a_replan_leaves_the_journal_alone() {
                 operation_id: OperationId::new(),
                 change,
                 tasks: vec![task("9", &[REQUIREMENT], &[EXPECTED])],
+                check_only: false,
             },
             &fixture.context,
         )
