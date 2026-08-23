@@ -2993,3 +2993,60 @@ fn a_plan_whose_tasks_wait_on_each_other_is_refused() {
         "the refusal must name the tasks in the cycle, said: {rendered}"
     );
 }
+
+/// A check runs every gate and leaves the store exactly as it found it.
+///
+/// One test for all of it: the cases share a change, and building it five times
+/// would say the same thing five times and take longer to read.
+#[test]
+fn a_checked_plan_answers_without_writing() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+    let connection = Connection::open(&path).expect("open");
+
+    let checking = |tasks: Vec<TaskDraft>| PlanCommand {
+        check_only: true,
+        ..plan_command(change, tasks)
+    };
+
+    let mut uncovered = task("1", &[]);
+    uncovered.produces = Vec::new();
+    let error = store
+        .plan(&checking(vec![uncovered]), &ctx)
+        .expect_err("a plan covering nothing must be refused");
+    assert!(error.to_string().contains(REQUIREMENT), "{error}");
+    assert!(
+        task_ids(&connection, &change.to_string()).is_empty(),
+        "a failed check must write nothing"
+    );
+
+    let report = store
+        .plan(&checking(vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("a covering plan checks out");
+    assert!(!report.written, "the report must say it wrote nothing");
+    assert!(
+        task_ids(&connection, &change.to_string()).is_empty(),
+        "a passing check must write nothing either"
+    );
+
+    let report = store
+        .plan(&plan_command(change, vec![task("1", &[REQUIREMENT])]), &ctx)
+        .expect("a real plan");
+    assert!(report.written, "a plan without the flag is stored");
+    let stored = task_ids(&connection, &change.to_string());
+    assert_eq!(stored.len(), 1);
+
+    let _ = store.plan(&checking(vec![task("9", &[REQUIREMENT])]), &ctx);
+    assert_eq!(
+        task_ids(&connection, &change.to_string()),
+        stored,
+        "a check must leave the stored plan alone"
+    );
+
+    let mut skeletal = task("1", &[REQUIREMENT]);
+    skeletal.body = None;
+    store
+        .plan(&checking(vec![skeletal]), &ctx)
+        .expect("a task with no body still checks out");
+}
