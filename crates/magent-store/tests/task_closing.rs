@@ -1534,3 +1534,198 @@ fn a_wrong_command_is_reported_before_a_trespass() {
         "the task is left open, not closed over either refusal"
     );
 }
+
+// --- closing a task reports the files outside its declared contract --------
+//
+// A path nobody holds is not a collision — `file_ledger.trespass_on` is only
+// ever stamped when the edit lands on a path a *live* hold on another task
+// declares (`store_contract.rs`). A path outside a task's own `files` that no
+// other hold reaches is simply a plan that did not predict every file the
+// work touched, which is ordinary, so the close still succeeds; it just names
+// what fell outside what was declared, on `TaskClosed`.
+//
+// Every test here plans a single task, "3", declaring `files: ["src/a.rs"]`,
+// and takes its hold through a checkpoint as production does — one session,
+// one hold, no second session anywhere, because these are the cases where
+// nobody else is involved at all.
+
+/// A change planned with one task, "3", declaring `files: ["src/a.rs"]` —
+/// built for the outside-the-contract tests, which need a task whose
+/// declared files are under the caller's control but which never collide
+/// with anyone else's hold.
+fn planned_change_declaring_a() -> (Fixture, ChangeId) {
+    let fixture = Fixture::new();
+    let change = fixture.proposed_and_specified();
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks: vec![TaskDraft {
+                    covers: vec![REQUIREMENT.to_owned()],
+                    ..task_declaring("3", &["src/a.rs"], &[EXPECTED])
+                }],
+                check_only: false,
+            },
+            &fixture.context,
+        )
+        .expect("plan");
+
+    (fixture, change)
+}
+
+/// The declared path is relative (`src/a.rs`) and the edited path is
+/// absolute (`/tmp/project/src/a.rs`), which is deliberate: `declares_path`
+/// (`store.rs`) matches on the tail at a separator boundary, and a fixture
+/// where both sides were written identically would pass against an
+/// implementation that never works in production.
+#[test]
+fn a_tick_names_the_files_outside_its_contract() {
+    let (fixture, change) = planned_change_declaring_a();
+    let (run_id, session_id) = fixture.bound_run_unclaimed();
+    fixture.hold(run_id, "3: cap the loop");
+
+    for path in ["/tmp/project/src/a.rs", "/tmp/project/src/b.rs"] {
+        fixture
+            .store
+            .append_ledger(
+                run_id,
+                session_id,
+                &FileLedgerEntry {
+                    path: std::path::PathBuf::from(path),
+                    tool: "Edit".into(),
+                    observed_at: chrono::Utc::now(),
+                },
+            )
+            .expect("append ledger");
+    }
+
+    let result = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect("a path nobody holds is not a collision, so the close succeeds");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert_eq!(closed.number, "3");
+    assert_eq!(
+        closed.files_outside_contract,
+        ["/tmp/project/src/b.rs".to_owned()],
+        "src/a.rs is declared and must not appear; src/b.rs is not declared \
+         and must be the only entry — a list checked only for what it holds \
+         would pass with the declared file in it too"
+    );
+
+    let (status, evidence, verified_at) = fixture.task_row(change, "3");
+    assert_eq!(status, "done");
+    assert!(evidence.is_some(), "the close wrote its evidence");
+    assert!(verified_at.is_some());
+}
+
+/// The good-news case: every edit lands inside the declared contract, so
+/// there is nothing to report.
+#[test]
+fn a_tick_within_its_contract_names_no_files() {
+    let (fixture, _change) = planned_change_declaring_a();
+    let (run_id, session_id) = fixture.bound_run_unclaimed();
+    fixture.hold(run_id, "3: cap the loop");
+
+    fixture
+        .store
+        .append_ledger(
+            run_id,
+            session_id,
+            &FileLedgerEntry {
+                path: std::path::PathBuf::from("/tmp/project/src/a.rs"),
+                tool: "Edit".into(),
+                observed_at: chrono::Utc::now(),
+            },
+        )
+        .expect("append ledger");
+
+    let result = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect("checkpoint");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert!(
+        closed.files_outside_contract.is_empty(),
+        "every edit landed on the declared src/a.rs, so nothing is outside \
+         the contract: got {:?}",
+        closed.files_outside_contract
+    );
+}
+
+/// A plan that declared one file and a task that touched three others still
+/// closes: refusing it would teach planners to declare every file they might
+/// conceivably touch, and a plan where everything is declared is one where
+/// everything conflicts with everything, which makes the ready set say
+/// nothing at all. This is the test that stops the report quietly becoming a
+/// refusal.
+#[test]
+fn three_files_outside_the_contract_still_close_the_task() {
+    let (fixture, _change) = planned_change_declaring_a();
+    let (run_id, session_id) = fixture.bound_run_unclaimed();
+    fixture.hold(run_id, "3: cap the loop");
+
+    for path in [
+        "/tmp/project/src/b.rs",
+        "/tmp/project/src/c.rs",
+        "/tmp/project/src/d.rs",
+    ] {
+        fixture
+            .store
+            .append_ledger(
+                run_id,
+                session_id,
+                &FileLedgerEntry {
+                    path: std::path::PathBuf::from(path),
+                    tool: "Edit".into(),
+                    observed_at: chrono::Utc::now(),
+                },
+            )
+            .expect("append ledger");
+    }
+
+    let result = fixture
+        .checkpoint(
+            run_id,
+            session_id,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect("three undeclared files are still not a collision, so the close succeeds");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert_eq!(
+        closed.files_outside_contract,
+        [
+            "/tmp/project/src/b.rs".to_owned(),
+            "/tmp/project/src/c.rs".to_owned(),
+            "/tmp/project/src/d.rs".to_owned(),
+        ],
+        "all three files outside the declared contract are named"
+    );
+}
