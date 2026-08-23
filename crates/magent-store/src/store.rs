@@ -1141,15 +1141,15 @@ fn close_task(
         .pop()
         .ok_or_else(|| StoreError::ChangeSlugNotFound(slug.to_owned()))?;
 
-    let planned: Option<(String, String)> = tx
+    let planned: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT verify_command, expected_output_json FROM tasks
+            "SELECT verify_command, expected_output_json, files_json FROM tasks
              WHERE change_id = ?1 AND number = ?2",
             rusqlite::params![&change_id, &done.number],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let Some((verify_command, expected_output_json)) = planned else {
+    let Some((verify_command, expected_output_json, files_json)) = planned else {
         return Err(StoreError::TaskNotFound {
             slug: slug.to_owned(),
             number: done.number.clone(),
@@ -1169,27 +1169,7 @@ fn close_task(
         });
     }
 
-    // Read against what was recorded, not against what the closer reports —
-    // the same principle as the command check above. The earliest row wins:
-    // one collision is enough to stop the tick, and naming the first keeps the
-    // message about a file rather than a list.
-    let trespass: Option<(String, String)> = tx
-        .query_row(
-            "SELECT l.path, l.trespass_on FROM file_ledger l
-             JOIN tasks t ON t.id = l.task_id
-             WHERE t.change_id = ?1 AND t.number = ?2 AND l.trespass_on IS NOT NULL
-             ORDER BY l.id LIMIT 1",
-            rusqlite::params![&change_id, &done.number],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    if let Some((path, holder)) = trespass {
-        return Err(StoreError::FileHeldByAnotherTask {
-            number: done.number.clone(),
-            path,
-            holder,
-        });
-    }
+    refuse_trespass(tx, &change_id, &done.number)?;
 
     // Trimmed on the plan's side only. A plan states the markers it expects to
     // see, and the whitespace around each is how the plan was written rather
@@ -1200,6 +1180,11 @@ fn close_task(
         .into_iter()
         .filter(|marker| !done.output.contains(marker.trim()))
         .collect();
+
+    // Distinct paths this task's own edits landed on, minus what it declared.
+    // Anything held by somebody else was refused above, so what reaches here
+    // belongs to nobody by construction.
+    let files_outside_contract = paths_outside_contract(tx, &change_id, &done.number, &files_json)?;
 
     tx.execute(
         // The hold goes with the status: a done task holds nothing.
@@ -1236,8 +1221,71 @@ fn close_task(
     Ok(TaskClosed {
         number: done.number.clone(),
         expected_output_missing,
+        files_outside_contract,
         change_ready,
     })
+}
+
+/// Refuses a tick whose edits landed on a path another session's task is
+/// holding live, split out of `close_task` so that function names its steps
+/// rather than running long with all of them inline.
+///
+/// Read against what was recorded, not against what the closer reports — the
+/// same principle as `close_task`'s command check. The earliest row wins: one
+/// collision is enough to stop the tick, and naming the first keeps the
+/// message about a file rather than a list.
+fn refuse_trespass(tx: &Transaction<'_>, change_id: &str, number: &str) -> Result<(), StoreError> {
+    let trespass: Option<(String, String)> = tx
+        .query_row(
+            "SELECT l.path, l.trespass_on FROM file_ledger l
+             JOIN tasks t ON t.id = l.task_id
+             WHERE t.change_id = ?1 AND t.number = ?2 AND l.trespass_on IS NOT NULL
+             ORDER BY l.id LIMIT 1",
+            rusqlite::params![change_id, number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+
+    match trespass {
+        Some((path, holder)) => Err(StoreError::FileHeldByAnotherTask {
+            number: number.to_owned(),
+            path,
+            holder,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Distinct paths a task's own edits landed on that its `files` did not
+/// declare, split out of `close_task` for the same reason `refuse_trespass`
+/// is: a step of that function's job that earned its own name.
+///
+/// Must run after `refuse_trespass`: a path held live by another session is
+/// refused there rather than reported here, so what this sees belongs to
+/// nobody by construction, and reporting it is safe.
+fn paths_outside_contract(
+    tx: &Transaction<'_>,
+    change_id: &str,
+    number: &str,
+    files_json: &str,
+) -> Result<Vec<String>, StoreError> {
+    let declared: Vec<String> = serde_json::from_str(files_json)?;
+    let mut statement = tx.prepare(
+        "SELECT DISTINCT l.path FROM file_ledger l
+         JOIN tasks t ON t.id = l.task_id
+         WHERE t.change_id = ?1 AND t.number = ?2
+         ORDER BY l.path",
+    )?;
+    let edited = statement
+        .query_map(rusqlite::params![change_id, number], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<String>, _>>()?;
+
+    Ok(edited
+        .into_iter()
+        .filter(|path| !declared.iter().any(|entry| declares_path(entry, path)))
+        .collect())
 }
 
 /// Moves a change to `ready` once no task of its plan is open, and says whether

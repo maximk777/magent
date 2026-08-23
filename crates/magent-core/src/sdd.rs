@@ -586,6 +586,21 @@ pub struct TaskClosed {
     /// rest printed — from a run that genuinely failed, and a boolean reports
     /// both as the same `false`.
     pub expected_output_missing: Vec<String>,
+    /// Paths this task's edits landed on that its own `files` did not declare,
+    /// and that nobody else was holding. Empty when the work stayed inside the
+    /// contract it was planned with.
+    ///
+    /// Reported and never enforced, for the opposite reason to the refusal one
+    /// case over: a path nobody holds is a planner who did not predict every
+    /// file, which is ordinary. Refusing it would teach a planner to declare
+    /// every file a task might conceivably touch, and a plan where everything
+    /// is declared is one where everything conflicts with everything — which
+    /// is the ready set saying nothing at all.
+    ///
+    /// Worth saying out loud even so: a plan whose tasks keep landing on files
+    /// they never named is a plan being written by somebody guessing, and
+    /// nothing else in the process would ever mention it.
+    pub files_outside_contract: Vec<String>,
     /// Whether this tick left the change with no open task.
     ///
     /// True when no task of the plan is open once this tick has landed, which
