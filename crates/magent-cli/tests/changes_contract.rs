@@ -12,8 +12,8 @@ use std::{
 };
 
 use magent_core::{
-    ArchiveCommand, ChangeId, Classification, DeltaOp, OperationId, PlanCommand, ProposeCommand,
-    RequirementDraft, ScenarioDraft, SpecifyCommand, TaskDraft,
+    ArchiveCommand, ChangeId, Classification, DeltaOp, HarnessKind, OperationId, PlanCommand,
+    ProposeCommand, RequirementDraft, ScenarioDraft, SpecifyCommand, StartRunCommand, TaskDraft,
 };
 use magent_store::{FactContext, Store};
 
@@ -1022,5 +1022,49 @@ fn a_planned_change_prints_its_shape_and_what_is_ready() {
     assert!(
         output.contains("ready  1, 2, 3"),
         "the ready tasks must be named, printed: {output}"
+    );
+}
+
+/// A person watching a wave has to see which tasks are taken, rather than
+/// inferring it from the ones that stopped being offered.
+#[test]
+fn a_planned_change_says_which_tasks_are_held() {
+    let world = World::new();
+    let change = world.plan_a_change(
+        "retry-budget",
+        "Retries have no ceiling and can loop forever.",
+        &[("1", "First step"), ("2", "Second step")],
+    );
+
+    let store = Store::open(&world.database()).expect("open the store");
+    let session = store
+        .start_run(
+            &StartRunCommand {
+                operation_id: OperationId::new(),
+                task: "an agent taking work".into(),
+                resume_run_id: None,
+                external_session_hint: None,
+                workspace_roots: vec![world.project.clone()],
+            },
+            HarnessKind::ClaudeCode,
+        )
+        .expect("start")
+        .session_id;
+
+    rusqlite::Connection::open(world.database())
+        .expect("open")
+        .execute(
+            "UPDATE tasks SET claimed_by = ?1, lease_until = '2099-01-01T00:00:00Z',
+                              status = 'running'
+             WHERE change_id = ?2 AND number = '2'",
+            rusqlite::params![session.to_string(), change.to_string()],
+        )
+        .expect("set the hold");
+
+    let (ok, output) = world.changes(&["retry-budget"]);
+    assert!(ok, "the command must succeed: {output}");
+    assert!(
+        output.contains("held"),
+        "a person watching a wave must see which tasks are taken, printed: {output}"
     );
 }
