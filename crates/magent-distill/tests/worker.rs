@@ -428,7 +428,7 @@ fn a_child_that_never_exits_is_stopped_at_the_bound() {
     let binary = fake_claude(
         fixture.transcript.parent().expect("dir"),
         "sleeper",
-        "sleep 600",
+        "sleep 30",
     );
     let engine = ClaudeHeadless::new(binary, "haiku".into(), TEST_BOUND);
 
@@ -460,7 +460,7 @@ fn a_child_that_floods_its_pipe_and_hangs_is_still_stopped() {
     let binary = fake_claude(
         fixture.transcript.parent().expect("dir"),
         "flooder",
-        "head -c 1000000 /dev/zero | tr '\\0' 'x'; sleep 600",
+        "head -c 1000000 /dev/zero | tr '\\0' 'x'; sleep 30",
     );
     let engine = ClaudeHeadless::new(binary, "haiku".into(), TEST_BOUND);
 

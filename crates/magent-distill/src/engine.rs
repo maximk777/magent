@@ -5,13 +5,38 @@
 //! startup, which is irrelevant to a background worker.
 
 use std::{
+    io::Read,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
 
 use crate::{DistillRequest, Distillation, Distiller};
+
+/// Stops a child and everything it started.
+///
+/// Through `kill` rather than a syscall: killing a group needs `killpg`, which
+/// would mean declaring `libc` here for one call. The command is on every unix
+/// this runs on, and a failure to signal is deliberately ignored — the group is
+/// already gone, which is the outcome wanted.
+fn stop_process_group(child: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{child}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// How often the worker asks whether the child has finished.
+///
+/// Short enough that the bound is honoured to a fraction of a second, long
+/// enough that waiting three minutes costs a few thousand cheap syscalls rather
+/// than a spinning core.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Transcript bytes handed to the model.
 ///
@@ -40,12 +65,16 @@ struct HeadlessEnvelope {
 pub struct ClaudeHeadless {
     binary: PathBuf,
     model: String,
+    /// How long the child may run before it is stopped. Nothing else in this
+    /// process waits without a bound, and this was the exception.
+    timeout: Duration,
 }
 
 impl Default for ClaudeHeadless {
     fn default() -> Self {
         Self {
             binary: PathBuf::from("claude"),
+            timeout: crate::DISTILLATION_TIMEOUT,
             // The task is summarising text that is already written. A larger
             // model would cost more for the same answer.
             model: "haiku".to_owned(),
@@ -55,8 +84,12 @@ impl Default for ClaudeHeadless {
 
 impl ClaudeHeadless {
     #[must_use]
-    pub fn new(binary: PathBuf, model: String) -> Self {
-        Self { binary, model }
+    pub fn new(binary: PathBuf, model: String, timeout: Duration) -> Self {
+        Self {
+            binary,
+            model,
+            timeout,
+        }
     }
 
     /// The arguments this engine invokes `claude` with.
@@ -88,18 +121,72 @@ impl Distiller for ClaudeHeadless {
         let transcript = read_tail(&request.transcript)?;
         let prompt = build_prompt(&request.task, &transcript);
 
-        let output = Command::new(&self.binary)
+        let mut child = Command::new(&self.binary)
             .args(self.command_arguments())
             .arg(&prompt)
             .env(RECURSION_GUARD, "1")
             // Without this the CLI waits several seconds for input that will
             // never arrive.
             .stdin(Stdio::null())
-            .output()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Its own process group, so stopping it stops what it started.
+            // `claude` runs children of its own, and killing only the process
+            // we spawned leaves those holding the write end of the pipe: the
+            // reads below would then never return, and the bound would hang on
+            // the very child it just stopped.
+            .process_group(0)
+            .spawn()?;
 
-        let envelope: Option<HeadlessEnvelope> = serde_json::from_slice(&output.stdout).ok();
+        // Drained on threads for as long as the child runs, which is not
+        // tidiness. A pipe holds about sixty-four kilobytes; a child that
+        // writes more blocks in `write` until somebody reads, so a worker
+        // polling for exit while nobody drains would wait for ever on exactly
+        // the child this deadline exists to catch. `Command::output` did this
+        // correctly, and replacing it inherits the obligation rather than
+        // dropping it.
+        let mut child_out = child.stdout.take().expect("stdout was piped");
+        let mut child_err = child.stderr.take().expect("stderr was piped");
+        let out_reader = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = child_out.read_to_end(&mut buffer);
+            buffer
+        });
+        let err_reader = std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = child_err.read_to_end(&mut buffer);
+            buffer
+        });
 
-        if !output.status.success() {
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                stop_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        };
+
+        // After the kill rather than before: killing the child closes its ends
+        // of the pipes, which is what lets both reads return.
+        let stdout = out_reader.join().unwrap_or_default();
+        let stderr = err_reader.join().unwrap_or_default();
+
+        let Some(status) = status else {
+            anyhow::bail!(
+                "claude did not finish within {:?} and was stopped; the reasoning was not going to arrive",
+                self.timeout
+            );
+        };
+
+        let envelope: Option<HeadlessEnvelope> = serde_json::from_slice(&stdout).ok();
+
+        if !status.success() {
             // The reason is in the envelope on stdout, not on stderr: a
             // refused login reports "Not logged in" there and leaves stderr
             // empty. Reading only the exit status recorded a failure whose
@@ -110,10 +197,10 @@ impl Distiller for ClaudeHeadless {
                 .map(|envelope| envelope.result.trim())
                 .filter(|reason| !reason.is_empty())
                 .map_or_else(
-                    || String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    || String::from_utf8_lossy(&stderr).trim().to_owned(),
                     ToOwned::to_owned,
                 );
-            anyhow::bail!("claude exited with {}: {reason}", output.status);
+            anyhow::bail!("claude exited with {status}: {reason}");
         }
 
         let envelope = envelope.ok_or_else(|| {
