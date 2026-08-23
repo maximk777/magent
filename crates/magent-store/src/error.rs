@@ -357,7 +357,8 @@ pub enum StoreError {
     /// the path because a refusal naming only a count is one nobody can act on.
     #[error(
         "task {number} edited {path}, which task {holder} was holding at the time; \
-         closing it would file a collision as clean work"
+         the edit cannot be undone, so reconcile with whoever holds task {holder} \
+         before closing {number}"
     )]
     FileHeldByAnotherTask {
         number: String,
