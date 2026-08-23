@@ -619,3 +619,71 @@ fn a_task_carries_who_holds_it_and_until_when() {
     );
     assert!(columns.contains("lease_until"), "and until when: {columns}");
 }
+
+/// A ledger row written before 0018 has no `task_id` and no `trespass_on` to
+/// give — the migration must add both columns without disturbing the row a
+/// pre-0018 build already wrote.
+#[test]
+fn the_ledger_knows_its_task_after_0018() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 17);
+    seed_slice_one(&legacy);
+    legacy
+        .execute(
+            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                LEGACY_RUN,
+                "44444444-4444-4444-8444-444444444444",
+                "crates/magent-store/src/store.rs",
+                "Edit",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .expect("seed a pre-0018 ledger row");
+    drop(legacy);
+
+    Store::open(&path).expect("upgrade");
+
+    let connection = Connection::open(&path).expect("reopen");
+
+    let columns: String = connection
+        .query_row(
+            "SELECT group_concat(name, ' ') FROM pragma_table_info('file_ledger')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the columns");
+    assert!(
+        columns.contains("task_id"),
+        "the ledger must record which task an edit was for: {columns}"
+    );
+    assert!(
+        columns.contains("trespass_on"),
+        "and whether it collided with a hold: {columns}"
+    );
+
+    let (recorded_path, recorded_tool, task_id, trespass_on): (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT path, tool, task_id, trespass_on FROM file_ledger",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("the row seeded before the migration must survive");
+
+    assert_eq!(
+        recorded_path, "crates/magent-store/src/store.rs",
+        "the row's path must survive the migration"
+    );
+    assert_eq!(
+        recorded_tool, "Edit",
+        "the row's tool must survive the migration"
+    );
+    assert_eq!(task_id, None, "an old row has no task_id to backfill");
+    assert_eq!(trespass_on, None, "an old row recorded no trespass");
+}
