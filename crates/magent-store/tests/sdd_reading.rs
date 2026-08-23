@@ -1329,6 +1329,9 @@ fn a_chain_of_two_tasks_reads_its_contract_back() {
     let mut second = task("Spend it", &[BUDGET, ATTEMPT]);
     second.number = "2".into();
     second.consumes = vec![PRODUCES.into()];
+    // Not also producing it: a task consuming what it produces itself is a
+    // cycle of one, and `plan` refuses it with no special case.
+    second.produces = Vec::new();
 
     fixture
         .store

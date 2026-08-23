@@ -636,6 +636,10 @@ impl Store {
             // previous tasks untouched, and an uncovered requirement is the
             // more actionable of the two when both are true.
             require_produced_artifacts(command)?;
+            // After the artifacts and not before: an unmatched entry is the
+            // more actionable of the two when both are true, and it is also
+            // what would make a cycle report incomprehensible.
+            require_acyclic_plan(command)?;
 
             let now = Utc::now().to_rfc3339();
 
@@ -1750,6 +1754,73 @@ fn require_plannable_change(
 ///
 /// Reported in plan order, then in the order within a task, the way
 /// `require_full_coverage` orders its own list and for the same reason: a
+/// The tasks each task waits on, as indexes into `command.tasks`.
+///
+/// Built once and used twice: to refuse a plan no order can satisfy, and to
+/// layer the plan for its shape. An artifact produced by several tasks yields
+/// an edge to each, which is right — the consumer waits for all of them.
+fn producer_indexes(command: &PlanCommand) -> Vec<Vec<usize>> {
+    command
+        .tasks
+        .iter()
+        .map(|task| {
+            let wanted: HashSet<&str> = task.consumes.iter().map(|name| name.trim()).collect();
+            command
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| {
+                    other
+                        .produces
+                        .iter()
+                        .any(|name| wanted.contains(name.trim()))
+                })
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect()
+}
+
+/// Refuses a plan no order can satisfy.
+///
+/// Kahn's algorithm: repeatedly take the tasks whose every producer is already
+/// taken. What is left when a pass takes nothing is the cycle, and those
+/// numbers are what the refusal names — a cycle is not a plan, because no task
+/// in it can ever be first.
+///
+/// A task consuming what it produces itself is a cycle of one and falls out of
+/// the same loop with no special case.
+fn require_acyclic_plan(command: &PlanCommand) -> Result<(), StoreError> {
+    let producers = producer_indexes(command);
+    let mut taken = vec![false; command.tasks.len()];
+
+    loop {
+        let mut progressed = false;
+        for index in 0..command.tasks.len() {
+            if !taken[index] && producers[index].iter().all(|producer| taken[*producer]) {
+                taken[index] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    let cyclic: Vec<String> = taken
+        .iter()
+        .enumerate()
+        .filter(|(_, done)| !**done)
+        .map(|(index, _)| command.tasks[index].number.clone())
+        .collect();
+
+    if cyclic.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::PlanIsCyclic(cyclic))
+    }
+}
+
 /// caller fixing them works down the plan rather than hunting.
 fn require_produced_artifacts(command: &PlanCommand) -> Result<(), StoreError> {
     let produced: HashSet<&str> = command
