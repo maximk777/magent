@@ -512,7 +512,9 @@ fn a_tick_that_cannot_be_written_takes_the_checkpoint_with_it() {
         "a checkpoint whose tick could not be written must not survive it"
     );
     let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
-    assert_eq!(status, "pending", "and the task is left as it was");
+    // `running`, not `pending`: binding the run named this task, which is what
+    // claims it. "As it was" means as the refused tick found it.
+    assert_eq!(status, "running", "and the task is left as it was");
     assert_eq!(evidence, None);
     assert_eq!(verified_at, None);
 }
@@ -727,7 +729,9 @@ fn a_tick_with_another_command_is_refused_and_leaves_the_task_open() {
     );
 
     let (status, evidence, verified_at) = fixture.task_row(change, "1.3");
-    assert_eq!(status, "pending", "the task is left open for the real run");
+    // Still held rather than pending: the run named it, and a refused tick
+    // does not take the task away from the agent that has it.
+    assert_eq!(status, "running", "the task is left open for the real run");
     assert_eq!(evidence, None);
     assert_eq!(verified_at, None);
 }
@@ -782,7 +786,7 @@ fn a_tick_whose_slug_names_no_open_change_is_refused() {
 
     let (status, _, _) = fixture.task_row(change, "1.3");
     assert_eq!(
-        status, "pending",
+        status, "running",
         "the plan that does exist is left untouched"
     );
 }
@@ -854,7 +858,7 @@ fn a_tick_whose_slug_names_two_changes_is_refused() {
 
     let (status, _, _) = fixture.task_row(change, "1.3");
     assert_eq!(
-        status, "pending",
+        status, "running",
         "neither plan is closed while it is unclear which one this is"
     );
 }

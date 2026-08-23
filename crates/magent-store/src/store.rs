@@ -887,6 +887,35 @@ pub(crate) fn load_run_row(tx: &Transaction<'_>, run_id: RunId) -> Result<RunRow
 /// Takes the transaction rather than opening one, because the two callers differ
 /// in exactly that: [`Store::bind_spec`] binds a run on its own, while a
 /// checkpoint's binding has to land in the checkpoint's own transaction or it is
+/// How long a hold on a task lasts before it lapses.
+///
+/// Renewed by every checkpoint, so an agent that keeps reporting keeps its
+/// task, and one that goes quiet for longer than this is indistinguishable
+/// from one that stopped. Ten minutes: long enough for a slow build between
+/// checkpoints, short enough that a dead agent does not park the plan.
+const TASK_LEASE: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The task number a `current_task` names, if it names one.
+///
+/// `current_task` is free text — `sdd-execute` writes `2: wire the budget`, and
+/// a checkpoint for work that is not a task at all writes whatever describes
+/// it. So this takes the leading token and hands it back only as a candidate;
+/// whether a task of that number exists is the caller's question, and a
+/// checkpoint naming none claims nothing and is not an error.
+fn task_number_in(current_task: &str) -> Option<&str> {
+    let head = current_task
+        .trim()
+        .split(|character: char| character.is_whitespace() || character == ':')
+        .next()?
+        .trim_end_matches('.');
+
+    (!head.is_empty()
+        && head
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.'))
+    .then_some(head)
+}
+
 /// a write that can be lost while the checkpoint survives.
 fn write_binding(
     tx: &Transaction<'_>,
@@ -911,6 +940,32 @@ fn write_binding(
     if changed == 0 {
         return Err(StoreError::RunNotFound(run_id));
     }
+
+    // The claim rides on the binding rather than on a verb of its own: this is
+    // already written before the work starts, and a second way to say the same
+    // thing would be a second thing to forget. Best effort by design — a
+    // checkpoint whose `current_task` names no task of the plan claims nothing
+    // and is not refused, because the field carries work that is not a task.
+    if let Some(current_task) = binding.current_task.as_deref()
+        && let Some(number) = task_number_in(current_task)
+    {
+        let until = (Utc::now() + TASK_LEASE).to_rfc3339();
+        tx.execute(
+            "UPDATE tasks
+                SET claimed_by = (SELECT id FROM sessions
+                                  WHERE run_id = ?1 ORDER BY last_seen_at DESC LIMIT 1),
+                    lease_until = ?2,
+                    status = 'running',
+                    updated_at = ?3
+              WHERE number = ?4
+                AND status IN ('pending', 'running')
+                AND change_id IN (SELECT c.id FROM sdd_changes c
+                                  JOIN runs r ON r.spec_change_id = c.slug
+                                  WHERE r.id = ?1)",
+            rusqlite::params![run_id.to_string(), &until, now, number],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1010,7 +1065,9 @@ fn close_task(
         .collect();
 
     tx.execute(
-        "UPDATE tasks SET status = 'done', evidence = ?1, verified_at = ?2, updated_at = ?3
+        // The hold goes with the status: a done task holds nothing.
+        "UPDATE tasks SET status = 'done', evidence = ?1, verified_at = ?2, updated_at = ?3,
+                          claimed_by = NULL, lease_until = NULL
          WHERE change_id = ?4 AND number = ?5",
         rusqlite::params![&done.output, now, now, &change_id, &done.number],
     )?;
