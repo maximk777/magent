@@ -5,26 +5,29 @@
 -- only who holds a task now and until when. A question asked later about a
 -- moment already past has no answer at all.
 --
--- task_id is a key and trespass_on is a number, which is not an oversight. The
--- number is the address every message and every plan uses. The CHECK below
--- only ties the pair together — trespass_on cannot be set without a task_id
--- to resolve it against — it does not defend the number itself: a replan
--- renumbers a change's tasks, and nothing here follows that renumbering.
+-- task_id is a key and trespass_on is a number, which is not an oversight.
+-- The number is the address every message and every plan uses, and a number
+-- is not defended against a replan renumbering the tasks. There is no CHECK
+-- tying the two together, and that is deliberate, not an omission: the pair
+-- is meaningful at the moment it is written, because the writer sets both
+-- together — a trespass is resolved only when the editing session holds a
+-- task, so task_id is always set alongside it at write time. But
+-- ON DELETE SET NULL (below) means a replan can later remove that task,
+-- leaving task_id NULL while trespass_on still stands. That row is not
+-- corruption: the edit really did land on somebody else's file, and that
+-- stays true even after the task it was made for is gone — a row nobody
+-- joins to any more, kept because the edit happened. A CHECK that forbade
+-- that state would forbid the replan instead, which is the mistake this
+-- migration made on its first attempt.
 --
--- task_id is ON DELETE SET NULL rather than CASCADE or the default NO ACTION.
--- Foreign keys are on in this store, and a replan deletes and reinserts a
--- change's tasks (`DELETE FROM tasks WHERE change_id = ?1`), which NO ACTION
--- would turn into a failed replan the first time an edit had been recorded
--- against one of those tasks. The ledger is the history of what was edited,
--- and CASCADE would destroy that history because a plan was rewritten;
--- losing only the attribution is the honest outcome, and it leaves the row
--- reading the same as it does when nobody held a task.
+-- task_id is ON DELETE SET NULL rather than CASCADE or the default NO ACTION,
+-- so a replan's `DELETE FROM tasks WHERE change_id = ?1` clears the
+-- attribution instead of failing on it or deleting the row it belongs to.
 --
 -- Additive, the way 0015 and 0017 were: a server already running against this
 -- profile keeps working while it lands.
 ALTER TABLE file_ledger ADD COLUMN task_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;
-ALTER TABLE file_ledger ADD COLUMN trespass_on TEXT
-    CHECK (trespass_on IS NULL OR task_id IS NOT NULL);
+ALTER TABLE file_ledger ADD COLUMN trespass_on TEXT;
 
 -- A future close_task belongs here: reading the ledger by the task it
 -- belongs to, inside the checkpoint's transaction, is what this index is

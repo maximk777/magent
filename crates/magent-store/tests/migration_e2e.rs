@@ -723,8 +723,9 @@ fn a_replan_frees_the_ledger_rather_than_being_refused() {
         .expect("seed task");
     database
         .execute(
-            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO file_ledger
+                 (run_id, session_id, path, tool, observed_at, task_id, trespass_on)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 LEGACY_RUN,
                 "44444444-4444-4444-8444-444444444444",
@@ -732,19 +733,24 @@ fn a_replan_frees_the_ledger_rather_than_being_refused() {
                 "Edit",
                 "2026-01-01T00:00:00Z",
                 "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "2",
             ),
         )
-        .expect("seed a ledger row against the task");
+        .expect("seed a ledger row that trespassed on another task's file");
 
     database
         .execute("DELETE FROM tasks WHERE change_id = ?1", [LEGACY_CHANGE])
         .expect("a replan must not be refused by the ledger left behind");
 
-    let (recorded_path, recorded_task_id): (String, Option<String>) = database
+    let (recorded_path, recorded_task_id, recorded_trespass_on): (
+        String,
+        Option<String>,
+        Option<String>,
+    ) = database
         .query_row(
-            "SELECT path, task_id FROM file_ledger WHERE path = ?1",
+            "SELECT path, task_id, trespass_on FROM file_ledger WHERE path = ?1",
             ["crates/worker/src/retry.rs"],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("the ledger row must survive a replan");
 
@@ -752,5 +758,10 @@ fn a_replan_frees_the_ledger_rather_than_being_refused() {
     assert_eq!(
         recorded_task_id, None,
         "the ledger keeps its history but loses attribution to a task the replan deleted"
+    );
+    assert_eq!(
+        recorded_trespass_on,
+        Some("2".to_string()),
+        "the trespass outlives the task it pointed at — the edit still happened"
     );
 }
