@@ -1362,3 +1362,117 @@ fn a_chain_of_two_tasks_reads_its_contract_back() {
         "the contract comes back as the list the plan wrote, entry for entry"
     );
 }
+
+/// Every scenario of the ready set shares one plan, so they share one fixture:
+/// building it four times would say the same thing four times and take longer
+/// to read.
+///
+/// Task 1 produces what task 2 waits for. Tasks 3 and 4 wait for nothing and
+/// both declare the same file, which is the collision the conflict list exists
+/// to report.
+fn ready_fixture(fixture: &Fixture) -> ChangeId {
+    let change = fixture.specified_change();
+
+    let mut producer = task("Produce the budget", &[BUDGET, ATTEMPT]);
+    producer.number = "1".into();
+    producer.files = vec!["crates/worker/src/one.rs".into()];
+
+    let mut waiter = task("Spend it", &[BUDGET, ATTEMPT]);
+    waiter.number = "2".into();
+    waiter.consumes = vec![PRODUCES.into()];
+    waiter.produces = Vec::new();
+    waiter.files = vec!["crates/worker/src/two.rs".into()];
+
+    let mut sharer = task("Touch the shared file", &[BUDGET, ATTEMPT]);
+    sharer.number = "3".into();
+    sharer.produces = Vec::new();
+    sharer.files = vec!["crates/worker/src/shared.rs".into()];
+
+    let mut other_sharer = task("Touch it too", &[BUDGET, ATTEMPT]);
+    other_sharer.number = "4".into();
+    other_sharer.produces = Vec::new();
+    other_sharer.files = vec!["crates/worker/src/shared.rs".into()];
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks: vec![producer, waiter, sharer, other_sharer],
+            },
+            &fixture.context,
+        )
+        .expect("plan");
+
+    change
+}
+
+fn ready_numbers(ready: &[magent_core::ReadyTask]) -> Vec<&str> {
+    ready.iter().map(|task| task.number.as_str()).collect()
+}
+
+#[test]
+fn a_task_whose_producer_is_open_is_not_ready() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+
+    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    assert_eq!(
+        ready_numbers(&ready),
+        ["1", "3", "4"],
+        "task 2 waits on what task 1 produces"
+    );
+}
+
+#[test]
+fn two_ready_tasks_sharing_a_file_name_each_other() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+
+    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    let of = |number: &str| {
+        ready
+            .iter()
+            .find(|task| task.number == number)
+            .unwrap_or_else(|| panic!("task {number} must be ready"))
+            .conflicts_with
+            .clone()
+    };
+
+    assert_eq!(of("3"), ["4"], "3 and 4 both write the shared file");
+    assert_eq!(of("4"), ["3"]);
+    assert!(
+        of("1").is_empty(),
+        "task 1 touches a file of its own and collides with nothing"
+    );
+}
+
+#[test]
+fn closing_the_producer_makes_the_waiter_ready() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+    fixture.tick(SLUG, "1");
+
+    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    assert!(
+        ready_numbers(&ready).contains(&"2"),
+        "the artifact it waits for is produced by a task that is done now"
+    );
+    assert!(
+        !ready_numbers(&ready).contains(&"1"),
+        "a closed task is not offered again"
+    );
+}
+
+#[test]
+fn a_plan_with_every_task_closed_offers_nothing() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+    for number in ["1", "3", "4", "2"] {
+        fixture.tick(SLUG, number);
+    }
+
+    let ready = fixture.store.ready_tasks(change).expect("ready set");
+    assert!(ready.is_empty(), "nothing is left to offer: {ready:?}");
+}
