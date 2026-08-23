@@ -10,8 +10,8 @@
 use magent_core::{
     ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, Classification,
     DeltaOp, HarnessKind, OperationId, PlanCommand, ProposeCommand, RequirementDraft,
-    ScenarioDraft, SpecBinding, SpecifyCommand, StartRunCommand, TaskClosed, TaskDone, TaskDraft,
-    WorkflowStage,
+    ScenarioDraft, SessionId, SpecBinding, SpecifyCommand, StartRunCommand, TaskClosed, TaskDone,
+    TaskDraft, WorkflowStage,
 };
 use magent_store::{FactContext, Store};
 use rusqlite::Connection;
@@ -1560,4 +1560,95 @@ fn a_plan_with_nothing_connecting_it_is_as_wide_as_it_is_long() {
         "nothing waits, so everything could go at once"
     );
     assert_eq!(shape.longest_chain, 1);
+}
+
+/// Sets a hold directly, so a test can put one in the past without waiting.
+fn hold(fixture: &Fixture, change: ChangeId, number: &str, session: &str, until: &str) {
+    rusqlite::Connection::open(&fixture.path)
+        .expect("open")
+        .execute(
+            "UPDATE tasks SET claimed_by = ?1, lease_until = ?2
+             WHERE change_id = ?3 AND number = ?4",
+            rusqlite::params![session, until, change.to_string(), number],
+        )
+        .expect("set the hold");
+}
+
+#[test]
+fn a_task_another_session_holds_is_not_offered() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+    let mine = SessionId::new();
+    let theirs = SessionId::new();
+
+    hold(
+        &fixture,
+        change,
+        "3",
+        &theirs.to_string(),
+        "2099-01-01T00:00:00Z",
+    );
+
+    let ready = fixture
+        .store
+        .ready_tasks(change, Some(mine))
+        .expect("ready set");
+    let numbers = ready_numbers(&ready);
+    assert!(
+        !numbers.contains(&"3"),
+        "someone else is working it: {numbers:?}"
+    );
+    assert!(
+        numbers.contains(&"1"),
+        "the rest are still offered: {numbers:?}"
+    );
+}
+
+#[test]
+fn the_session_holding_a_task_is_still_offered_it() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+    let mine = SessionId::new();
+
+    hold(
+        &fixture,
+        change,
+        "3",
+        &mine.to_string(),
+        "2099-01-01T00:00:00Z",
+    );
+
+    let ready = fixture
+        .store
+        .ready_tasks(change, Some(mine))
+        .expect("ready set");
+    assert!(
+        ready_numbers(&ready).contains(&"3"),
+        "hiding it would make an agent's own task look as though it had gone"
+    );
+}
+
+#[test]
+fn a_lapsed_hold_offers_the_task_again() {
+    let fixture = Fixture::new();
+    let change = ready_fixture(&fixture);
+    let mine = SessionId::new();
+    let theirs = SessionId::new();
+
+    hold(
+        &fixture,
+        change,
+        "3",
+        &theirs.to_string(),
+        "2000-01-01T00:00:00Z",
+    );
+
+    let ready = fixture
+        .store
+        .ready_tasks(change, Some(mine))
+        .expect("ready set");
+    assert!(
+        ready_numbers(&ready).contains(&"3"),
+        "an agent that stopped reporting is indistinguishable from one that stopped"
+    );
 }
