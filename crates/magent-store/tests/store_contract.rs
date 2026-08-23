@@ -1007,6 +1007,17 @@ fn edit_at(path: &str) -> FileLedgerEntry {
     }
 }
 
+/// Like `edit_at`, but with an `observed_at` the caller controls instead of
+/// `Utc::now()` — for a test that needs the edit to have happened at a
+/// particular moment in the past.
+fn edit_observed_at(path: &str, observed_at: chrono::DateTime<chrono::Utc>) -> FileLedgerEntry {
+    FileLedgerEntry {
+        path: PathBuf::from(path),
+        tool: "Edit".into(),
+        observed_at,
+    }
+}
+
 /// The task number an edit was stamped with, read back through the number
 /// rather than the id — so an assertion says something a reader recognises.
 fn stamped_task(connection: &rusqlite::Connection, path: &str) -> Option<String> {
@@ -1122,5 +1133,51 @@ fn two_tasks_in_turn_each_get_their_own_edits() {
         stamped_task(&fixture.raw(), EDIT_B),
         Some(TASK_FOUR.into()),
         "the second edit names the task held when it landed"
+    );
+}
+
+/// Exists to stop the lease comparison in `append_ledger` drifting to
+/// `Utc::now()`. Every other test's edit lands via `edit_at()`, whose
+/// `observed_at` is `Utc::now()`, so a query compared against `Utc::now()`
+/// would pass all of them just as happily as one compared against
+/// `entry.observed_at`. Here the lease lapsed 30 minutes ago but the edit's
+/// `observed_at` is an hour ago — earlier still, while the lease was live —
+/// so the two comparisons finally disagree: judged by `observed_at` the task
+/// is stamped, judged by `Utc::now()` it would not be.
+#[test]
+fn an_edit_is_judged_by_the_lease_that_was_live_when_it_landed() {
+    let fixture = HoldFixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    // Scoped by change as well as by number, as the other lapse test does:
+    // `tasks_number` is `UNIQUE(change_id, number)` (`0009_tasks.sql`), not
+    // unique on the number alone.
+    fixture
+        .raw()
+        .execute(
+            "UPDATE tasks SET lease_until = ?1 WHERE number = ?2 AND change_id = ?3",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339(),
+                TASK_THREE,
+                change.to_string(),
+            ],
+        )
+        .expect("lapse the hold into the past");
+
+    fixture
+        .store
+        .append_ledger(
+            run_id,
+            session_id,
+            &edit_observed_at(EDIT_A, chrono::Utc::now() - chrono::Duration::hours(1)),
+        )
+        .expect("append ledger");
+
+    assert_eq!(
+        stamped_task(&fixture.raw(), EDIT_A),
+        Some(TASK_THREE.into()),
+        "the lease was still live when the edit landed, even though it has lapsed since"
     );
 }
