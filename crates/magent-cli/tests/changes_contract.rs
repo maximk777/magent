@@ -994,3 +994,31 @@ fn each_candidate_of_the_refusal_carries_its_own_status_not_the_word_archived() 
          `archived` gets wrong: {report}"
     );
 }
+
+/// The shape is what a person decides on before dispatching anybody, so it has
+/// to reach the terminal rather than only the MCP payload.
+#[test]
+fn a_planned_change_prints_its_shape_and_what_is_ready() {
+    let world = World::new();
+    world.plan_a_change(
+        "retry-budget",
+        "Retries have no ceiling and can loop forever.",
+        &[
+            ("1", "First independent step"),
+            ("2", "Second independent step"),
+            ("3", "Third independent step"),
+        ],
+    );
+
+    let (ok, output) = world.changes(&["retry-budget"]);
+    assert!(ok, "the command must succeed: {output}");
+
+    assert!(
+        output.contains("width 3") && output.contains("longest chain 1"),
+        "the shape must reach the terminal, printed: {output}"
+    );
+    assert!(
+        output.contains("ready  1, 2, 3"),
+        "the ready tasks must be named, printed: {output}"
+    );
+}
