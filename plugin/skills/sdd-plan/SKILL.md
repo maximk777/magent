@@ -69,6 +69,26 @@ These are plan failures. Never write them:
 - An `expected_output` written as a sentence about the output rather than a
   fragment of it
 
+## Check before you write the prose
+
+Send the plan twice.
+
+**First with `check_only: true` and no `body` on any task.** The gates read
+`covers`, `consumes` and `produces` and nothing else, so a skeleton — numbers,
+titles, those three lists, `verify_command` and `expected_output` — answers the
+same question. Nothing is written: a change that had a plan still has exactly
+that plan, and one that had none still has none. The report says so, so a check
+cannot be mistaken for a plan that was stored.
+
+**Then, once it passes, write the bodies and send it for real.**
+
+The reason is the cost of being wrong. A plan is accepted only whole, so a
+`covers` list that misses one requirement is refused — correctly — and fixing it
+means writing every paragraph in the plan again. One session paid forty-four
+kilobytes for that: thirty-three tasks, the largest request this profile has
+ever recorded, refused for twenty-five uncovered requirements, and from outside
+it read as a hang. The skeleton for the same plan is under seven kilobytes.
+
 ## The call
 
 The whole list goes in one `magent_plan`. A second call **replaces** the tasks
