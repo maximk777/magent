@@ -363,6 +363,21 @@ pub struct TaskDraft {
     pub covers: Vec<String>,
 }
 
+/// One task a caller may dispatch now, and what it must not be dispatched
+/// beside.
+///
+/// `conflicts_with` names the other ready tasks sharing a file with this one. A
+/// caller taking several picks a set whose members name none of each other, and
+/// which of two to defer stays with the caller: between two tasks that share a
+/// file there is no single right answer, so a store that chose would be making
+/// an arbitrary decision it cannot explain and hiding the one it deferred.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadyTask {
+    pub number: String,
+    pub title: String,
+    pub conflicts_with: Vec<String>,
+}
+
 /// Phrases borrowed from `superpowers`, where the same rule is stated in
 /// prose and so goes unenforced. Checked case-insensitively against every
 /// field a plan writes prose into. Extend this list rather than adding a

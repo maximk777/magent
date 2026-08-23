@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use magent_core::{
     ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, ProposeCommand,
-    RequirementDraft, ScenarioDraft, SpecifyCommand, Validate,
+    ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, Validate,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -682,6 +682,58 @@ impl Store {
                 status: ChangeStatus::Planned,
             })
         })
+    }
+
+    /// The tasks of `change` that may be started now.
+    ///
+    /// Ready means neither done nor skipped, and every artifact this task
+    /// consumes is produced by a task that is already done. Computed on each
+    /// read against the tasks closed so far rather than laid out as waves when
+    /// the plan is written: a wave is a barrier, and the quick tasks in one
+    /// wait on the slowest for nothing.
+    ///
+    /// `skipped` counts as neither done nor available, the way
+    /// `require_covered_by_done` counts it: a task nobody did produces nothing,
+    /// whoever decided to pass it over.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn ready_tasks(&self, change: ChangeId) -> Result<Vec<ReadyTask>, StoreError> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        let tasks = load_task_summaries(&tx, &change.to_string())?;
+        drop(tx);
+
+        let available: HashSet<&str> = tasks
+            .iter()
+            .filter(|task| task.status == "done")
+            .flat_map(|task| task.produces.iter())
+            .map(|artifact| artifact.trim())
+            .collect();
+
+        let ready: Vec<&TaskSummary> = tasks
+            .iter()
+            .filter(|task| task.status != "done" && task.status != "skipped")
+            .filter(|task| {
+                task.consumes
+                    .iter()
+                    .all(|artifact| available.contains(artifact.trim()))
+            })
+            .collect();
+
+        Ok(ready
+            .iter()
+            .map(|task| ReadyTask {
+                number: task.number.clone(),
+                title: task.title.clone(),
+                conflicts_with: ready
+                    .iter()
+                    .filter(|other| other.number != task.number)
+                    .filter(|other| other.files.iter().any(|path| task.files.contains(path)))
+                    .map(|other| other.number.clone())
+                    .collect(),
+            })
+            .collect())
     }
 
     /// Folds a change's deltas into the live base and moves it to `archived`.

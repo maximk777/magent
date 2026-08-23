@@ -22,5 +22,5 @@ pub use model::{
 };
 pub use sdd::{
     ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, ProposeCommand,
-    RequirementDraft, ScenarioDraft, SpecifyCommand, TaskClosed, TaskDone, TaskDraft,
+    ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, TaskClosed, TaskDone, TaskDraft,
 };
