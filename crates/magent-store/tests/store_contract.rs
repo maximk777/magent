@@ -922,8 +922,8 @@ impl HoldFixture {
                     operation_id: OperationId::new(),
                     change,
                     tasks: vec![
-                        hold_task(TASK_THREE, &[HOLD_REQUIREMENT]),
-                        hold_task(TASK_FOUR, &[]),
+                        hold_task(TASK_THREE, &[HOLD_REQUIREMENT], &["src/a.rs"]),
+                        hold_task(TASK_FOUR, &[], &["src/store.rs"]),
                     ],
                     check_only: false,
                 },
@@ -978,19 +978,60 @@ impl HoldFixture {
             .expect("hold");
     }
 
+    /// A second session joined to `run_id`, the way
+    /// `each_session_reads_back_the_checkpoint_it_wrote` and
+    /// `a_session_with_no_checkpoint_of_its_own_is_shown_the_runs` join one —
+    /// by binding to the same workspace root, which `bind_session` resolves
+    /// back to the run already open on it.
+    ///
+    /// `write_binding`'s claim (`store.rs`) hands a hold to whichever session
+    /// on the run was seen most recently, not to a session named by the
+    /// caller. Calling this right before `hold` is what makes the claim land
+    /// on the session it just created rather than on whichever session held
+    /// the previous task: a freshly inserted session is stamped with `now`,
+    /// which sorts after every session already in the run.
+    fn second_session(&self, run_id: RunId, hint: &str) -> SessionId {
+        let bound = self
+            .store
+            .bind_session(
+                hint,
+                &self.root,
+                "hold a task to its edits",
+                HarnessKind::ClaudeCode,
+            )
+            .expect("bind second session");
+        assert_eq!(bound.run_id, run_id, "both sessions must share one run");
+        bound.session_id
+    }
+
     /// A second connection to the same file, for reading back what the store
     /// itself would never expose through its own API.
     fn raw(&self) -> rusqlite::Connection {
         rusqlite::Connection::open(&self.path).expect("raw connection")
     }
+
+    /// The session currently claiming a task, read back the way `holder_of`'s
+    /// callers use it: to confirm `second_session` actually won the hold it
+    /// was meant to win, before trusting anything built on that assumption.
+    fn holder_of(&self, change: ChangeId, task_number: &str) -> Option<SessionId> {
+        let claimed_by: Option<String> = self
+            .raw()
+            .query_row(
+                "SELECT claimed_by FROM tasks WHERE number = ?1 AND change_id = ?2",
+                rusqlite::params![task_number, change.to_string()],
+                |row| row.get(0),
+            )
+            .expect("one task row");
+        claimed_by.and_then(|id| id.parse().ok())
+    }
 }
 
-fn hold_task(number: &str, covers: &[&str]) -> TaskDraft {
+fn hold_task(number: &str, covers: &[&str], files: &[&str]) -> TaskDraft {
     TaskDraft {
         number: number.into(),
         title: format!("Hold a task to its edits, step {number}"),
         body: Some("Stamp the ledger with the task the session holds.".into()),
-        files: vec!["crates/magent-store/src/store.rs".into()],
+        files: files.iter().map(|path| (*path).to_string()).collect(),
         consumes: Vec::new(),
         produces: vec!["fn append_ledger(&self, ...) -> Result<(), StoreError>".into()],
         verify_command: HOLD_VERIFY.into(),
@@ -1179,5 +1220,146 @@ fn an_edit_is_judged_by_the_lease_that_was_live_when_it_landed() {
         stamped_task(&fixture.raw(), EDIT_A),
         Some(TASK_THREE.into()),
         "the lease was still live when the edit landed, even though it has lapsed since"
+    );
+}
+
+// --- an edit recorded as a trespass onto a file another session holds ------
+//
+// `append_ledger` does not write `trespass_on` yet — that is task 3.2. These
+// tests are the red half: the two sessions below are both taken through the
+// store (`bound_run`, `second_session`, `hold`), never by writing
+// `claimed_by` or `trespass_on` by hand, so the failures are honest.
+//
+// Task 3 declares `src/a.rs`, task 4 declares `src/store.rs`
+// (`HoldFixture::planned_change`), so an edit under task 3's session that
+// lands on `src/store.rs` has somewhere real to trespass onto.
+
+/// The second session's hint, distinct from `EDITING_HINT` used elsewhere in
+/// this file for an unrelated fixture.
+const TRESPASS_HINT: &str = "harness-session-trespasser";
+
+/// An edit under session A, but on the file task 4 declares — an absolute
+/// path, not the relative one the plan recorded, because that is what a real
+/// harness hands the hook. A hook matching only identical strings would
+/// never fire in production.
+const TRESPASS_EDIT: &str = "/tmp/project/src/store.rs";
+
+fn trespass(connection: &rusqlite::Connection, path: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT trespass_on FROM file_ledger WHERE path = ?1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        )
+        .expect("one ledger row for this path")
+}
+
+#[test]
+fn an_edit_onto_a_held_file_records_the_trespass() {
+    let fixture = HoldFixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_a) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    fixture.second_session(run_id, TRESPASS_HINT);
+    fixture.hold(run_id, TASK_FOUR_NAMED);
+
+    assert_ne!(
+        fixture.holder_of(change, TASK_THREE),
+        fixture.holder_of(change, TASK_FOUR),
+        "second_session must actually win task 4's hold, or this exercises self-trespass, not cross-session trespass"
+    );
+
+    fixture
+        .store
+        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .expect("append ledger");
+
+    assert_eq!(
+        trespass(&fixture.raw(), TRESPASS_EDIT),
+        Some(TASK_FOUR.into()),
+        "the edit landed on a file task 4 declares, and session B holds task 4"
+    );
+}
+
+#[test]
+fn an_edit_onto_an_unheld_file_records_no_trespass() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, session_a) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    // Nobody holds task 4 here — no second session, no hold taken on it.
+    fixture
+        .store
+        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .expect("append ledger");
+
+    assert_eq!(
+        trespass(&fixture.raw(), TRESPASS_EDIT),
+        None,
+        "nobody holds the file this edit landed on"
+    );
+}
+
+#[test]
+fn an_edit_onto_a_file_whose_holder_lapsed_records_no_trespass() {
+    let fixture = HoldFixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_a) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    fixture.second_session(run_id, TRESPASS_HINT);
+    fixture.hold(run_id, TASK_FOUR_NAMED);
+
+    assert_ne!(
+        fixture.holder_of(change, TASK_THREE),
+        fixture.holder_of(change, TASK_FOUR),
+        "second_session must actually win task 4's hold, or this exercises self-trespass, not cross-session trespass"
+    );
+
+    // Scoped by change as well as by number, as the other lapse tests in this
+    // file do: `tasks_number` is `UNIQUE(change_id, number)` (`0009_tasks.sql`),
+    // not unique on the number alone.
+    fixture
+        .raw()
+        .execute(
+            "UPDATE tasks SET lease_until = ?1 WHERE number = ?2 AND change_id = ?3",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+                TASK_FOUR,
+                change.to_string(),
+            ],
+        )
+        .expect("lapse the hold");
+
+    fixture
+        .store
+        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .expect("append ledger");
+
+    assert_eq!(
+        trespass(&fixture.raw(), TRESPASS_EDIT),
+        None,
+        "the holder's lease had lapsed by the time the edit landed"
+    );
+}
+
+#[test]
+fn an_edit_onto_your_own_declared_file_is_no_trespass() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, session_a) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    fixture
+        .store
+        .append_ledger(run_id, session_a, &edit_at(EDIT_A))
+        .expect("append ledger");
+
+    assert_eq!(
+        trespass(&fixture.raw(), EDIT_A),
+        None,
+        "a session editing the file its own task declares is not trespassing"
     );
 }
