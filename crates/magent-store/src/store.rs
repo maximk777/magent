@@ -551,9 +551,41 @@ impl Store {
             )
             .optional()?;
 
+        // Whose file this landed on, asked only when the editing session holds
+        // something: with no task to file the edit under there is nothing for a
+        // later close to refuse, and the row would carry an accusation nobody
+        // reads. Scoped to the same change, because `files` is a contract
+        // between the tasks of one plan.
+        let trespass_on = match &held {
+            Some((_, change_id)) => {
+                let mut statement = tx.prepare(
+                    "SELECT number, files_json FROM tasks
+                     WHERE change_id = ?1 AND claimed_by IS NOT NULL AND claimed_by != ?2
+                       AND lease_until IS NOT NULL AND lease_until > ?3",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![change_id, session_id.to_string(), &observed_at],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?;
+
+                let edited = entry.path.to_string_lossy();
+                let mut found = None;
+                for row in rows {
+                    let (number, files_json) = row?;
+                    let declared: Vec<String> = serde_json::from_str(&files_json)?;
+                    if declared.iter().any(|path| declares_path(path, &edited)) {
+                        found = Some(number);
+                        break;
+                    }
+                }
+                found
+            }
+            None => None,
+        };
+
         tx.execute(
-            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id, trespass_on)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 run_id.to_string(),
                 session_id.to_string(),
@@ -561,6 +593,7 @@ impl Store {
                 &entry.tool,
                 &observed_at,
                 held.as_ref().map(|(id, _)| id),
+                &trespass_on,
             ),
         )?;
         tx.commit()?;
@@ -959,6 +992,22 @@ fn task_number_in(current_task: &str) -> Option<&str> {
             .chars()
             .all(|character| character.is_ascii_digit() || character == '.'))
     .then_some(head)
+}
+
+/// Whether a path a plan declared names the file an edit landed on.
+///
+/// A plan writes repository-relative paths (`src/store.rs`); the hook records
+/// what the harness handed it, which is absolute. Nothing here can bridge the
+/// two by construction — `repositories.canonical_root` is where the repository
+/// was first seen, and a worktree of it resolves somewhere else — so the match
+/// is made on the tail, at a separator boundary. `src/store.rs` matches
+/// `/home/me/project/src/store.rs` and not `/home/me/project/src/store.rs.bak`,
+/// and a plan declaring the bare name `store.rs` matches any file so called,
+/// which is what declaring a bare name asks for.
+fn declares_path(declared: &str, edited: &str) -> bool {
+    let declared = declared.trim().trim_start_matches("./");
+
+    !declared.is_empty() && (edited == declared || edited.ends_with(&format!("/{declared}")))
 }
 
 /// a write that can be lost while the checkpoint survives.
