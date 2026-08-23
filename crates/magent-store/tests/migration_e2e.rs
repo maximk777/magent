@@ -493,3 +493,54 @@ fn sessions_carry_a_last_seen_stamp_backfilled_from_their_start() {
         "a session that predates the stamp is worth exactly the moment it started"
     );
 }
+
+#[test]
+fn a_tasks_prose_contract_survives_as_a_single_entry() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 15);
+    seed_slice_one(&legacy);
+
+    // Seeded here rather than through `seed_planned_task`, which writes the
+    // pre-0011 `expected_output` column and so only builds against version 10.
+    legacy
+        .execute(
+            "INSERT INTO sdd_changes
+                 (id, workspace_id, namespace, slug, title, classification, status,
+                  created_at, updated_at)
+             VALUES (?1, ?2, 'service', 'add-retry-budget', 'Give retries a ceiling',
+                     'bounded', 'planned', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (LEGACY_CHANGE, LEGACY_WORKSPACE),
+        )
+        .expect("seed change");
+    legacy
+        .execute(
+            "INSERT INTO tasks
+                 (id, change_id, number, title, files_json, consumes, produces,
+                  verify_command, expected_output_json, covers_json, status,
+                  created_at, updated_at)
+             VALUES ('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', ?1, '1', 'cap the retries',
+                     '[]', ?2, ?3, 'cargo test -p worker retry', '[\"ok\"]', '[]',
+                     'pending', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            (
+                LEGACY_CHANGE,
+                "RetryBudget::new(u32) from task 1",
+                "nothing downstream",
+            ),
+        )
+        .expect("seed a prose contract");
+    drop(legacy);
+
+    Store::open(&path).expect("upgrade");
+
+    let connection = Connection::open(&path).expect("reopen");
+    let (consumes, produces): (String, String) = connection
+        .query_row(
+            "SELECT consumes_json, produces_json FROM tasks LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the columns must be lists now");
+
+    assert_eq!(consumes, "[\"RetryBudget::new(u32) from task 1\"]");
+    assert_eq!(produces, "[\"nothing downstream\"]");
+}
