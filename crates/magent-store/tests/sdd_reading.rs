@@ -1476,3 +1476,80 @@ fn a_plan_with_every_task_closed_offers_nothing() {
     let ready = fixture.store.ready_tasks(change).expect("ready set");
     assert!(ready.is_empty(), "nothing is left to offer: {ready:?}");
 }
+
+/// A plan of `count` tasks, each consuming what the one before produces.
+fn chain(fixture: &Fixture, count: usize) -> ChangeId {
+    let change = fixture.specified_change();
+    let artifact = |index: usize| format!("fn step_{index}()");
+
+    let tasks = (0..count)
+        .map(|index| {
+            let mut step = task("A step of the chain", &[BUDGET, ATTEMPT]);
+            step.number = (index + 1).to_string();
+            step.produces = vec![artifact(index)];
+            step.consumes = if index == 0 {
+                Vec::new()
+            } else {
+                vec![artifact(index - 1)]
+            };
+            step
+        })
+        .collect();
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks,
+            },
+            &fixture.context,
+        )
+        .expect("plan");
+    change
+}
+
+#[test]
+fn a_plan_that_is_one_chain_has_nothing_to_run_beside_anything() {
+    let fixture = Fixture::new();
+    let change = chain(&fixture, 4);
+
+    let shape = fixture.store.plan_shape(change).expect("shape");
+    assert_eq!(shape.width, 1, "a chain has nothing to run beside anything");
+    assert_eq!(shape.longest_chain, 4);
+}
+
+#[test]
+fn a_plan_with_nothing_connecting_it_is_as_wide_as_it_is_long() {
+    let fixture = Fixture::new();
+    let change = fixture.specified_change();
+
+    let tasks = (1..=3)
+        .map(|number| {
+            let mut step = task("An independent step", &[BUDGET, ATTEMPT]);
+            step.number = number.to_string();
+            step.produces = Vec::new();
+            step
+        })
+        .collect();
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks,
+            },
+            &fixture.context,
+        )
+        .expect("plan");
+
+    let shape = fixture.store.plan_shape(change).expect("shape");
+    assert_eq!(
+        shape.width, 3,
+        "nothing waits, so everything could go at once"
+    );
+    assert_eq!(shape.longest_chain, 1);
+}
