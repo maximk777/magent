@@ -592,3 +592,28 @@ fn a_migrated_plan_still_offers_its_open_tasks() {
         "a migrated task must still be offered: {ready:?}"
     );
 }
+
+#[test]
+fn a_task_carries_who_holds_it_and_until_when() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 16);
+    seed_slice_one(&legacy);
+    drop(legacy);
+
+    Store::open(&path).expect("upgrade");
+
+    let connection = Connection::open(&path).expect("reopen");
+    let columns: String = connection
+        .query_row(
+            "SELECT group_concat(name, ' ') FROM pragma_table_info('tasks')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the columns");
+
+    assert!(
+        columns.contains("claimed_by"),
+        "tasks must record who holds one: {columns}"
+    );
+    assert!(columns.contains("lease_until"), "and until when: {columns}");
+}
