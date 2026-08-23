@@ -363,6 +363,23 @@ pub struct TaskDraft {
     pub covers: Vec<String>,
 }
 
+/// How parallel a plan could ever be, computed from the graph it carries.
+///
+/// Both numbers exist because parallel execution costs more tokens rather than
+/// fewer: orientation is duplicated into every agent, review multiplies, and
+/// merging is added. What it buys is wall-clock time and less context
+/// degradation on a long plan, and someone deciding whether to pay needs the
+/// shape before the first dispatch rather than after.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanShape {
+    /// The most tasks that could be ready at the same time. `1` says the plan
+    /// is a chain and there is nothing to parallelise, which is a real answer
+    /// and worth more than an offer that turns out empty.
+    pub width: usize,
+    /// The longest run of tasks that must happen one after another.
+    pub longest_chain: usize,
+}
+
 /// One task a caller may dispatch now, and what it must not be dispatched
 /// beside.
 ///

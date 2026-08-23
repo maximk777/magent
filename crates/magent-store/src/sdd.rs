@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use magent_core::{
-    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, ProposeCommand,
-    ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, Validate,
+    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, PlanShape,
+    ProposeCommand, ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, Validate,
 };
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -734,6 +734,54 @@ impl Store {
                     .collect(),
             })
             .collect())
+    }
+
+    /// How parallel `change`'s plan could ever be.
+    ///
+    /// Read from the graph rather than from what is closed, so the numbers do
+    /// not move as tasks finish: they describe the plan, and the question they
+    /// answer — is this worth dispatching several agents for — is asked before
+    /// anything has been dispatched.
+    ///
+    /// The width is the largest level of the dependency layering, which is the
+    /// most tasks that could be ready at once. File conflicts are deliberately
+    /// not subtracted: they change which of the ready tasks may go together,
+    /// not how wide the plan is, and `ready_tasks` is where a caller learns
+    /// them.
+    ///
+    /// An empty plan is nought wide and nought long.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn plan_shape(&self, change: ChangeId) -> Result<PlanShape, StoreError> {
+        let mut connection = self.lock()?;
+        let tx = connection.transaction()?;
+        let tasks = load_task_summaries(&tx, &change.to_string())?;
+        drop(tx);
+
+        let contracts: Vec<(&[String], &[String])> = tasks
+            .iter()
+            .map(|task| (task.consumes.as_slice(), task.produces.as_slice()))
+            .collect();
+
+        // A stored plan passed `require_acyclic_plan` on the way in, so every
+        // task has a level; `unwrap_or(0)` is for a row this crate did not
+        // write rather than for a case the process allows.
+        let levels: Vec<usize> = dependency_levels(&contracts)
+            .into_iter()
+            .map(|level| level.unwrap_or(0))
+            .collect();
+
+        let longest_chain = levels.iter().max().map_or(0, |deepest| deepest + 1);
+        let width = (0..longest_chain)
+            .map(|level| levels.iter().filter(|task| **task == level).count())
+            .max()
+            .unwrap_or(0);
+
+        Ok(PlanShape {
+            width,
+            longest_chain,
+        })
     }
 
     /// Folds a change's deltas into the live base and moves it to `archived`.
@@ -1786,83 +1834,75 @@ fn require_plannable_change(
     Ok(())
 }
 
-/// Refuses a plan that leaves a requirement of this change to nobody.
+/// The level of each task in the dependency graph, or `None` for a task no
+/// order can reach.
 ///
-/// Compared against `spec_deltas.name` rather than `requirements.name`: a
-/// task's `covers` holds the name the requirement was proposed under in *this*
-/// change, fixed at the moment of planning (`0009_tasks.sql`). A `renamed`
-/// delta moves the live name in `requirements` without touching the plan, so
-/// matching there would report a perfectly covered requirement as uncovered
-/// the first time one is renamed.
+/// Level 0 is a task that waits for nothing; a task's level is one past the
+/// highest level among the tasks producing what it consumes. That is Kahn's
+/// algorithm with the pass number kept, which is the one walk two questions
+/// need: what is left unreached is the cycle, and how the reached ones stack
+/// up is the plan's shape.
 ///
-/// A change proposed with `skip_specs` has no deltas, so the query returns
-/// Refuses a plan whose `consumes` names an artifact no task in it produces.
-///
-/// Matched by exact string equality after trimming, which is the whole point:
-/// `superpowers` states the rule about repeating the exact name in prose, where
-/// it goes unenforced, and this is that rule as a check. A near-miss is a miss,
-/// because an executing agent that cannot find the name it was given has
-/// nothing to fall back on but a guess.
-///
-/// Reported in plan order, then in the order within a task, the way
-/// `require_full_coverage` orders its own list and for the same reason: a
-/// The tasks each task waits on, as indexes into `command.tasks`.
-///
-/// Built once and used twice: to refuse a plan no order can satisfy, and to
-/// layer the plan for its shape. An artifact produced by several tasks yields
-/// an edge to each, which is right — the consumer waits for all of them.
-fn producer_indexes(command: &PlanCommand) -> Vec<Vec<usize>> {
-    command
-        .tasks
+/// Takes the contracts rather than the tasks so both callers can use it — one
+/// holds a `PlanCommand` on the way in, the other rows on the way out.
+fn dependency_levels(contracts: &[(&[String], &[String])]) -> Vec<Option<usize>> {
+    let produced_by: Vec<HashSet<&str>> = contracts
         .iter()
-        .map(|task| {
-            let wanted: HashSet<&str> = task.consumes.iter().map(|name| name.trim()).collect();
-            command
-                .tasks
+        .map(|(_, produces)| produces.iter().map(|name| name.trim()).collect())
+        .collect();
+
+    let producers: Vec<Vec<usize>> = contracts
+        .iter()
+        .map(|(consumes, _)| {
+            let wanted: HashSet<&str> = consumes.iter().map(|name| name.trim()).collect();
+            produced_by
                 .iter()
                 .enumerate()
-                .filter(|(_, other)| {
-                    other
-                        .produces
-                        .iter()
-                        .any(|name| wanted.contains(name.trim()))
-                })
+                .filter(|(_, made)| made.iter().any(|name| wanted.contains(name)))
                 .map(|(index, _)| index)
                 .collect()
         })
-        .collect()
-}
+        .collect();
 
-/// Refuses a plan no order can satisfy.
-///
-/// Kahn's algorithm: repeatedly take the tasks whose every producer is already
-/// taken. What is left when a pass takes nothing is the cycle, and those
-/// numbers are what the refusal names — a cycle is not a plan, because no task
-/// in it can ever be first.
-///
-/// A task consuming what it produces itself is a cycle of one and falls out of
-/// the same loop with no special case.
-fn require_acyclic_plan(command: &PlanCommand) -> Result<(), StoreError> {
-    let producers = producer_indexes(command);
-    let mut taken = vec![false; command.tasks.len()];
-
+    let mut levels: Vec<Option<usize>> = vec![None; contracts.len()];
     loop {
         let mut progressed = false;
-        for index in 0..command.tasks.len() {
-            if !taken[index] && producers[index].iter().all(|producer| taken[*producer]) {
-                taken[index] = true;
+        for index in 0..contracts.len() {
+            if levels[index].is_some() {
+                continue;
+            }
+            let reached = producers[index]
+                .iter()
+                .map(|producer| levels[*producer])
+                .collect::<Option<Vec<usize>>>();
+            if let Some(depths) = reached {
+                levels[index] = Some(depths.into_iter().max().map_or(0, |deepest| deepest + 1));
                 progressed = true;
             }
         }
         if !progressed {
-            break;
+            return levels;
         }
     }
+}
 
-    let cyclic: Vec<String> = taken
+/// Refuses a plan no order can satisfy.
+///
+/// A task left without a level is one nothing can reach, and those numbers are
+/// what the refusal names — a cycle is not a plan, because no task in it can
+/// ever be first. A task consuming what it produces itself is a cycle of one
+/// and falls out of the same walk with no special case.
+fn require_acyclic_plan(command: &PlanCommand) -> Result<(), StoreError> {
+    let contracts: Vec<(&[String], &[String])> = command
+        .tasks
+        .iter()
+        .map(|task| (task.consumes.as_slice(), task.produces.as_slice()))
+        .collect();
+
+    let cyclic: Vec<String> = dependency_levels(&contracts)
         .iter()
         .enumerate()
-        .filter(|(_, done)| !**done)
+        .filter(|(_, level)| level.is_none())
         .map(|(index, _)| command.tasks[index].number.clone())
         .collect();
 

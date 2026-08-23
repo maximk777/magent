@@ -21,6 +21,7 @@ pub use model::{
     RunStatus, SessionId, SpecBinding, StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
 };
 pub use sdd::{
-    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, ProposeCommand,
-    ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, TaskClosed, TaskDone, TaskDraft,
+    ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, PlanShape,
+    ProposeCommand, ReadyTask, RequirementDraft, ScenarioDraft, SpecifyCommand, TaskClosed,
+    TaskDone, TaskDraft,
 };
