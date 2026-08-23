@@ -15,8 +15,8 @@
 
 use magent_core::{
     ArchiveCommand, ChangeId, ChangeStatus, CheckpointCommand, CheckpointOrigin, CheckpointResult,
-    Classification, DeltaOp, HarnessKind, OperationId, PlanCommand, ProposeCommand,
-    RequirementDraft, RunId, ScenarioDraft, SessionId, SpecBinding, SpecifyCommand,
+    Classification, DeltaOp, FileLedgerEntry, HarnessKind, OperationId, PlanCommand,
+    ProposeCommand, RequirementDraft, RunId, ScenarioDraft, SessionId, SpecBinding, SpecifyCommand,
     StartRunCommand, TaskDone, TaskDraft, WorkflowStage,
 };
 use magent_store::{FactContext, Store, StoreError};
@@ -81,6 +81,29 @@ impl Fixture {
     /// handed in — so a test can plan more than one of them and read back
     /// which ones the tick did not find.
     fn planned_change_expecting(&self, markers: &[&str]) -> ChangeId {
+        let change = self.proposed_and_specified();
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![
+                        task("1.3", &[REQUIREMENT], markers),
+                        task("2", &[], &[EXPECTED]),
+                    ],
+                    check_only: false,
+                },
+                &self.context,
+            )
+            .expect("plan");
+
+        change
+    }
+
+    /// A change carried to `specified` — the propose-then-specify half every
+    /// planned change in this file shares, before its tasks are written.
+    fn proposed_and_specified(&self) -> ChangeId {
         let change = self
             .store
             .propose(
@@ -128,14 +151,25 @@ impl Fixture {
             )
             .expect("specify");
 
+        change
+    }
+
+    /// A change planned with tasks "3" and "4" instead of "1.3" and "2":
+    /// task "3" declares nothing that overlaps task "4", and task "4"
+    /// declares `src/store.rs`. Built for the trespass-refusal tests, whose
+    /// plan text names task 3 as the one that closes and task 4 as the one
+    /// that holds the file the close finds trespassed.
+    fn planned_change_for_trespass(&self) -> ChangeId {
+        let change = self.proposed_and_specified();
+
         self.store
             .plan(
                 &PlanCommand {
                     operation_id: OperationId::new(),
                     change,
                     tasks: vec![
-                        task("1.3", &[REQUIREMENT], markers),
-                        task("2", &[], &[EXPECTED]),
+                        task("3", &[REQUIREMENT], &[EXPECTED]),
+                        task_declaring("4", &["src/store.rs"], &[EXPECTED]),
                     ],
                     check_only: false,
                 },
@@ -183,6 +217,75 @@ impl Fixture {
             .expect("bind");
 
         (run_id, session_id)
+    }
+
+    /// A run bound to the change by its slug, but naming no task — nothing
+    /// is held until a test calls [`Fixture::hold`]. For the trespass tests,
+    /// which need to choose which task each session holds rather than
+    /// inheriting `bound_run`'s fixed "1.3".
+    fn bound_run_unclaimed(&self) -> (RunId, SessionId) {
+        let (run_id, session_id) = self.unbound_run();
+
+        self.store
+            .bind_spec(
+                run_id,
+                &SpecBinding {
+                    change_id: Some(SLUG.into()),
+                    current_task: None,
+                },
+            )
+            .expect("bind");
+
+        (run_id, session_id)
+    }
+
+    /// Claims a task by naming it on a binding — the way production takes a
+    /// hold; there is no claim verb of its own.
+    fn hold(&self, run_id: RunId, current_task: &str) {
+        self.store
+            .bind_spec(
+                run_id,
+                &SpecBinding {
+                    change_id: None,
+                    current_task: Some(current_task.into()),
+                },
+            )
+            .expect("hold");
+    }
+
+    /// A second session joined to `run_id`, by binding to the same
+    /// workspace root, which `bind_session` resolves back to the run already
+    /// open on it. `write_binding`'s claim (`store.rs`) hands a hold to
+    /// whichever session on the run was seen most recently, so calling this
+    /// right before `hold` is what makes the claim land on the session it
+    /// just created rather than on whichever session held the previous task.
+    fn second_session(&self, run_id: RunId, hint: &str) -> SessionId {
+        let bound = self
+            .store
+            .bind_session(
+                hint,
+                &self.root,
+                "cap the retry loop",
+                HarnessKind::ClaudeCode,
+            )
+            .expect("bind second session");
+        assert_eq!(bound.run_id, run_id, "both sessions must share one run");
+        bound.session_id
+    }
+
+    /// The session currently claiming a task, read back to confirm
+    /// `second_session` actually won the hold it was meant to win, before a
+    /// test trusts anything built on that assumption.
+    fn holder_of(&self, change: ChangeId, task_number: &str) -> Option<SessionId> {
+        let claimed_by: Option<String> = self
+            .raw()
+            .query_row(
+                "SELECT claimed_by FROM tasks WHERE number = ?1 AND change_id = ?2",
+                rusqlite::params![task_number, change.to_string()],
+                |row| row.get(0),
+            )
+            .expect("one task row");
+        claimed_by.and_then(|id| id.parse().ok())
     }
 
     /// A checkpoint carrying a tick, under an `operation_id` the caller picks.
@@ -313,6 +416,16 @@ fn task(number: &str, covers: &[&str], markers: &[&str]) -> TaskDraft {
         verify_command: VERIFY.into(),
         expected_output: markers.iter().map(|marker| (*marker).to_string()).collect(),
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
+    }
+}
+
+/// Like `task`, but with the files it declares under the caller's control —
+/// for the trespass tests, which need a task declaring `src/store.rs` rather
+/// than `task`'s fixed `crates/worker/src/retry.rs`.
+fn task_declaring(number: &str, files: &[&str], markers: &[&str]) -> TaskDraft {
+    TaskDraft {
+        files: files.iter().map(|path| (*path).to_string()).collect(),
+        ..task(number, &[], markers)
     }
 }
 
@@ -1167,5 +1280,171 @@ fn a_checkpoint_takes_renews_and_releases_a_task() {
         still_held.as_deref(),
         Some(session_id.to_string().as_str()),
         "prose must not steal or drop a claim"
+    );
+}
+
+// --- closing a task refused over a trespass its edits recorded --------------
+//
+// `append_ledger` already stamps `file_ledger.trespass_on` when an edit lands
+// on a path another live hold declares (`store_contract.rs`). Closing the
+// task that made that edit does not check it yet — these tests are the red
+// half, and `StoreError::FileHeldByAnotherTask` does not exist until it does.
+// They will not even compile until then; once it lands they are run again to
+// see the *behaviour* fail, which is the state this task is meant to leave
+// them in.
+
+/// The absolute path a real harness hands the hook — not the relative one the
+/// plan records — landing on the file task "4" declares.
+const TRESPASS_EDIT: &str = "/tmp/project/src/store.rs";
+
+/// Session A holding task 3 and session B holding task 4 of
+/// `planned_change_for_trespass`, with session A's edit already recorded on
+/// the file task 4 declares — the setup all three trespass tests share.
+fn fixture_with_a_recorded_trespass() -> (Fixture, ChangeId, RunId, SessionId) {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change_for_trespass();
+    let (run_id, session_a) = fixture.bound_run_unclaimed();
+    fixture.hold(run_id, "3: cap the loop");
+
+    fixture.second_session(run_id, "harness-session-trespasser");
+    fixture.hold(run_id, "4: cap the loop");
+
+    assert_ne!(
+        fixture.holder_of(change, "3"),
+        fixture.holder_of(change, "4"),
+        "second_session must actually win task 4's hold, or this exercises \
+         self-trespass, not cross-session trespass"
+    );
+
+    fixture
+        .store
+        .append_ledger(
+            run_id,
+            session_a,
+            &FileLedgerEntry {
+                path: std::path::PathBuf::from(TRESPASS_EDIT),
+                tool: "Edit".into(),
+                observed_at: chrono::Utc::now(),
+            },
+        )
+        .expect("append ledger");
+
+    (fixture, change, run_id, session_a)
+}
+
+/// A tick that closes a task whose session trespassed onto a file another
+/// live hold declares must be refused, not filed as evidence: the file was
+/// not this task's alone to prove, and letting the close through would file
+/// the collision away as if it never happened.
+#[test]
+fn a_task_that_took_another_agents_file_is_refused() {
+    let (fixture, change, run_id, session_a) = fixture_with_a_recorded_trespass();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_a,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected the close to be refused over the recorded trespass");
+
+    let StoreError::FileHeldByAnotherTask {
+        number,
+        path,
+        holder,
+    } = &error
+    else {
+        panic!("expected the trespass to be reported, got {error:?}");
+    };
+    assert_eq!(number, "3");
+    assert_eq!(holder, "4");
+    assert!(
+        path.ends_with("src/store.rs"),
+        "expected the trespassed file to be named, got {path:?}"
+    );
+
+    let (status, _, _) = fixture.task_row(change, "3");
+    assert_eq!(
+        status, "running",
+        "the task is left open, not closed over a trespass"
+    );
+}
+
+/// A count alone tells a reader nothing to act on; the file itself belongs in
+/// the message. A separate test from the variant check above, so a Display
+/// impl that drops the path would be caught even if the fields never move.
+#[test]
+fn a_refusal_over_a_held_file_names_the_file() {
+    let (fixture, _change, run_id, session_a) = fixture_with_a_recorded_trespass();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_a,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected the close to be refused over the recorded trespass");
+
+    assert!(
+        error.to_string().contains("src/store.rs"),
+        "the refusal should name the file it was refused over: {error}"
+    );
+}
+
+/// The record was written while both holds were live; whether the other
+/// agent later went quiet says nothing about whether the edits collided. So a
+/// lapsed hold on the file task 4 declares must not excuse a trespass that
+/// `append_ledger` already recorded while that hold was still in force.
+#[test]
+fn a_holder_that_lapsed_does_not_excuse_the_trespass() {
+    let (fixture, change, run_id, session_a) = fixture_with_a_recorded_trespass();
+
+    // Scoped by change as well as by number, as `store_contract.rs`'s lapse
+    // tests are: `tasks_number` is `UNIQUE(change_id, number)`
+    // (`0009_tasks.sql`), not unique on the number alone.
+    fixture
+        .raw()
+        .execute(
+            "UPDATE tasks SET lease_until = ?1 WHERE number = ?2 AND change_id = ?3",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+                "4",
+                change.to_string(),
+            ],
+        )
+        .expect("lapse the other holder's lease into the past");
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_a,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("a holder going quiet since does not undo a recorded trespass");
+
+    assert!(
+        matches!(&error, StoreError::FileHeldByAnotherTask { number, .. } if number == "3"),
+        "expected the trespass to still be reported, got {error:?}"
+    );
+
+    let (status, _, _) = fixture.task_row(change, "3");
+    assert_eq!(
+        status, "running",
+        "the task is left open, not closed over a trespass"
     );
 }
