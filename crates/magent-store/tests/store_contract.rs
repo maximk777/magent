@@ -10,10 +10,12 @@ use std::{
 };
 
 use magent_core::{
-    CheckpointCommand, CheckpointOrigin, FileLedgerEntry, FinishAction, FinishRunCommand,
-    HarnessKind, OperationId, RunId, RunStatus, SessionId, StartRunCommand, WorkflowStage,
+    ChangeId, CheckpointCommand, CheckpointOrigin, Classification, DeltaOp, FileLedgerEntry,
+    FinishAction, FinishRunCommand, HarnessKind, OperationId, PlanCommand, ProposeCommand,
+    RequirementDraft, RunId, RunStatus, ScenarioDraft, SessionId, SpecBinding, SpecifyCommand,
+    StartRunCommand, TaskDraft, WorkflowStage,
 };
-use magent_store::{CURRENT_VERSION, Store, StoreError};
+use magent_store::{CURRENT_VERSION, FactContext, Store, StoreError};
 
 /// Set on a re-invocation of this test binary to make it act as a competing
 /// writer process instead of running assertions.
@@ -800,5 +802,325 @@ fn a_session_with_no_checkpoint_of_its_own_is_shown_the_runs() {
     assert_eq!(
         seen.handoff_summary, "where things stand",
         "the fallback is the run's latest, not silence"
+    );
+}
+
+// --- an edit stamped with the task its session holds ------------------------
+//
+// `append_ledger` does not stamp anything yet — that lands in the task after
+// this one. These tests are the red half: the fixture is built the way
+// production takes a hold (a checkpoint's binding, not a column written by
+// hand), so the failures below are honest.
+
+const HOLD_SLUG: &str = "hold-a-task-to-its-edits";
+const HOLD_CAPABILITY: &str = "worker/hold";
+const HOLD_REQUIREMENT: &str = "An edit is stamped with the task its session holds";
+const HOLD_VERIFY: &str = "cargo test -p magent-store --test store_contract an_edit";
+const HOLD_EXPECTED: &str = "test result: ok";
+/// Long enough to clear `magent-core`'s 50-character floor on a purpose.
+const HOLD_PURPOSE: &str = "Recording which task an edit was made for, so closing a task can \
+                             tell a real collision from noise instead of guessing at one.";
+
+/// The two tasks the stamping tests hold in turn.
+const TASK_THREE: &str = "3";
+const TASK_FOUR: &str = "4";
+/// `current_task` as a checkpoint's binding carries it — free text after the
+/// number, the shape `task_number_in` (`store.rs`) parses.
+const TASK_THREE_NAMED: &str = "3: whatever";
+const TASK_FOUR_NAMED: &str = "4: next";
+
+const EDIT_A: &str = "/tmp/project/src/a.rs";
+const EDIT_B: &str = "/tmp/project/src/b.rs";
+
+struct HoldFixture {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+    store: Store,
+    context: FactContext,
+    root: PathBuf,
+}
+
+impl HoldFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("magent.db");
+        let store = Store::open(&path).expect("open");
+
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let resolved = store.resolve_workspace_for(&root).expect("resolve");
+        let context = FactContext {
+            workspace_id: Some(resolved.workspace_id),
+            namespace: None,
+            ..FactContext::default()
+        };
+
+        Self {
+            _dir: dir,
+            path,
+            store,
+            context,
+            root,
+        }
+    }
+
+    /// A change carried to `planned`, with tasks "3" and "4" — the pair the
+    /// stamping tests hold in turn. Returns the id so a caller can scope a
+    /// query by it: `tasks_number` is `UNIQUE(change_id, number)`
+    /// (`0009_tasks.sql`), not unique on the number alone.
+    fn planned_change(&self) -> ChangeId {
+        let change = self
+            .store
+            .propose(
+                &ProposeCommand {
+                    operation_id: OperationId::new(),
+                    slug: HOLD_SLUG.into(),
+                    title: "Hold a task to its edits".into(),
+                    classification: Classification::Bounded,
+                    why: "An edit is not attributed to the task that made it.".into(),
+                    what_changes: vec!["Stamp the ledger with the held task".into()],
+                    capabilities: vec![HOLD_CAPABILITY.into()],
+                    impact: Some("None known.".into()),
+                    skip_specs: false,
+                },
+                &self.context,
+            )
+            .expect("propose")
+            .id;
+
+        self.store
+            .specify(
+                &SpecifyCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    capability_path: HOLD_CAPABILITY.into(),
+                    purpose: Some(HOLD_PURPOSE.into()),
+                    requirements: vec![RequirementDraft {
+                        op: DeltaOp::Added,
+                        name: HOLD_REQUIREMENT.into(),
+                        text: Some(
+                            "The store SHALL stamp an edit with the task its session holds.".into(),
+                        ),
+                        rename_to: None,
+                        reason: None,
+                        migration: None,
+                        scenarios: vec![ScenarioDraft {
+                            name: "a session holds a task".into(),
+                            given: None,
+                            when: "an edit lands under a live hold".into(),
+                            then: "the ledger names the task".into(),
+                        }],
+                    }],
+                },
+                &self.context,
+            )
+            .expect("specify");
+
+        self.store
+            .plan(
+                &PlanCommand {
+                    operation_id: OperationId::new(),
+                    change,
+                    tasks: vec![
+                        hold_task(TASK_THREE, &[HOLD_REQUIREMENT]),
+                        hold_task(TASK_FOUR, &[]),
+                    ],
+                    check_only: false,
+                },
+                &self.context,
+            )
+            .expect("plan");
+
+        change
+    }
+
+    /// A run of this workspace, bound to the change by its slug — but naming
+    /// no task, so nothing is held until a test says so.
+    fn bound_run(&self) -> (RunId, SessionId) {
+        let started = self
+            .store
+            .start_run(
+                &StartRunCommand {
+                    operation_id: OperationId::new(),
+                    task: "hold a task to its edits".into(),
+                    resume_run_id: None,
+                    external_session_hint: None,
+                    workspace_roots: vec![self.root.clone()],
+                },
+                HarnessKind::ClaudeCode,
+            )
+            .expect("start");
+
+        self.store
+            .bind_spec(
+                started.run_id,
+                &SpecBinding {
+                    change_id: Some(HOLD_SLUG.into()),
+                    current_task: None,
+                },
+            )
+            .expect("bind");
+
+        (started.run_id, started.session_id)
+    }
+
+    /// Claims a task by naming it on a binding, the way production takes a
+    /// hold — there is no claim verb of its own.
+    fn hold(&self, run_id: RunId, current_task: &str) {
+        self.store
+            .bind_spec(
+                run_id,
+                &SpecBinding {
+                    change_id: None,
+                    current_task: Some(current_task.into()),
+                },
+            )
+            .expect("hold");
+    }
+
+    /// A second connection to the same file, for reading back what the store
+    /// itself would never expose through its own API.
+    fn raw(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.path).expect("raw connection")
+    }
+}
+
+fn hold_task(number: &str, covers: &[&str]) -> TaskDraft {
+    TaskDraft {
+        number: number.into(),
+        title: format!("Hold a task to its edits, step {number}"),
+        body: Some("Stamp the ledger with the task the session holds.".into()),
+        files: vec!["crates/magent-store/src/store.rs".into()],
+        consumes: Vec::new(),
+        produces: vec!["fn append_ledger(&self, ...) -> Result<(), StoreError>".into()],
+        verify_command: HOLD_VERIFY.into(),
+        expected_output: vec![HOLD_EXPECTED.to_string()],
+        covers: covers.iter().map(|name| (*name).to_string()).collect(),
+    }
+}
+
+fn edit_at(path: &str) -> FileLedgerEntry {
+    FileLedgerEntry {
+        path: PathBuf::from(path),
+        tool: "Edit".into(),
+        observed_at: chrono::Utc::now(),
+    }
+}
+
+/// The task number an edit was stamped with, read back through the number
+/// rather than the id — so an assertion says something a reader recognises.
+fn stamped_task(connection: &rusqlite::Connection, path: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT t.number FROM file_ledger l
+             LEFT JOIN tasks t ON t.id = l.task_id
+             WHERE l.path = ?1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        )
+        .expect("one ledger row for this path")
+}
+
+#[test]
+fn an_edit_is_stamped_with_the_task_its_session_holds() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    fixture
+        .store
+        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .expect("append ledger");
+
+    assert_eq!(
+        stamped_task(&fixture.raw(), EDIT_A),
+        Some(TASK_THREE.into()),
+        "the edit is stamped with the task the session holds"
+    );
+}
+
+#[test]
+fn an_edit_under_no_hold_is_stamped_with_nothing() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    fixture
+        .store
+        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .expect("append ledger");
+
+    assert_eq!(
+        stamped_task(&fixture.raw(), EDIT_A),
+        None,
+        "an edit under no hold names no task"
+    );
+}
+
+#[test]
+fn an_edit_after_the_lease_ran_out_is_stamped_with_nothing() {
+    let fixture = HoldFixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+    fixture.hold(run_id, TASK_THREE_NAMED);
+
+    // Scoped by change as well as by number: `tasks_number` is
+    // `UNIQUE(change_id, number)` (`0009_tasks.sql`), not unique on the
+    // number alone, so an unscoped UPDATE would as happily lapse a task "3"
+    // belonging to a different change.
+    fixture
+        .raw()
+        .execute(
+            "UPDATE tasks SET lease_until = ?1 WHERE number = ?2 AND change_id = ?3",
+            rusqlite::params![
+                (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339(),
+                TASK_THREE,
+                change.to_string(),
+            ],
+        )
+        .expect("lapse the hold");
+
+    fixture
+        .store
+        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .expect("append ledger");
+
+    assert_eq!(
+        stamped_task(&fixture.raw(), EDIT_A),
+        None,
+        "a lapsed hold stamps nothing"
+    );
+}
+
+/// The test that would still pass if the task were resolved at read time
+/// instead of write time — so it is the one worth having.
+#[test]
+fn two_tasks_in_turn_each_get_their_own_edits() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    fixture.hold(run_id, TASK_THREE_NAMED);
+    fixture
+        .store
+        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .expect("append ledger a");
+
+    fixture.hold(run_id, TASK_FOUR_NAMED);
+    fixture
+        .store
+        .append_ledger(run_id, session_id, &edit_at(EDIT_B))
+        .expect("append ledger b");
+
+    assert_eq!(
+        stamped_task(&fixture.raw(), EDIT_A),
+        Some(TASK_THREE.into()),
+        "the first edit still names the task held when it landed"
+    );
+    assert_eq!(
+        stamped_task(&fixture.raw(), EDIT_B),
+        Some(TASK_FOUR.into()),
+        "the second edit names the task held when it landed"
     );
 }
