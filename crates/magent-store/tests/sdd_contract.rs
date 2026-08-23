@@ -2939,3 +2939,29 @@ fn a_ready_change_can_still_be_replanned() {
         "the two ticks taken under the plan that was replaced are still recorded"
     );
 }
+
+/// A task consuming an artifact nothing in the plan produces.
+#[test]
+fn a_consumed_artifact_nothing_produces_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+    drop(path);
+
+    let mut consumer = task("2", &[REQUIREMENT]);
+    consumer.produces = Vec::new();
+    consumer.consumes = vec!["RetryBudget::take(&mut self) -> bool".into()];
+
+    let error = store
+        .plan(
+            &plan_command(change, vec![task("1", &[REQUIREMENT]), consumer]),
+            &ctx,
+        )
+        .expect_err("a consumes nothing produces must be refused");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("RetryBudget::take(&mut self) -> bool"),
+        "the refusal must name the unmatched entry, said: {rendered}"
+    );
+}
