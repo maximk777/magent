@@ -2965,3 +2965,31 @@ fn a_consumed_artifact_nothing_produces_is_refused() {
         "the refusal must name the unmatched entry, said: {rendered}"
     );
 }
+
+/// Both entries match a produces, so 2.2's gate passes and only the cycle is
+/// left to catch.
+#[test]
+fn a_plan_whose_tasks_wait_on_each_other_is_refused() {
+    let (dir, path, store) = temp_store();
+    let ctx = context(&store, dir.path());
+    let change = specified_change(&store, &ctx, "add-retry-budget", REQUIREMENT);
+    drop(path);
+
+    let mut first = task("1", &[REQUIREMENT]);
+    first.produces = vec!["fn a()".into()];
+    first.consumes = vec!["fn b()".into()];
+
+    let mut second = task("2", &[REQUIREMENT]);
+    second.produces = vec!["fn b()".into()];
+    second.consumes = vec!["fn a()".into()];
+
+    let error = store
+        .plan(&plan_command(change, vec![first, second]), &ctx)
+        .expect_err("a cycle is not a plan and must be refused");
+
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains('1') && rendered.contains('2'),
+        "the refusal must name the tasks in the cycle, said: {rendered}"
+    );
+}
