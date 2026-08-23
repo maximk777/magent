@@ -76,8 +76,26 @@ skipped a check, leave the task open and say which and why.
 Preferred for any plan longer than a few tasks: context degrades over a long
 plan, and a fresh subagent per task does not inherit the degradation.
 
-Dispatch one implementer per task — never two in parallel, they collide — then
-review in two stages before moving on.
+Dispatch one implementer per task, then review in two stages before moving on.
+
+**Take the work from the ready set.** `magent_changes` naming the change reports
+which tasks may be started now — every artifact they consume has been produced
+by a task already closed — and each one names the other ready tasks it shares a
+file with. Dispatch as many as you like provided no two of them name each other.
+That list is why there is no longer a ban on working in parallel: the collision
+the ban warned about is a fact the store reports rather than a risk you have to
+hold in mind.
+
+Read the plan's shape before briefing anybody. A width of 1 says the plan is a
+chain and there is nothing to offer, and saying so beats briefing four agents
+for work that turns out to be sequential. Parallel execution costs more tokens
+rather than fewer — orientation is duplicated into every agent, review
+multiplies, merging is added — so what it buys is wall-clock time and less
+context degradation, and that trade is worth naming out loud before it is made.
+
+The ready set is recomputed against what is closed, so read it again after each
+task rather than planning waves up front: a wave is a barrier, and the quick
+tasks in one wait on the slowest for nothing.
 
 **Give the subagent the task's full text.** Do not tell it to look the task up.
 You have the text already; making it fetch the plan costs a tool call and lets

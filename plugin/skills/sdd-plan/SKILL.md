@@ -86,7 +86,7 @@ magent_plan { change: "add-retry-budget",
                          has no constructor yet — a failure naming anything
                          else in the test file is a bug in the test.",
                   files: ["tests/budget.rs"],
-                  produces: "the test budget::caps_attempts, failing",
+                  produces: ["the test budget::caps_attempts, failing"],
                   verify_command: "cargo test budget::caps_attempts",
                   expected_output: ["no function or associated item named `new`",
                                     "RetryBudget"],
@@ -97,8 +97,9 @@ magent_plan { change: "add-retry-budget",
                          counting down and returning false once the count is
                          spent. No clock and no jitter yet; 2.1 adds those.",
                   files: ["src/budget.rs", "src/lib.rs"],
-                  consumes: "the test budget::caps_attempts from 1.1",
-                  produces: "RetryBudget::new(u32), RetryBudget::take(&mut self) -> bool",
+                  consumes: ["the test budget::caps_attempts, failing"],
+                  produces: ["RetryBudget::new(max: u32)",
+                             "RetryBudget::take(&mut self) -> bool"],
                   verify_command: "cargo test budget",
                   expected_output: ["test result: ok", "caps_attempts ... ok"],
                   covers: ["A retry budget caps attempts"] } ] }
@@ -106,9 +107,25 @@ magent_plan { change: "add-retry-budget",
 
 `number`, `title`, `verify_command` and `expected_output` are required on every
 task; `body`, `files`, `consumes`, `produces` and `covers` are what make it
-executable by someone who cannot see the rest of the plan. `consumes` and
-`produces` repeat the exact names and signatures across the seam, because the
-agent doing 1.2 never sees 1.1.
+executable by someone who cannot see the rest of the plan.
+
+`consumes` and `produces` are lists of artifact names, and one entry is one
+exact name. The identical string appears in the producing task's `produces` and
+the consuming task's `consumes` — look at 1.1 and 1.2 above, where the failing
+test is named the same way twice. That repetition is the point rather than
+duplication: the agent doing 1.2 never sees 1.1, so a name written differently
+is a name it cannot find, and exact equality is what lets the store match them
+at all.
+
+Two refusals follow from it. A `consumes` entry no task in the plan `produces`
+is refused and named, because an agent told to build on something nobody makes
+will guess, and guess plausibly. A plan whose tasks wait on each other is
+refused with the tasks in the cycle named, because no task in it can ever be
+first — including a task that consumes what it produces itself.
+
+What this buys is the reason to be exact: from those edges the store computes
+what may be started now and how wide the plan could ever run, so whether two
+tasks can go side by side stops being a judgement and becomes a query.
 
 `expected_output` is one or more markers, and a marker is a string the command
 will print verbatim — the invariant fragments of a line rather than the line
