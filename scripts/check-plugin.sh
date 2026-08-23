@@ -323,6 +323,32 @@ for source in crates/magent-mcp/src/*.rs; do
   fi
 done
 
+# --- the skills teach the contract the store now matches on -----------------
+
+# consumes and produces are matched by exact string equality, so the example
+# every future plan is copied from has to show lists. expected_output spent
+# sixteen tasks as one line of prose that no output could contain because its
+# example showed a string; this is that lesson applied before it happens twice.
+if [ -f plugin/skills/sdd-plan/SKILL.md ]; then
+  if grep -qE '(consumes|produces): "' plugin/skills/sdd-plan/SKILL.md; then
+    fail "sdd-plan shows consumes or produces as a string; they are lists of artifact names, and a plan copied from that example is refused"
+  fi
+  if ! grep -q 'consumes: \[' plugin/skills/sdd-plan/SKILL.md; then
+    fail "sdd-plan no longer shows consumes as a list, so nothing teaches the shape magent_plan accepts"
+  fi
+fi
+
+# The instruction this change makes false. A skill is read before the work, so a
+# wrong line there is followed rather than noticed.
+if [ -f plugin/skills/sdd-execute/SKILL.md ]; then
+  if grep -qi 'never two in parallel' plugin/skills/sdd-execute/SKILL.md; then
+    fail "sdd-execute still forbids dispatching two implementers at once; the store now reports which tasks collide, so the ban is both false and unnecessary"
+  fi
+  if ! grep -q 'ready' plugin/skills/sdd-execute/SKILL.md; then
+    fail "sdd-execute never mentions the ready set, so nothing tells it how to pick the next task"
+  fi
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo >&2
   echo "$failures problem(s): a clean install of this plugin would not work." >&2
