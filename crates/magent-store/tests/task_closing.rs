@@ -1285,13 +1285,10 @@ fn a_checkpoint_takes_renews_and_releases_a_task() {
 
 // --- closing a task refused over a trespass its edits recorded --------------
 //
-// `append_ledger` already stamps `file_ledger.trespass_on` when an edit lands
-// on a path another live hold declares (`store_contract.rs`). Closing the
-// task that made that edit does not check it yet — these tests are the red
-// half, and `StoreError::FileHeldByAnotherTask` does not exist until it does.
-// They will not even compile until then; once it lands they are run again to
-// see the *behaviour* fail, which is the state this task is meant to leave
-// them in.
+// `append_ledger` stamps `file_ledger.trespass_on` when an edit lands on a
+// path another live hold declares (`store_contract.rs`), and `close_task`
+// (`store.rs`) refuses to let that collision be filed as a clean piece of
+// work.
 
 /// The absolute path a real harness hands the hook — not the relative one the
 /// plan records — landing on the file task "4" declares.
@@ -1299,14 +1296,17 @@ const TRESPASS_EDIT: &str = "/tmp/project/src/store.rs";
 
 /// Session A holding task 3 and session B holding task 4 of
 /// `planned_change_for_trespass`, with session A's edit already recorded on
-/// the file task 4 declares — the setup all three trespass tests share.
-fn fixture_with_a_recorded_trespass() -> (Fixture, ChangeId, RunId, SessionId) {
+/// the file task 4 declares — the setup every trespass test in this file
+/// shares. Both session ids travel: A is the one whose close the trespass
+/// tests refuse, B is the one a clean close needs to prove task 4 is not
+/// swept up in a collision that was never its own.
+fn fixture_with_a_recorded_trespass() -> (Fixture, ChangeId, RunId, SessionId, SessionId) {
     let fixture = Fixture::new();
     let change = fixture.planned_change_for_trespass();
     let (run_id, session_a) = fixture.bound_run_unclaimed();
     fixture.hold(run_id, "3: cap the loop");
 
-    fixture.second_session(run_id, "harness-session-trespasser");
+    let session_b = fixture.second_session(run_id, "harness-session-trespasser");
     fixture.hold(run_id, "4: cap the loop");
 
     assert_ne!(
@@ -1329,16 +1329,20 @@ fn fixture_with_a_recorded_trespass() -> (Fixture, ChangeId, RunId, SessionId) {
         )
         .expect("append ledger");
 
-    (fixture, change, run_id, session_a)
+    (fixture, change, run_id, session_a, session_b)
 }
 
 /// A tick that closes a task whose session trespassed onto a file another
 /// live hold declares must be refused, not filed as evidence: the file was
 /// not this task's alone to prove, and letting the close through would file
-/// the collision away as if it never happened.
+/// the collision away as if it never happened. Nothing about the refusal
+/// leaves a mark: the task is left `running` with no evidence and no
+/// `verified_at`, exactly as `a_tick_with_another_command_is_refused_and_leaves_the_task_open`
+/// checks a verify-command refusal does, and the journal gains no row, exactly
+/// as `a_refused_tick_writes_no_journal_row` checks for that refusal.
 #[test]
 fn a_task_that_took_another_agents_file_is_refused() {
-    let (fixture, change, run_id, session_a) = fixture_with_a_recorded_trespass();
+    let (fixture, change, run_id, session_a, _session_b) = fixture_with_a_recorded_trespass();
 
     let error = fixture
         .checkpoint(
@@ -1368,10 +1372,25 @@ fn a_task_that_took_another_agents_file_is_refused() {
         "expected the trespassed file to be named, got {path:?}"
     );
 
-    let (status, _, _) = fixture.task_row(change, "3");
+    let (status, evidence, verified_at) = fixture.task_row(change, "3");
     assert_eq!(
         status, "running",
         "the task is left open, not closed over a trespass"
+    );
+    assert_eq!(
+        evidence, None,
+        "a refused close must not file the trespass as evidence"
+    );
+    assert_eq!(
+        verified_at, None,
+        "and it must not be recorded as verified either"
+    );
+
+    assert_eq!(
+        row_count(&fixture.raw(), "task_ticks"),
+        0,
+        "a refused tick, over a trespass as over any other refusal, is not \
+         something that happened"
     );
 }
 
@@ -1380,7 +1399,7 @@ fn a_task_that_took_another_agents_file_is_refused() {
 /// impl that drops the path would be caught even if the fields never move.
 #[test]
 fn a_refusal_over_a_held_file_names_the_file() {
-    let (fixture, _change, run_id, session_a) = fixture_with_a_recorded_trespass();
+    let (fixture, _change, run_id, session_a, _session_b) = fixture_with_a_recorded_trespass();
 
     let error = fixture
         .checkpoint(
@@ -1407,7 +1426,7 @@ fn a_refusal_over_a_held_file_names_the_file() {
 /// `append_ledger` already recorded while that hold was still in force.
 #[test]
 fn a_holder_that_lapsed_does_not_excuse_the_trespass() {
-    let (fixture, change, run_id, session_a) = fixture_with_a_recorded_trespass();
+    let (fixture, change, run_id, session_a, _session_b) = fixture_with_a_recorded_trespass();
 
     // Scoped by change as well as by number, as `store_contract.rs`'s lapse
     // tests are: `tasks_number` is `UNIQUE(change_id, number)`
@@ -1446,5 +1465,72 @@ fn a_holder_that_lapsed_does_not_excuse_the_trespass() {
     assert_eq!(
         status, "running",
         "the task is left open, not closed over a trespass"
+    );
+}
+
+/// The trespass query in `close_task` (`store.rs`) is scoped by `t.number`,
+/// so a collision recorded against task 3 must not reach task 4's own close —
+/// the fourth scenario the requirement states. Task 4 never trespassed
+/// anything; it is proven with its own plan-named command, and the fact that
+/// an unrelated row in the same change's `file_ledger` carries a trespass
+/// must not be visible to it at all.
+#[test]
+fn a_clean_close_is_not_refused_by_an_unrelated_trespass() {
+    let (fixture, change, run_id, _session_a, session_b) = fixture_with_a_recorded_trespass();
+
+    let result = fixture
+        .checkpoint(
+            run_id,
+            session_b,
+            OperationId::new(),
+            TaskDone {
+                number: "4".into(),
+                verify_command: VERIFY.into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect("task 4's own close must not be refused by task 3's trespass");
+
+    let closed = result.task.expect("the checkpoint closed a task");
+    assert_eq!(closed.number, "4");
+
+    let (status, evidence, verified_at) = fixture.task_row(change, "4");
+    assert_eq!(status, "done", "task 4 closes on its own merits");
+    assert!(evidence.is_some() && verified_at.is_some());
+}
+
+/// `close_task`'s doc comment (`store.rs`) states its refusals fire in one
+/// order: the run's binding, then the slug, then the number, then the
+/// command, then the ledger. A task that is both trespassing and ticking with
+/// a command the plan never named must be reported for the command, not the
+/// trespass — otherwise that ordering is a claim in prose nobody checks.
+#[test]
+fn a_wrong_command_is_reported_before_a_trespass() {
+    let (fixture, change, run_id, session_a, _session_b) = fixture_with_a_recorded_trespass();
+
+    let error = fixture
+        .checkpoint(
+            run_id,
+            session_a,
+            OperationId::new(),
+            TaskDone {
+                number: "3".into(),
+                verify_command: "cargo test -p worker".into(),
+                output: format!("{EXPECTED}\n"),
+            },
+        )
+        .expect_err("expected the wrong command to be refused ahead of the trespass");
+
+    assert!(
+        matches!(&error, StoreError::VerifyCommandMismatch { number, expected }
+            if number == "3" && expected == VERIFY),
+        "the command check comes before the ledger check, so this refusal \
+         must be about the command, got {error:?}"
+    );
+
+    let (status, _, _) = fixture.task_row(change, "3");
+    assert_eq!(
+        status, "running",
+        "the task is left open, not closed over either refusal"
     );
 }
