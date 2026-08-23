@@ -1095,3 +1095,73 @@ fn closing_a_task_twice_keeps_both_ticks() {
         "both runs are on the record, in the order they happened"
     );
 }
+
+/// The hold a checkpoint takes on the task it names.
+fn hold_of(
+    fixture: &Fixture,
+    change: ChangeId,
+    number: &str,
+) -> (String, Option<String>, Option<String>) {
+    fixture
+        .raw()
+        .query_row(
+            "SELECT status, claimed_by, lease_until FROM tasks
+             WHERE change_id = ?1 AND number = ?2",
+            rusqlite::params![change.to_string(), number],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("task row")
+}
+
+/// Taking, renewing and letting go, in one test because they share a plan.
+#[test]
+fn a_checkpoint_takes_renews_and_releases_a_task() {
+    let fixture = Fixture::new();
+    let change = fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    let naming = |task: &str| {
+        Some(SpecBinding {
+            change_id: None,
+            current_task: Some(task.to_owned()),
+        })
+    };
+
+    fixture
+        .store
+        .bind_spec(run_id, &naming("1.3: cap the loop").expect("binding"))
+        .expect("claim by naming");
+
+    let (status, held_by, until) = hold_of(&fixture, change, "1.3");
+    assert_eq!(status, "running", "a task in hand is running");
+    assert_eq!(
+        held_by.as_deref(),
+        Some(session_id.to_string().as_str()),
+        "the claim belongs to the session that named it"
+    );
+    let first_lease = until.expect("a claim has an end");
+
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fixture
+        .store
+        .bind_spec(run_id, &naming("1.3: cap the loop").expect("binding"))
+        .expect("renew");
+    let (_, _, renewed) = hold_of(&fixture, change, "1.3");
+    assert!(
+        renewed.expect("still held") > first_lease,
+        "a second checkpoint pushes the hold out"
+    );
+
+    // Prose naming no task claims nothing, and is not an error. `current_task`
+    // is free text and carries work that is not a task at all.
+    fixture
+        .store
+        .bind_spec(run_id, &naming("архивация").expect("binding"))
+        .expect("prose is not an error");
+    let (_, still_held, _) = hold_of(&fixture, change, "1.3");
+    assert_eq!(
+        still_held.as_deref(),
+        Some(session_id.to_string().as_str()),
+        "prose must not steal or drop a claim"
+    );
+}
