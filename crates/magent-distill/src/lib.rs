@@ -60,20 +60,41 @@ pub trait Distiller {
     fn distill(&self, request: &DistillRequest) -> anyhow::Result<Distillation>;
 }
 
+/// How long one distillation may run before its child is stopped.
+///
+/// Shared by [`WorkerConfig`] and the engine's own default so the two cannot be
+/// set to different numbers by accident. Three minutes: the work is one model
+/// call over a transcript tail, and a call that has not answered in three
+/// minutes was not going to.
+pub const DISTILLATION_TIMEOUT: Duration = Duration::from_mins(3);
+
 #[derive(Clone, Copy, Debug)]
 pub struct WorkerConfig {
-    /// How long a claimed job stays invisible to other workers.
-    pub lease: Duration,
+    /// How long one distillation may run before its child is killed.
+    pub distillation_timeout: Duration,
     /// How long a failed job waits before it is offered again.
     pub retry_backoff: Duration,
+}
+
+impl WorkerConfig {
+    /// How long a claimed job stays invisible to other workers.
+    ///
+    /// Derived rather than stated. A lease shorter than the bound would hand
+    /// the same job to a second worker while the first is still running and
+    /// still going to write its result — the failure the lease exists to
+    /// prevent, turned inside out. Arithmetic cannot drift; the sentence that
+    /// stood here instead already had, because nothing bounded a distillation
+    /// at all.
+    #[must_use]
+    pub fn lease(&self) -> Duration {
+        self.distillation_timeout * 2
+    }
 }
 
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            // Comfortably longer than a distillation, short enough that a
-            // killed worker's job is picked up while it still matters.
-            lease: Duration::from_mins(5),
+            distillation_timeout: DISTILLATION_TIMEOUT,
             retry_backoff: Duration::from_mins(1),
         }
     }
@@ -112,7 +133,7 @@ pub fn run_once(
     distiller: &dyn Distiller,
     config: &WorkerConfig,
 ) -> anyhow::Result<Outcome> {
-    let Some(job) = store.claim_job(ENRICH_JOB, config.lease)? else {
+    let Some(job) = store.claim_job(ENRICH_JOB, config.lease())? else {
         return Ok(Outcome::Idle);
     };
 

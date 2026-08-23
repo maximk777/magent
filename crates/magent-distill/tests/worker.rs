@@ -28,9 +28,13 @@ const LEASE: Duration = Duration::from_mins(1);
 
 /// Backoff is a parameter rather than a constant so tests can drive the retry
 /// path without sleeping, and without a test-only hook on the store.
-fn config(lease: Duration) -> WorkerConfig {
+///
+/// Takes the bound rather than the lease, because the lease is derived from it
+/// now: a caller that could set the two apart is exactly what this change
+/// removed.
+fn config(distillation_timeout: Duration) -> WorkerConfig {
     WorkerConfig {
-        lease,
+        distillation_timeout,
         retry_backoff: Duration::ZERO,
     }
 }
