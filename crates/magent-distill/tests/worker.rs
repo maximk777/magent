@@ -394,3 +394,106 @@ fn the_lease_outlasts_the_bound_it_exists_to_survive() {
         "the relationship must hold for any bound, not only the shipped one"
     );
 }
+
+// --- the bound on a child --------------------------------------------------
+
+/// A stand-in for `claude`, so these tests never call a model.
+fn fake_claude(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write the fake");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+/// The bound under test. Short enough that a test waits a second rather than
+/// three minutes, and the margin below is what tells a bound that worked from
+/// one that never fired.
+const TEST_BOUND: Duration = Duration::from_secs(1);
+const MARGIN: Duration = Duration::from_secs(10);
+
+fn request_for(fixture: &Fixture) -> DistillRequest {
+    DistillRequest {
+        run_id: fixture.run_id,
+        session_id: fixture.session_id,
+        task: "fix the payment timeout".into(),
+        transcript: fixture.transcript.clone(),
+    }
+}
+
+#[test]
+fn a_child_that_never_exits_is_stopped_at_the_bound() {
+    let fixture = Fixture::new();
+    let binary = fake_claude(
+        fixture.transcript.parent().expect("dir"),
+        "sleeper",
+        "sleep 600",
+    );
+    let engine = ClaudeHeadless::new(binary, "haiku".into(), TEST_BOUND);
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .distill(&request_for(&fixture))
+        .expect_err("a child past its bound must fail");
+
+    assert!(
+        started.elapsed() < MARGIN,
+        "the bound never fired: took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.to_string().to_lowercase().contains("within"),
+        "the failure must name the bound: {error}"
+    );
+}
+
+/// The test that tells a real bound from a decorative one.
+///
+/// A pipe holds about sixty-four kilobytes. This child writes far more and then
+/// hangs, so it blocks in `write` unless the worker drains it — and a worker
+/// polling for exit while nobody reads would wait for ever on exactly the child
+/// the bound exists to catch.
+#[test]
+fn a_child_that_floods_its_pipe_and_hangs_is_still_stopped() {
+    let fixture = Fixture::new();
+    let binary = fake_claude(
+        fixture.transcript.parent().expect("dir"),
+        "flooder",
+        "head -c 1000000 /dev/zero | tr '\\0' 'x'; sleep 600",
+    );
+    let engine = ClaudeHeadless::new(binary, "haiku".into(), TEST_BOUND);
+
+    let started = std::time::Instant::now();
+    let error = engine
+        .distill(&request_for(&fixture))
+        .expect_err("a flooding child past its bound must fail");
+
+    assert!(
+        started.elapsed() < MARGIN,
+        "the worker blocked on the undrained pipe: took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        error.to_string().to_lowercase().contains("within"),
+        "the failure must name the bound: {error}"
+    );
+}
+
+#[test]
+fn a_child_that_answers_at_once_is_never_stopped() {
+    let fixture = Fixture::new();
+    let reply = r#"{\"handoff_summary\":\"did the thing\",\"completed_steps\":[],\"next_steps\":[],\"decisions\":[],\"rejected\":[],\"verification\":[],\"risks\":[]}"#;
+    let binary = fake_claude(
+        fixture.transcript.parent().expect("dir"),
+        "prompt-answer",
+        &format!(r#"printf '%s' '{{"is_error":false,"result":"{reply}"}}'"#),
+    );
+    let engine = ClaudeHeadless::new(binary, "haiku".into(), TEST_BOUND);
+
+    let distillation = engine
+        .distill(&request_for(&fixture))
+        .expect("a child inside its bound is left alone");
+
+    assert_eq!(distillation.handoff_summary, "did the thing");
+}
