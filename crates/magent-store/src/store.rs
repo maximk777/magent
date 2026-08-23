@@ -1107,9 +1107,10 @@ fn write_binding(
 ///
 /// Every refusal below comes before the `UPDATE`, and they come in this order:
 /// the run's binding, then what the slug resolves to, then the number, then the
-/// command. Cheapest and most fundamental first, so a caller whose run is
-/// unbound is told that rather than told its number is unknown — which would be
-/// true, and would send it to fix the wrong thing.
+/// command, then the ledger. Cheapest and most fundamental first, so a caller
+/// whose run is unbound is told that rather than told its number is unknown —
+/// which would be true, and would send it to fix the wrong thing. The ledger
+/// check comes last because it is the only one that reads another table.
 fn close_task(
     tx: &Transaction<'_>,
     run_id: RunId,
@@ -1165,6 +1166,28 @@ fn close_task(
         return Err(StoreError::VerifyCommandMismatch {
             number: done.number.clone(),
             expected: verify_command,
+        });
+    }
+
+    // Read against what was recorded, not against what the closer reports —
+    // the same principle as the command check above. The earliest row wins:
+    // one collision is enough to stop the tick, and naming the first keeps the
+    // message about a file rather than a list.
+    let trespass: Option<(String, String)> = tx
+        .query_row(
+            "SELECT l.path, l.trespass_on FROM file_ledger l
+             JOIN tasks t ON t.id = l.task_id
+             WHERE t.change_id = ?1 AND t.number = ?2 AND l.trespass_on IS NOT NULL
+             ORDER BY l.id LIMIT 1",
+            rusqlite::params![&change_id, &done.number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((path, holder)) = trespass {
+        return Err(StoreError::FileHeldByAnotherTask {
+            number: done.number.clone(),
+            path,
+            holder,
         });
     }
 

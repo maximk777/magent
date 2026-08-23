@@ -345,6 +345,25 @@ pub enum StoreError {
          proves nothing about it"
     )]
     VerifyCommandMismatch { number: String, expected: String },
+
+    /// A task edited a file another session was holding for its own task.
+    ///
+    /// Late by construction: the hook sees an edit only after the tool has made
+    /// it, so nothing can stop the edit itself. What closing time can do is
+    /// refuse to file a collision as a clean piece of work, and make somebody
+    /// look at it before the plan reads as tidy.
+    ///
+    /// The other task's number travels because it is who to go and talk to, and
+    /// the path because a refusal naming only a count is one nobody can act on.
+    #[error(
+        "task {number} edited {path}, which task {holder} was holding at the time; \
+         closing it would file a collision as clean work"
+    )]
+    FileHeldByAnotherTask {
+        number: String,
+        path: String,
+        holder: String,
+    },
 }
 
 /// The tail of [`StoreError::ChangeNotExecuted`]'s message.
@@ -433,6 +452,7 @@ impl StoreError {
             Self::ChangeSlugNotFound(_) => "change_slug_not_found",
             Self::TaskNotFound { .. } => "task_not_found",
             Self::VerifyCommandMismatch { .. } => "verify_command_mismatch",
+            Self::FileHeldByAnotherTask { .. } => "file_held_by_another_task",
         }
     }
 }
