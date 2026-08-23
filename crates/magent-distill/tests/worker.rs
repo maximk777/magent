@@ -448,35 +448,41 @@ fn a_child_that_never_exits_is_stopped_at_the_bound() {
     );
 }
 
-/// The test that tells a real bound from a decorative one.
+/// The test that tells draining from not draining.
 ///
 /// A pipe holds about sixty-four kilobytes. This child writes far more and then
-/// hangs, so it blocks in `write` unless the worker drains it — and a worker
-/// polling for exit while nobody reads would wait for ever on exactly the child
-/// the bound exists to catch.
+/// exits cleanly, so without a reader it blocks in `write`, never exits on its
+/// own, and is killed at the bound — a perfectly good answer thrown away for
+/// being long. Stopping the process group closes the pipes either way, so the
+/// bound fires with or without draining; what draining buys is this child
+/// succeeding at all.
 #[test]
-fn a_child_that_floods_its_pipe_and_hangs_is_still_stopped() {
+fn a_child_whose_answer_outgrows_a_pipe_still_succeeds() {
     let fixture = Fixture::new();
     let binary = fake_claude(
         fixture.transcript.parent().expect("dir"),
-        "flooder",
-        "head -c 1000000 /dev/zero | tr '\\0' 'x'; sleep 30",
+        "windbag",
+        concat!(
+            // `printf '%s'` rather than a bare format string: printf processes
+            // backslash escapes in a format, which ate the ones holding the
+            // inner JSON together and produced an envelope nothing could parse.
+            r#"printf '%s' '{"is_error":false,"result":"{\"handoff_summary\":\"'"#,
+            "\n",
+            r#"head -c 100000 /dev/zero | tr '\0' 'x'"#,
+            "\n",
+            r#"printf '%s' '\",\"completed_steps\":[],\"next_steps\":[],\"decisions\":[],\"rejected\":[],\"verification\":[],\"risks\":[]}"}'"#,
+        ),
     );
     let engine = ClaudeHeadless::new(binary, "haiku".into(), TEST_BOUND);
 
-    let started = std::time::Instant::now();
-    let error = engine
+    let distillation = engine
         .distill(&request_for(&fixture))
-        .expect_err("a flooding child past its bound must fail");
+        .expect("an answer larger than a pipe buffer is still an answer");
 
-    assert!(
-        started.elapsed() < MARGIN,
-        "the worker blocked on the undrained pipe: took {:?}",
-        started.elapsed()
-    );
-    assert!(
-        error.to_string().to_lowercase().contains("within"),
-        "the failure must name the bound: {error}"
+    assert_eq!(
+        distillation.handoff_summary.len(),
+        100_000,
+        "the whole answer must come back, not the first pipeful"
     );
 }
 
