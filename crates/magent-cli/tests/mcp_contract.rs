@@ -2707,7 +2707,7 @@ fn loop_tasks() -> Value {
                 "title": "cap the attempts in the worker",
                 "body": "Read the budget from config and refuse a retry once it is spent.",
                 "files": ["crates/worker/src/retry.rs"],
-                "produces": "fn spend_budget(&mut self) -> bool",
+                "produces": ["fn spend_budget(&mut self) -> bool"],
                 "verify_command": "cargo test -p worker budget",
                 "expected_output": ["test budget_caps_retries ... ok"],
                 "covers": ["budget-caps-retries"]
@@ -2717,7 +2717,7 @@ fn loop_tasks() -> Value {
                 "title": "charge every attempt against the budget",
                 "body": "Call spend_budget from the attempt path, once per attempt.",
                 "files": ["crates/worker/src/attempt.rs"],
-                "consumes": "fn spend_budget(&mut self) -> bool, from task 1",
+                "consumes": ["fn spend_budget(&mut self) -> bool"],
                 "verify_command": "cargo test -p worker attempt",
                 "expected_output": ["test attempts_spend_the_budget ... ok"],
                 "covers": ["attempts-spend-the-budget"]

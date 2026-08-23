@@ -223,10 +223,11 @@ pub struct TaskSummary {
     /// given rather than the JSON `files_json` stores it as: a caller that had
     /// to parse that string would be doing this module's job.
     pub files: Vec<String>,
-    /// The names and signatures the task before this one promised, and what
-    /// the next task is waiting on this one to produce.
-    pub consumes: Option<String>,
-    pub produces: Option<String>,
+    /// The artifacts the task before this one promised, and what the next task
+    /// is waiting on this one to produce. Handed over as the lists `plan` was
+    /// given, for the reason `files` gives above.
+    pub consumes: Vec<String>,
+    pub produces: Vec<String>,
     /// The markers `verify_command`'s output should contain, which is half of
     /// the instruction — a command with no stated result is one an executor
     /// cannot judge. Handed over as the list `plan` was given, for the reason
@@ -642,8 +643,8 @@ impl Store {
             for task in &command.tasks {
                 tx.execute(
                     "INSERT INTO tasks (
-                         id, change_id, number, title, body, files_json, consumes, produces,
-                         verify_command, expected_output_json, covers_json, status,
+                         id, change_id, number, title, body, files_json, consumes_json,
+                         produces_json, verify_command, expected_output_json, covers_json, status,
                          created_at, updated_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?12)",
                     rusqlite::params![
@@ -653,8 +654,8 @@ impl Store {
                         &task.title,
                         task.body.as_deref(),
                         serde_json::to_string(&task.files)?,
-                        task.consumes.as_deref(),
-                        task.produces.as_deref(),
+                        serde_json::to_string(&task.consumes)?,
+                        serde_json::to_string(&task.produces)?,
                         &task.verify_command,
                         serde_json::to_string(&task.expected_output)?,
                         serde_json::to_string(&task.covers)?,
@@ -2299,8 +2300,8 @@ struct TaskSummaryRow {
     verify_command: String,
     body: Option<String>,
     files_json: String,
-    consumes: Option<String>,
-    produces: Option<String>,
+    consumes_json: String,
+    produces_json: String,
     expected_output_json: String,
     evidence: Option<String>,
     verified_at: Option<String>,
@@ -2314,8 +2315,8 @@ fn load_task_summaries(
     change_id: &str,
 ) -> Result<Vec<TaskSummary>, StoreError> {
     let mut statement = tx.prepare(
-        "SELECT number, title, status, verify_command, body, files_json, consumes,
-                produces, expected_output_json, evidence, verified_at
+        "SELECT number, title, status, verify_command, body, files_json, consumes_json,
+                produces_json, expected_output_json, evidence, verified_at
          FROM tasks
          WHERE change_id = ?1 ORDER BY number",
     )?;
@@ -2328,8 +2329,8 @@ fn load_task_summaries(
                 verify_command: row.get(3)?,
                 body: row.get(4)?,
                 files_json: row.get(5)?,
-                consumes: row.get(6)?,
-                produces: row.get(7)?,
+                consumes_json: row.get(6)?,
+                produces_json: row.get(7)?,
                 expected_output_json: row.get(8)?,
                 evidence: row.get(9)?,
                 verified_at: row.get(10)?,
@@ -2350,8 +2351,10 @@ fn load_task_summaries(
                 // this crate did not write, and reporting a task with no files
                 // would hide that from the one caller who could act on it.
                 files: serde_json::from_str(&row.files_json)?,
-                consumes: row.consumes,
-                produces: row.produces,
+                // Parsed rather than defaulted on a failure, for the reason
+                // `files` gives above.
+                consumes: serde_json::from_str(&row.consumes_json)?,
+                produces: serde_json::from_str(&row.produces_json)?,
                 // Parsed rather than defaulted on a failure, for the reason
                 // `files` gives above.
                 expected_output: serde_json::from_str(&row.expected_output_json)?,

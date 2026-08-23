@@ -325,18 +325,24 @@ pub struct TaskDraft {
     /// reviewer can tell an expected diff from a surprising one.
     #[serde(default)]
     pub files: Vec<String>,
-    /// The exact names and signatures an earlier task promised to produce,
-    /// that this task now depends on. `superpowers`' idiom: the executing
-    /// agent never sees the sibling task that produced them, only what is
-    /// written here, so a promise not repeated here is a promise it cannot
-    /// know about.
+    /// The artifacts an earlier task promised to produce, that this task now
+    /// depends on. One entry is one exact name and signature, and the identical
+    /// string appears in the producing task's `produces`.
+    ///
+    /// `superpowers`' idiom: the executing agent never sees the sibling task
+    /// that produced them, only what is written here, so a promise not repeated
+    /// here is a promise it cannot know about. Exact equality after trimming is
+    /// what turns that rule from a discipline into a check — the store refuses
+    /// a plan naming an artifact nothing produces, and a near-miss is a miss,
+    /// because an agent that cannot find the name it was given has nothing to
+    /// fall back on.
     #[serde(default)]
-    pub consumes: Option<String>,
-    /// The exact names and signatures this task hands to a later task in the
-    /// plan. Left unset when nothing downstream depends on this task's
-    /// output.
+    pub consumes: Vec<String>,
+    /// The artifacts this task hands to a later task in the plan, written
+    /// exactly as those tasks will name them. Empty when nothing downstream
+    /// depends on this task's output.
     #[serde(default)]
-    pub produces: Option<String>,
+    pub produces: Vec<String>,
     /// The exact command a caller runs to check this task actually happened.
     /// Required: a task with no way to be checked is not a task, and the
     /// executing agent has no other way to know it is done.

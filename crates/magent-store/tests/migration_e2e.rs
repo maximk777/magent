@@ -49,6 +49,7 @@ fn migration(version: i64) -> String {
         13 => "0013_session_notices.sql",
         14 => "0014_requirement_origin.sql",
         15 => "0015_session_last_seen.sql",
+        16 => "0016_contracts_are_lists.sql",
         other => panic!("no migration {other}"),
     };
 

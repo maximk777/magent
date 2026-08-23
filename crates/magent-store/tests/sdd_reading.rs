@@ -411,8 +411,8 @@ fn task(title: &str, covers: &[&str]) -> TaskDraft {
             "crates/worker/src/retry.rs".into(),
             "crates/worker/src/config.rs".into(),
         ],
-        consumes: Some(CONSUMES.into()),
-        produces: Some(PRODUCES.into()),
+        consumes: vec![CONSUMES.into()],
+        produces: vec![PRODUCES.into()],
         verify_command: VERIFY.into(),
         expected_output: vec![EXPECTED.into()],
         covers: covers.iter().map(|name| (*name).to_string()).collect(),
@@ -762,8 +762,8 @@ fn a_planned_task_reads_back_whole() {
         ],
         "the files come back as the list the plan wrote, not as the JSON they are stored in"
     );
-    assert_eq!(task.consumes.as_deref(), Some(CONSUMES));
-    assert_eq!(task.produces.as_deref(), Some(PRODUCES));
+    assert_eq!(task.consumes, [CONSUMES]);
+    assert_eq!(task.produces, [PRODUCES]);
     assert_eq!(task.verify_command, VERIFY);
     assert_eq!(
         task.expected_output,
