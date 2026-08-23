@@ -632,6 +632,10 @@ impl Store {
             let change_id = command.change.to_string();
             require_plannable_change(tx, command.change, &workspace_id.to_string())?;
             require_full_coverage(tx, &change_id, command)?;
+            // After coverage and before the DELETE: a refused plan leaves the
+            // previous tasks untouched, and an uncovered requirement is the
+            // more actionable of the two when both are true.
+            require_produced_artifacts(command)?;
 
             let now = Utc::now().to_rfc3339();
 
@@ -1736,6 +1740,41 @@ fn require_plannable_change(
 /// the first time one is renamed.
 ///
 /// A change proposed with `skip_specs` has no deltas, so the query returns
+/// Refuses a plan whose `consumes` names an artifact no task in it produces.
+///
+/// Matched by exact string equality after trimming, which is the whole point:
+/// `superpowers` states the rule about repeating the exact name in prose, where
+/// it goes unenforced, and this is that rule as a check. A near-miss is a miss,
+/// because an executing agent that cannot find the name it was given has
+/// nothing to fall back on but a guess.
+///
+/// Reported in plan order, then in the order within a task, the way
+/// `require_full_coverage` orders its own list and for the same reason: a
+/// caller fixing them works down the plan rather than hunting.
+fn require_produced_artifacts(command: &PlanCommand) -> Result<(), StoreError> {
+    let produced: HashSet<&str> = command
+        .tasks
+        .iter()
+        .flat_map(|task| task.produces.iter())
+        .map(|artifact| artifact.trim())
+        .collect();
+
+    let unproduced: Vec<String> = command
+        .tasks
+        .iter()
+        .flat_map(|task| task.consumes.iter())
+        .map(|artifact| artifact.trim())
+        .filter(|artifact| !produced.contains(artifact))
+        .map(str::to_owned)
+        .collect();
+
+    if unproduced.is_empty() {
+        Ok(())
+    } else {
+        Err(StoreError::ArtifactsUnproduced(unproduced))
+    }
+}
+
 /// nothing and the check passes without needing a branch of its own.
 fn require_full_coverage(
     tx: &Transaction<'_>,

@@ -53,7 +53,6 @@ const EXPECTED: &str = "test result: ok. 3 passed";
 /// What the plan tells the agent executing its one task — the fields that exist
 /// precisely because that agent sees its own row and nothing around it.
 const BODY: &str = "Read the budget from config and spend it per attempt.";
-const CONSUMES: &str = "struct RetryConfig, from the task before this one";
 const PRODUCES: &str = "fn spend_budget(&mut self) -> bool";
 
 /// Long enough to clear `magent-core`'s 50-character floor on a purpose.
@@ -411,7 +410,11 @@ fn task(title: &str, covers: &[&str]) -> TaskDraft {
             "crates/worker/src/retry.rs".into(),
             "crates/worker/src/config.rs".into(),
         ],
-        consumes: vec![CONSUMES.into()],
+        // Consumes nothing: this fixture plans one task, and a lone task
+        // consuming an artifact no task produces is exactly what `plan` now
+        // refuses. The round trip of a real contract is covered by
+        // `a_chain_of_two_tasks_reads_its_contract_back` below.
+        consumes: Vec::new(),
         produces: vec![PRODUCES.into()],
         verify_command: VERIFY.into(),
         expected_output: vec![EXPECTED.into()],
@@ -762,7 +765,7 @@ fn a_planned_task_reads_back_whole() {
         ],
         "the files come back as the list the plan wrote, not as the JSON they are stored in"
     );
-    assert_eq!(task.consumes, [CONSUMES]);
+    assert!(task.consumes.is_empty());
     assert_eq!(task.produces, [PRODUCES]);
     assert_eq!(task.verify_command, VERIFY);
     assert_eq!(
@@ -1312,4 +1315,47 @@ fn open_changes_lists_a_change_exactly_when_is_open_calls_it_open() {
             status.is_open()
         );
     }
+}
+
+/// The contract round trip on a plan that actually has one: task 2 consumes
+/// exactly what task 1 produces, which is the shape `plan` now matches on.
+#[test]
+fn a_chain_of_two_tasks_reads_its_contract_back() {
+    let fixture = Fixture::new();
+    let change = fixture.specified_change();
+
+    let mut first = task("Produce the budget", &[BUDGET, ATTEMPT]);
+    first.number = "1".into();
+    let mut second = task("Spend it", &[BUDGET, ATTEMPT]);
+    second.number = "2".into();
+    second.consumes = vec![PRODUCES.into()];
+
+    fixture
+        .store
+        .plan(
+            &PlanCommand {
+                operation_id: OperationId::new(),
+                change,
+                tasks: vec![first, second],
+            },
+            &fixture.context,
+        )
+        .expect("a consumes that matches a produces is accepted");
+
+    let detail = fixture
+        .store
+        .change_detail(change, &fixture.context)
+        .expect("detail")
+        .expect("the change");
+    let consumer = detail
+        .tasks
+        .iter()
+        .find(|task| task.number == "2")
+        .expect("task 2");
+
+    assert_eq!(
+        consumer.consumes,
+        [PRODUCES],
+        "the contract comes back as the list the plan wrote, entry for entry"
+    );
 }

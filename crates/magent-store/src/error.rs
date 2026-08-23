@@ -208,6 +208,32 @@ pub enum StoreError {
     )]
     RequirementsUnimplemented(Vec<String>),
 
+    /// A plan whose `consumes` names an artifact no task in it produces.
+    ///
+    /// Carries the entries rather than a count. An executing agent sees its own
+    /// task and nothing around it, so a name it was told to build on and cannot
+    /// find leaves it nothing to fall back on but a guess — and it will guess
+    /// plausibly. The refusal has to say which promise is missing.
+    ///
+    /// Matched by exact equality after trimming: `superpowers` states the rule
+    /// about repeating the exact name in prose, where it goes unenforced, and
+    /// this is that rule as a check. A near-miss is a miss.
+    #[error(
+        "these consumed artifacts are produced by no task in the plan: {}; produce each, or correct the name to match the task that does",
+        .0.join(", ")
+    )]
+    ArtifactsUnproduced(Vec<String>),
+
+    /// A plan whose dependencies form a cycle.
+    ///
+    /// Not a plan at all: no task in it can ever be first. Carries the tasks
+    /// left over when nothing more could be ordered, which is the cycle.
+    #[error(
+        "these tasks depend on each other in a cycle: {}; no order can satisfy them, so one must stop consuming what a later task produces",
+        .0.join(", ")
+    )]
+    PlanIsCyclic(Vec<String>),
+
     /// Archiving files a change's deltas as what is now true of the product,
     /// so work still open would put an unbuilt behaviour into the live base
     /// and every later change would read it as the starting point. Nothing in
@@ -398,6 +424,8 @@ impl StoreError {
             Self::ChangeNotSpecified { .. } => "change_not_specified",
             Self::RequirementsUncovered(_) => "requirements_uncovered",
             Self::RequirementsUnimplemented(_) => "requirements_unimplemented",
+            Self::ArtifactsUnproduced(_) => "artifacts_unproduced",
+            Self::PlanIsCyclic(_) => "plan_is_cyclic",
             Self::ChangeNotExecuted { .. } => "change_not_executed",
             Self::NothingToArchive(_) => "nothing_to_archive",
             Self::RunNotBoundToChange { .. } => "run_not_bound",
