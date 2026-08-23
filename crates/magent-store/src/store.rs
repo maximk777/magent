@@ -1002,8 +1002,13 @@ fn task_number_in(current_task: &str) -> Option<&str> {
 /// was first seen, and a worktree of it resolves somewhere else — so the match
 /// is made on the tail, at a separator boundary. `src/store.rs` matches
 /// `/home/me/project/src/store.rs` and not `/home/me/project/src/store.rs.bak`,
-/// and a plan declaring the bare name `store.rs` matches any file so called,
-/// which is what declaring a bare name asks for.
+/// nor `/home/me/other_src/store.rs` — a different directory of the same
+/// leaf name is not a match either. A plan declaring the bare name
+/// `store.rs` matches any file so called, which is what declaring a bare
+/// name asks for. A leading `./` is trimmed, so `./src/store.rs` behaves
+/// exactly like `src/store.rs`. An empty declaration — `""`, or all
+/// whitespace — matches nothing, deliberately: a stray blank entry in
+/// `files` must not make every edit in the change a trespass.
 fn declares_path(declared: &str, edited: &str) -> bool {
     let declared = declared.trim().trim_start_matches("./");
 
@@ -1508,4 +1513,63 @@ pub(crate) fn parse_timestamp(raw: &str) -> Result<DateTime<Utc>, StoreError> {
     DateTime::parse_from_rfc3339(raw)
         .map(|value| value.with_timezone(&Utc))
         .map_err(|error| StoreError::Serialization(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `declares_path` is a pure string function whose interesting cases are
+    // all boundaries. Driving five path shapes through a full database
+    // fixture (`store_contract.rs`) would cost ten times as much for the same
+    // answer, so its behaviour is pinned here instead — the crate's one
+    // deliberate exception to testing only through the public contract.
+
+    #[test]
+    fn a_declared_path_matches_only_at_a_separator_boundary() {
+        assert!(
+            declares_path("src/store.rs", "/home/me/project/src/store.rs"),
+            "a declared relative path must match the absolute path the hook hands over"
+        );
+        assert!(
+            !declares_path("src/store.rs", "/home/me/project/src/store.rs.bak"),
+            "a longer file name sharing the same characters must not match — \
+             this is the boundary a switch to `contains` would silently break"
+        );
+        assert!(
+            !declares_path("src/store.rs", "/home/me/other_src/store.rs"),
+            "the same leaf name under a different directory must not match — \
+             this is the boundary a missing leading `/` in the match would silently break"
+        );
+    }
+
+    #[test]
+    fn a_bare_declared_name_matches_any_file_so_named() {
+        assert!(
+            declares_path("store.rs", "/home/me/project/src/store.rs"),
+            "a plan declaring a bare file name asks to match that name anywhere"
+        );
+    }
+
+    #[test]
+    fn a_leading_dot_slash_is_trimmed_before_matching() {
+        assert!(
+            declares_path("./src/store.rs", "/home/me/project/src/store.rs"),
+            "`./src/store.rs` must behave exactly like `src/store.rs`"
+        );
+    }
+
+    #[test]
+    fn an_empty_declaration_matches_nothing() {
+        assert!(
+            !declares_path("", "/home/me/project/src/store.rs"),
+            "an empty declared path must match nothing — otherwise a stray blank \
+             entry in `files` would make every edit in the change a trespass, \
+             and no task of that plan could ever close"
+        );
+        assert!(
+            !declares_path("   ", "/home/me/project/src/store.rs"),
+            "an all-whitespace declared path must match nothing, for the same reason"
+        );
+    }
 }
