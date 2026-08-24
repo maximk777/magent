@@ -61,6 +61,7 @@ fn append_edits(store: &Store, hint: &str, count: usize) {
         store
             .append_ledger_for_external_session(
                 hint,
+                None,
                 &FileLedgerEntry {
                     path: PathBuf::from(format!("src/module{index}.rs")),
                     tool: "Edit".into(),
@@ -1120,7 +1121,7 @@ fn an_edit_is_stamped_with_the_task_its_session_holds() {
 
     fixture
         .store
-        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .append_ledger(run_id, session_id, None, &edit_at(EDIT_A))
         .expect("append ledger");
 
     assert_eq!(
@@ -1138,7 +1139,7 @@ fn an_edit_under_no_hold_is_stamped_with_nothing() {
 
     fixture
         .store
-        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .append_ledger(run_id, session_id, None, &edit_at(EDIT_A))
         .expect("append ledger");
 
     assert_eq!(
@@ -1173,7 +1174,7 @@ fn an_edit_after_the_lease_ran_out_is_stamped_with_nothing() {
 
     fixture
         .store
-        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .append_ledger(run_id, session_id, None, &edit_at(EDIT_A))
         .expect("append ledger");
 
     assert_eq!(
@@ -1194,13 +1195,13 @@ fn two_tasks_in_turn_each_get_their_own_edits() {
     fixture.hold(run_id, TASK_THREE_NAMED);
     fixture
         .store
-        .append_ledger(run_id, session_id, &edit_at(EDIT_A))
+        .append_ledger(run_id, session_id, None, &edit_at(EDIT_A))
         .expect("append ledger a");
 
     fixture.hold(run_id, TASK_FOUR_NAMED);
     fixture
         .store
-        .append_ledger(run_id, session_id, &edit_at(EDIT_B))
+        .append_ledger(run_id, session_id, None, &edit_at(EDIT_B))
         .expect("append ledger b");
 
     assert_eq!(
@@ -1250,6 +1251,7 @@ fn an_edit_is_judged_by_the_lease_that_was_live_when_it_landed() {
         .append_ledger(
             run_id,
             session_id,
+            None,
             &edit_observed_at(EDIT_A, chrono::Utc::now() - chrono::Duration::hours(1)),
         )
         .expect("append ledger");
@@ -1314,7 +1316,7 @@ fn an_edit_onto_a_held_file_records_the_trespass() {
 
     fixture
         .store
-        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .append_ledger(run_id, session_a, None, &edit_at(TRESPASS_EDIT))
         .expect("append ledger");
 
     assert_eq!(
@@ -1334,7 +1336,7 @@ fn an_edit_onto_an_unheld_file_records_no_trespass() {
     // Nobody holds task 4 here — no second session, no hold taken on it.
     fixture
         .store
-        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .append_ledger(run_id, session_a, None, &edit_at(TRESPASS_EDIT))
         .expect("append ledger");
 
     assert_eq!(
@@ -1377,7 +1379,7 @@ fn an_edit_onto_a_file_whose_holder_lapsed_records_no_trespass() {
 
     fixture
         .store
-        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .append_ledger(run_id, session_a, None, &edit_at(TRESPASS_EDIT))
         .expect("append ledger");
 
     assert_eq!(
@@ -1396,7 +1398,7 @@ fn an_edit_onto_your_own_declared_file_is_no_trespass() {
 
     fixture
         .store
-        .append_ledger(run_id, session_a, &edit_at(EDIT_A))
+        .append_ledger(run_id, session_a, None, &edit_at(EDIT_A))
         .expect("append ledger");
 
     assert_eq!(
@@ -1465,7 +1467,7 @@ fn a_trespass_names_the_freshest_of_two_holders() {
 
     fixture
         .store
-        .append_ledger(run_id, session_a, &edit_at(TRESPASS_EDIT))
+        .append_ledger(run_id, session_a, None, &edit_at(TRESPASS_EDIT))
         .expect("append ledger");
 
     assert_eq!(
@@ -1473,5 +1475,119 @@ fn a_trespass_names_the_freshest_of_two_holders() {
         Some(TASK_FIVE.into()),
         "task 5 holds the newer of the two leases, so it is the one named — \
          not task 4, which an unordered scan would meet first"
+    );
+}
+
+// --- an edit recorded against the agent that made it -----------------------
+//
+// Subagents share their parent's session id by design, so the session alone
+// never distinguishes one from the main agent. `append_ledger` takes the
+// agent as its own parameter instead of a field on `FileLedgerEntry`, so a
+// session with a hint bound (`second_session`) stands in for a subagent's own
+// session here, the same way the trespass tests above use it for a second
+// task holder.
+
+/// A subagent's hint, distinct from the trespass fixtures' hints used
+/// elsewhere in this file.
+const AGENT_HINT: &str = "harness-session-agent-alpha";
+
+/// A second subagent's hint, for the test that needs two agents at once.
+const OTHER_AGENT_HINT: &str = "harness-session-agent-beta";
+
+const AGENT_ID: &str = "agent-alpha";
+const OTHER_AGENT_ID: &str = "agent-beta";
+
+/// The agent id an edit was stamped with, read back the way `stamped_task`
+/// and `trespass` read the other two columns `append_ledger` writes.
+fn agent_of(connection: &rusqlite::Connection, path: &str) -> Option<String> {
+    connection
+        .query_row(
+            "SELECT agent_id FROM file_ledger WHERE path = ?1",
+            rusqlite::params![path],
+            |row| row.get(0),
+        )
+        .expect("one ledger row for this path")
+}
+
+#[test]
+fn an_edit_inside_a_subagent_names_that_agent() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, _main_session) = fixture.bound_run();
+    let subagent_session = fixture.second_session(run_id, AGENT_HINT);
+
+    fixture
+        .store
+        .record_agent(AGENT_HINT, AGENT_ID, Some("code-reviewer"))
+        .expect("record agent");
+
+    fixture
+        .store
+        .append_ledger(run_id, subagent_session, Some(AGENT_ID), &edit_at(EDIT_A))
+        .expect("append ledger");
+
+    assert_eq!(
+        agent_of(&fixture.raw(), EDIT_A),
+        Some(AGENT_ID.into()),
+        "the ledger row names the agent that made the edit"
+    );
+}
+
+/// This is the test that would still pass against an implementation that
+/// invented an agent row rather than leaving the column empty — hence the
+/// specific `None`, not just an absence of assertion.
+#[test]
+fn an_edit_by_the_main_agent_names_no_agent() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, session_id) = fixture.bound_run();
+
+    fixture
+        .store
+        .append_ledger(run_id, session_id, None, &edit_at(EDIT_A))
+        .expect("append ledger");
+
+    assert_eq!(
+        agent_of(&fixture.raw(), EDIT_A),
+        None,
+        "an edit with no agent id names no agent"
+    );
+}
+
+#[test]
+fn two_agents_editing_different_files_each_name_their_own() {
+    let fixture = HoldFixture::new();
+    fixture.planned_change();
+    let (run_id, _main_session) = fixture.bound_run();
+    let session_a = fixture.second_session(run_id, AGENT_HINT);
+    let session_b = fixture.second_session(run_id, OTHER_AGENT_HINT);
+
+    fixture
+        .store
+        .record_agent(AGENT_HINT, AGENT_ID, None)
+        .expect("record agent a");
+    fixture
+        .store
+        .record_agent(OTHER_AGENT_HINT, OTHER_AGENT_ID, None)
+        .expect("record agent b");
+
+    fixture
+        .store
+        .append_ledger(run_id, session_a, Some(AGENT_ID), &edit_at(EDIT_A))
+        .expect("append ledger a");
+    fixture
+        .store
+        .append_ledger(run_id, session_b, Some(OTHER_AGENT_ID), &edit_at(EDIT_B))
+        .expect("append ledger b");
+
+    assert_eq!(
+        agent_of(&fixture.raw(), EDIT_A),
+        Some(AGENT_ID.into()),
+        "the first agent's edit names the first agent"
+    );
+    assert_eq!(
+        agent_of(&fixture.raw(), EDIT_B),
+        Some(OTHER_AGENT_ID.into()),
+        "the second agent's edit names the second agent, not the first"
     );
 }

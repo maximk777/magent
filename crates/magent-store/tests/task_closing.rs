@@ -1321,6 +1321,7 @@ fn fixture_with_a_recorded_trespass() -> (Fixture, ChangeId, RunId, SessionId, S
         .append_ledger(
             run_id,
             session_a,
+            None,
             &FileLedgerEntry {
                 path: std::path::PathBuf::from(TRESPASS_EDIT),
                 tool: "Edit".into(),
@@ -1593,6 +1594,7 @@ fn a_tick_names_the_files_outside_its_contract() {
             .append_ledger(
                 run_id,
                 session_id,
+                None,
                 &FileLedgerEntry {
                     path: std::path::PathBuf::from(path),
                     tool: "Edit".into(),
@@ -1644,6 +1646,7 @@ fn a_tick_within_its_contract_names_no_files() {
         .append_ledger(
             run_id,
             session_id,
+            None,
             &FileLedgerEntry {
                 path: std::path::PathBuf::from("/tmp/project/src/a.rs"),
                 tool: "Edit".into(),
@@ -1696,6 +1699,7 @@ fn three_files_outside_the_contract_still_close_the_task() {
             .append_ledger(
                 run_id,
                 session_id,
+                None,
                 &FileLedgerEntry {
                     path: std::path::PathBuf::from(path),
                     tool: "Edit".into(),

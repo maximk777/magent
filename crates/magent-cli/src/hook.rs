@@ -257,8 +257,12 @@ fn post_tool_use(store: &Store, session: &str, input: &Value) -> anyhow::Result<
         return Ok(String::new());
     };
 
+    // `None` for now: the payload's `agent_id` is not read here yet. Wiring
+    // it through is the next task; this one only gives `append_ledger`
+    // somewhere to put it.
     store.append_ledger_for_external_session(
         session,
+        None,
         &FileLedgerEntry {
             path,
             tool: string_field(input, "tool_name").unwrap_or_else(|| "unknown".into()),

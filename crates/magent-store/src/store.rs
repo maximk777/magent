@@ -499,12 +499,19 @@ impl Store {
     /// Records one observed mutation. Called from `PostToolUse`, so it must stay
     /// a single cheap insert.
     ///
+    /// `agent_id` names the subagent that made the edit, taken verbatim from
+    /// the caller — this method invents no fallback for it. `None` for the
+    /// main agent, whose edits share the session's own attribution. A name
+    /// that was never passed to `record_agent` fails the insert outright:
+    /// `file_ledger.agent_id` references `agents(id)` with foreign keys on.
+    ///
     /// # Errors
     /// Fails on a database error.
     pub fn append_ledger(
         &self,
         run_id: RunId,
         session_id: SessionId,
+        agent_id: Option<&str>,
         entry: &FileLedgerEntry,
     ) -> Result<(), StoreError> {
         let mut connection = self.lock()?;
@@ -596,8 +603,8 @@ impl Store {
         };
 
         tx.execute(
-            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id, trespass_on)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at, task_id, trespass_on, agent_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 run_id.to_string(),
                 session_id.to_string(),
@@ -606,6 +613,7 @@ impl Store {
                 &observed_at,
                 held.as_ref().map(|(id, _)| id),
                 &trespass_on,
+                agent_id,
             ),
         )?;
         tx.commit()?;

@@ -253,12 +253,13 @@ impl Store {
     pub fn append_ledger_for_external_session(
         &self,
         hint: &str,
+        agent_id: Option<&str>,
         entry: &FileLedgerEntry,
     ) -> Result<(), StoreError> {
         let Some(binding) = self.binding_for_external_session(hint)? else {
             return Ok(());
         };
-        self.append_ledger(binding.run_id, binding.session_id, entry)
+        self.append_ledger(binding.run_id, binding.session_id, agent_id, entry)
     }
 
     /// # Errors
