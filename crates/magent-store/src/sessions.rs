@@ -341,6 +341,69 @@ impl Store {
         Ok(())
     }
 
+    /// Records a subagent the first time an event names it.
+    ///
+    /// Lazy by necessity: nothing announces a subagent's dispatch, so the row
+    /// is created by whatever it does first. `INSERT OR IGNORE` rather than a
+    /// read-then-write, because the same agent raises many events and only the
+    /// first is its beginning.
+    ///
+    /// A blank `agent_id` records nothing: `agents.id` is the first primary key
+    /// in this schema whose value comes from outside rather than being minted
+    /// here, and an empty string is a legal `TEXT PRIMARY KEY` in `SQLite` — every
+    /// event with a missing id would otherwise collide into one row that
+    /// silently merges unrelated subagents.
+    ///
+    /// A hint that resolves to no session also records nothing: an agent whose
+    /// parent has no session row belongs to no run, and inventing one here
+    /// would attribute work to a run nobody opened.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn record_agent(
+        &self,
+        hint: &str,
+        agent_id: &str,
+        agent_type: Option<&str>,
+    ) -> Result<(), StoreError> {
+        if agent_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO agents (id, session_id, agent_type, started_at)
+             SELECT ?1, s.id, ?2, ?3
+             FROM sessions s
+             WHERE s.external_session_hint = ?4
+             ORDER BY s.started_at DESC LIMIT 1",
+            (agent_id, agent_type, Utc::now().to_rfc3339(), hint),
+        )?;
+        Ok(())
+    }
+
+    /// Marks that a subagent returned. Called from `SubagentStop`, which is the
+    /// only event that says so plainly.
+    ///
+    /// Sets `ended_at` only when it is still `NULL`, so a repeated event does
+    /// not move the time. A blank `agent_id` marks nothing, for the same reason
+    /// `record_agent` refuses to record one.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn mark_agent_returned(&self, agent_id: &str) -> Result<(), StoreError> {
+        if agent_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        let connection = self.lock()?;
+        connection.execute(
+            "UPDATE agents SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+            (Utc::now().to_rfc3339(), agent_id),
+        )?;
+        Ok(())
+    }
+
     /// The session on `run_id` heard from most recently and not yet ended.
     ///
     /// A checkpoint belongs to a session, but the model has no way to learn its
