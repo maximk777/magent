@@ -52,6 +52,7 @@ fn migration(version: i64) -> String {
         16 => "0016_contracts_are_lists.sql",
         17 => "0017_task_holds.sql",
         18 => "0018_ledger_knows_its_task.sql",
+        19 => "0019_agents.sql",
         other => panic!("no migration {other}"),
     };
 
@@ -687,6 +688,92 @@ fn the_ledger_knows_its_task_after_0018() {
     );
     assert_eq!(task_id, None, "an old row has no task_id to backfill");
     assert_eq!(trespass_on, None, "an old row recorded no trespass");
+}
+
+/// A ledger row written before 0019 has no `agent_id` to give, and there is no
+/// `agents` table at all — the migration must add both without disturbing the
+/// row a pre-0019 build already wrote.
+#[test]
+fn an_agent_is_known_after_0019() {
+    let (_dir, path) = temp();
+    let legacy = database_at(&path, 18);
+    seed_slice_one(&legacy);
+    legacy
+        .execute(
+            "INSERT INTO file_ledger (run_id, session_id, path, tool, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                LEGACY_RUN,
+                "44444444-4444-4444-8444-444444444444",
+                "crates/magent-store/src/store.rs",
+                "Edit",
+                "2026-01-01T00:00:00Z",
+            ),
+        )
+        .expect("seed a pre-0019 ledger row");
+    drop(legacy);
+
+    let store = Store::open(&path).expect("upgrade");
+    assert_eq!(store.schema_version().expect("version"), CURRENT_VERSION);
+
+    let connection = Connection::open(&path).expect("reopen");
+
+    // Only agent_id is new here; file_ledger's other columns are already
+    // exercised by the surviving seeded row below, so checking this one alone
+    // is not a narrower check than agents gets.
+    let file_ledger_columns: String = connection
+        .query_row(
+            "SELECT group_concat(name, ' ') FROM pragma_table_info('file_ledger')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the columns");
+    assert!(
+        file_ledger_columns.contains("agent_id"),
+        "the ledger must record which agent made an edit: {file_ledger_columns}"
+    );
+
+    // agents is a brand-new table with no seeded row to fall back on, so every
+    // column is checked here rather than left for something else to catch.
+    let agents_columns: String = connection
+        .query_row(
+            "SELECT group_concat(name, ' ') FROM pragma_table_info('agents')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the columns");
+    assert!(
+        agents_columns.contains("id"),
+        "an agent must be addressable by the harness's agent_id: {agents_columns}"
+    );
+    assert!(
+        agents_columns.contains("session_id"),
+        "an agent belongs to a session: {agents_columns}"
+    );
+    assert!(
+        agents_columns.contains("agent_type"),
+        "an agent must carry what the subagent was: {agents_columns}"
+    );
+    assert!(
+        agents_columns.contains("started_at"),
+        "an agent's row is written first-seen, so this must survive: {agents_columns}"
+    );
+    assert!(
+        agents_columns.contains("ended_at"),
+        "an agent can be seen to have finished: {agents_columns}"
+    );
+
+    let (recorded_path, agent_id): (String, Option<String>) = connection
+        .query_row("SELECT path, agent_id FROM file_ledger", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("the row seeded before the migration must survive");
+
+    assert_eq!(
+        recorded_path, "crates/magent-store/src/store.rs",
+        "the row's path must survive the migration"
+    );
+    assert_eq!(agent_id, None, "an old row has no agent_id to backfill");
 }
 
 /// A replan deletes and reinserts a change's tasks (`sdd.rs`'s
