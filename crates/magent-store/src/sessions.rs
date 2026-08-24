@@ -8,15 +8,15 @@ use std::path::Path;
 
 use chrono::Utc;
 use magent_core::{
-    CheckpointOrigin, FileLedgerEntry, HarnessKind, RunId, RunSnapshot, SessionId, StartRunCommand,
-    StartRunResult, WorkflowStage, WorkspaceId,
+    AgentAtLarge, CheckpointOrigin, FileLedgerEntry, HarnessKind, RunId, RunSnapshot, SessionId,
+    StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{
     error::StoreError,
     git,
-    store::{Store, enum_to_sql, parse_id, upsert_repository},
+    store::{Store, enum_to_sql, parse_id, parse_timestamp, upsert_repository},
 };
 
 /// How many edits a run carries before its silence is worth remarking on.
@@ -403,6 +403,56 @@ impl Store {
             (Utc::now().to_rfc3339(), agent_id),
         )?;
         Ok(())
+    }
+
+    /// The agents of `run_id` that were seen and never came back.
+    ///
+    /// Not a stored flag but a question: the agent was recorded, it has no
+    /// `ended_at`, and the hold of the session it ran under has lapsed. A live
+    /// lease is the agent still reporting, so it is not named while one holds.
+    ///
+    /// No timeout is introduced here. The ten-minute task lease already draws
+    /// that line, and a constant large enough not to kill an agent running one
+    /// long build would be too large to catch anything worth catching.
+    ///
+    /// # Errors
+    /// Fails on a database error.
+    pub fn agents_that_did_not_return(
+        &self,
+        run_id: RunId,
+    ) -> Result<Vec<AgentAtLarge>, StoreError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.agent_type, a.started_at
+               FROM agents a
+               JOIN sessions s ON s.id = a.session_id
+              WHERE s.run_id = ?1
+                AND a.ended_at IS NULL
+                AND NOT EXISTS (SELECT 1 FROM tasks t
+                                 WHERE t.claimed_by = a.session_id
+                                   AND t.lease_until IS NOT NULL
+                                   AND t.lease_until > ?2)
+              ORDER BY a.started_at, a.id",
+        )?;
+
+        let rows = statement
+            .query_map(
+                (run_id.to_string(), Utc::now().to_rfc3339()),
+                |row| -> rusqlite::Result<(String, Option<String>, String)> {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(|(id, agent_type, started_at)| {
+                Ok(AgentAtLarge {
+                    id,
+                    agent_type,
+                    started_at: parse_timestamp(&started_at)?,
+                })
+            })
+            .collect()
     }
 
     /// The session on `run_id` heard from most recently and not yet ended.

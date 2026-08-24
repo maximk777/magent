@@ -15,10 +15,11 @@ pub use fact::{
     RelationKind, RememberCommand,
 };
 pub use model::{
-    CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult, CheckpointSnapshot,
-    DependencyId, FileLedgerEntry, FinishAction, FinishRunCommand, FinishRunResult, GitState,
-    HarnessKind, OperationId, Repository, RepositoryId, RepositoryRole, RunId, RunSnapshot,
-    RunStatus, SessionId, SpecBinding, StartRunCommand, StartRunResult, WorkflowStage, WorkspaceId,
+    AgentAtLarge, CheckpointCommand, CheckpointId, CheckpointOrigin, CheckpointResult,
+    CheckpointSnapshot, DependencyId, FileLedgerEntry, FinishAction, FinishRunCommand,
+    FinishRunResult, GitState, HarnessKind, OperationId, Repository, RepositoryId, RepositoryRole,
+    RunId, RunSnapshot, RunStatus, SessionId, SpecBinding, StartRunCommand, StartRunResult,
+    WorkflowStage, WorkspaceId,
 };
 pub use sdd::{
     ArchiveCommand, ChangeId, ChangeStatus, Classification, DeltaOp, PlanCommand, PlanShape,

@@ -191,6 +191,17 @@ pub struct FileLedgerEntry {
     pub observed_at: DateTime<Utc>,
 }
 
+/// An agent that was seen and never came back.
+///
+/// Carries `agent_type` because "the spec reviewer never came back" is what a
+/// reader can act on, where a bare seventeen-character id is not.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentAtLarge {
+    pub id: String,
+    pub agent_type: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StartRunCommand {
     pub operation_id: OperationId,
