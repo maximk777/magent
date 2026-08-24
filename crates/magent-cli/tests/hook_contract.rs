@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use magent_core::{HarnessKind, OperationId, SpecBinding, StartRunCommand};
+use magent_core::{FileLedgerEntry, HarnessKind, OperationId, SpecBinding, StartRunCommand};
 use magent_store::Store;
 use serde_json::{Value, json};
 
@@ -923,6 +923,225 @@ fn post_tool_use_without_a_file_path_is_a_no_op() {
     assert!(fixture.hook("post-tool-use", &input).succeeded());
 }
 
+// --- the agent a subagent's edit is attributed to ---------------------------
+//
+// Subagents share their parent's session id by design, so the session alone
+// never distinguishes one from the main agent or from another subagent. The
+// harness gives `agent_id` — and, beside it, `agent_type` — in the payload of
+// `PostToolUse` and `SubagentStop`, present only inside a subagent's own
+// events.
+
+/// The ledger row's `agent_id`, read straight from the database the way
+/// `last_seen_of` reads the session profile.
+fn ledger_agent_id(fixture: &Fixture, path: &Path) -> Option<String> {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open profile");
+    connection
+        .query_row(
+            "SELECT agent_id FROM file_ledger WHERE path = ?1",
+            [path.to_string_lossy().as_ref()],
+            |row| row.get(0),
+        )
+        .expect("one ledger row for this path")
+}
+
+/// The ledger entry whose path ends with `filename`, fetched through the
+/// store's own API so its path matches whatever canonical form `hook.rs`
+/// stored — the same reason `post_tool_use_records_edited_files` above
+/// compares with `ends_with` rather than an exact path.
+fn ledger_entry(fixture: &Fixture, session: &str, filename: &str) -> FileLedgerEntry {
+    fixture
+        .store()
+        .ledger_for_external_session(session, 50)
+        .expect("ledger")
+        .into_iter()
+        .find(|entry| entry.path.ends_with(filename))
+        .unwrap_or_else(|| {
+            panic!(
+                "no ledger entry for {filename} in session {session} — if this is a \
+                 regression in `post_tool_use`'s ordering, the append against an \
+                 unrecorded agent was refused by the `file_ledger.agent_id` \
+                 foreign key and the hook swallowed that error"
+            )
+        })
+}
+
+/// How many rows the `agents` table holds.
+fn agents_count(fixture: &Fixture) -> i64 {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open profile");
+    connection
+        .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+        .expect("count agents")
+}
+
+/// `ended_at` for one agent row, read straight from the database.
+fn agent_ended_at(fixture: &Fixture, agent_id: &str) -> Option<String> {
+    let connection =
+        rusqlite::Connection::open(fixture.state_dir.join("magent.db")).expect("open profile");
+    connection
+        .query_row(
+            "SELECT ended_at FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get(0),
+        )
+        .expect("an agents row for this id")
+}
+
+/// Also the ordering guard for `post_tool_use`: `record_agent` runs before
+/// `append_ledger_for_external_session`, and `agent-attributed` is never
+/// recorded any other way in this test. If the order were reversed, the
+/// append would hit the same foreign-key refusal
+/// `appending_with_an_unrecorded_agent_is_refused` pins directly — the hook
+/// would swallow that error, no `file_ledger` row would exist for
+/// `attributed.rs`, and `ledger_entry` below would panic rather than find
+/// nothing to assert on. A passing run here already proves the order held.
+#[test]
+fn an_edit_inside_a_subagent_is_attributed_to_it() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "review the diff");
+    let session = "s-agent-attributed";
+    fixture.hook("user-prompt-submit", &prompt_of(&fixture, session, "go"));
+
+    let mut input = fixture.base("PostToolUse", session);
+    input["tool_name"] = json!("Edit");
+    input["tool_input"] = json!({ "file_path": fixture.repo.join("src/attributed.rs") });
+    input["agent_id"] = json!("agent-attributed");
+    input["agent_type"] = json!("code-reviewer");
+
+    assert!(fixture.hook("post-tool-use", &input).succeeded());
+
+    let entry = ledger_entry(&fixture, session, "attributed.rs");
+    assert_eq!(
+        ledger_agent_id(&fixture, &entry.path),
+        Some("agent-attributed".into()),
+        "the ledger row names the subagent that made the edit"
+    );
+    assert_eq!(
+        agents_count(&fixture),
+        1,
+        "the subagent's first edit records it in the agents table"
+    );
+}
+
+#[test]
+fn an_edit_with_no_agent_is_attributed_to_none() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "review the diff");
+    let session = "s-agent-none";
+    fixture.hook("user-prompt-submit", &prompt_of(&fixture, session, "go"));
+
+    let mut input = fixture.base("PostToolUse", session);
+    input["tool_name"] = json!("Edit");
+    input["tool_input"] = json!({ "file_path": fixture.repo.join("src/unattributed.rs") });
+
+    assert!(fixture.hook("post-tool-use", &input).succeeded());
+
+    let entry = ledger_entry(&fixture, session, "unattributed.rs");
+    assert_eq!(
+        ledger_agent_id(&fixture, &entry.path),
+        None,
+        "an edit whose payload carries no agent_id names no agent"
+    );
+    assert_eq!(
+        agents_count(&fixture),
+        0,
+        "no agent_id in the payload means no agents row is invented"
+    );
+}
+
+#[test]
+fn subagent_stop_marks_that_agent_returned() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "review the diff");
+    let session = "s-agent-returns";
+    fixture.hook("user-prompt-submit", &prompt_of(&fixture, session, "go"));
+
+    let mut edit = fixture.base("PostToolUse", session);
+    edit["tool_name"] = json!("Edit");
+    edit["tool_input"] = json!({ "file_path": fixture.repo.join("src/returned.rs") });
+    edit["agent_id"] = json!("agent-returns");
+    assert!(fixture.hook("post-tool-use", &edit).succeeded());
+
+    assert!(
+        agent_ended_at(&fixture, "agent-returns").is_none(),
+        "an agent that has not stopped yet has no end time"
+    );
+
+    let mut stop = fixture.base("SubagentStop", session);
+    stop["agent_id"] = json!("agent-returns");
+    let run = fixture.hook("subagent-stop", &stop);
+
+    assert!(run.succeeded());
+    assert!(
+        agent_ended_at(&fixture, "agent-returns").is_some(),
+        "SubagentStop must mark the agent it names returned"
+    );
+}
+
+#[test]
+fn a_subagent_stop_without_an_agent_changes_nothing() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "review the diff");
+    let session = "s-agent-stopless";
+    fixture.hook("user-prompt-submit", &prompt_of(&fixture, session, "go"));
+
+    // Documented as present only inside a subagent's own events, so a `Stop`
+    // (or a malformed payload) reaching this handler without one is the
+    // shape an unexpected event takes, not a fabricated case.
+    let stop = fixture.base("SubagentStop", session);
+    let run = fixture.hook("subagent-stop", &stop);
+
+    assert!(
+        run.succeeded(),
+        "a SubagentStop with no agent_id must still succeed"
+    );
+    assert_eq!(
+        agents_count(&fixture),
+        0,
+        "nothing to mark returned when no agent_id was given"
+    );
+}
+
+/// Pins the order inside `post_tool_use`: recording an agent before
+/// appending its edit is not decorative. `file_ledger.agent_id` references
+/// `agents(id)` with foreign keys on, and a hook swallows every error by
+/// contract ("never fails the session") — so if an edit for an unrecorded
+/// agent were ever appended before `record_agent` ran, the refusal would not
+/// surface as an attribution bug but as the edit vanishing from the ledger
+/// outright. This drives `Store::append_ledger` the way the hook would if
+/// that order were reversed, and asserts `SQLite` refuses it.
+#[test]
+fn appending_with_an_unrecorded_agent_is_refused() {
+    let fixture = Fixture::new();
+    seed_run(&fixture, "guard the ledger order");
+    let session = "s-agent-unrecorded";
+    fixture.hook("user-prompt-submit", &prompt_of(&fixture, session, "go"));
+
+    let store = fixture.store();
+    let binding = store
+        .binding_for_external_session(session)
+        .expect("lookup binding")
+        .expect("the seeded run bound this session");
+
+    let result = store.append_ledger(
+        binding.run_id,
+        binding.session_id,
+        Some("never-recorded-agent"),
+        &FileLedgerEntry {
+            path: fixture.repo.join("src/guarded.rs"),
+            tool: "Edit".into(),
+            observed_at: chrono::Utc::now(),
+        },
+    );
+
+    assert!(
+        result.is_err(),
+        "an insert naming an agent record_agent never wrote must be refused, \
+         not accepted with a phantom attribution: {result:?}"
+    );
+}
+
 // --- pre-compact -----------------------------------------------------------
 
 #[test]
@@ -1272,8 +1491,26 @@ fn the_notice_and_the_memory_index_stay_separate() {
 /// The stamp is what makes the ordering in `latest_open_session` mean anything.
 ///
 /// Without it every session keeps the stamp it was inserted with, and the order
-/// is the old one wearing a new column's name — so this asserts the stamp moves
-/// on an event that is not the one that created the session.
+/// is the old one wearing a new column's name — so this drives every event that
+/// is supposed to stamp and asserts the stamp moved each time, iterating rather
+/// than naming two events so that an event added later is covered without
+/// anybody remembering to add it here.
+///
+/// Six of the seven events are driven in the loop below. `UserPromptSubmit`
+/// is not one of them, and deliberately so rather than by omission: it is
+/// what binds the session in the first place (`insert_session`), so there is
+/// no earlier stamp on this hint to advance past — the row does not exist
+/// until this call creates it, with `last_seen_at` set to `started_at`. That
+/// row's existence, read as `previous` right after the call, is this event's
+/// verification; the loop then checks that every later event moves the stamp
+/// on the row this one created.
+///
+/// `Stop` is the one deliberate exception among the driven events: it
+/// returns before the store opens (see `handle`), so it must NOT move
+/// `last_seen_at`. A regression that let `SubagentStop` fall back behind that
+/// same early return — which is exactly what "the event stopped being thrown
+/// away" undoes — would show up here as that event's stamp failing to
+/// advance.
 #[test]
 fn every_hook_event_records_that_its_session_was_heard_from() {
     let fixture = Fixture::new();
@@ -1284,17 +1521,32 @@ fn every_hook_event_records_that_its_session_was_heard_from() {
         &fixture.base("UserPromptSubmit", session),
     );
 
-    let stamp_after_first = last_seen_of(&fixture, session);
+    // The stamp `insert_session` set when this call created the session row
+    // — see the doc comment above for why there is nothing earlier to
+    // compare it against.
+    let mut previous = last_seen_of(&fixture, session);
 
-    // Far enough apart that the two stamps cannot land in the same instant.
-    std::thread::sleep(Duration::from_millis(20));
-    fixture.hook("session-start", &fixture.base("SessionStart", session));
+    for (event, name) in [
+        ("session-start", "SessionStart"),
+        ("post-tool-use", "PostToolUse"),
+        ("pre-compact", "PreCompact"),
+        ("subagent-stop", "SubagentStop"),
+        ("session-end", "SessionEnd"),
+    ] {
+        // Far enough apart that consecutive stamps cannot land in the same
+        // instant.
+        std::thread::sleep(Duration::from_millis(20));
 
-    let stamp_after_second = last_seen_of(&fixture, session);
-    assert!(
-        stamp_after_second > stamp_after_first,
-        "a later hook event must advance last_seen_at: {stamp_after_first} then {stamp_after_second}"
-    );
+        let run = fixture.hook(event, &fixture.base(name, session));
+        assert!(run.succeeded(), "{event} must not fail the session");
+
+        let stamp = last_seen_of(&fixture, session);
+        assert!(
+            stamp > previous,
+            "{event} must advance last_seen_at: {previous} then {stamp}"
+        );
+        previous = stamp;
+    }
 }
 
 /// The newest stamp held for `session`, read straight from the profile.

@@ -46,6 +46,17 @@ pub enum Event {
     Stop,
 }
 
+/// A subagent's identity, carried as one value rather than two facets that
+/// happen to travel together. `id` and `kind` (the payload's `agent_type`)
+/// are only meaningful as a pair — a bare `kind` names nothing without the
+/// `id` it describes — and threading them as separate `Option`s let that
+/// pairing drift apart at the call site with nothing enforcing it.
+#[derive(Clone, Copy, Debug)]
+struct Subagent<'a> {
+    id: &'a str,
+    kind: Option<&'a str>,
+}
+
 impl Event {
     /// Parses the CLI subcommand name.
     #[must_use]
@@ -82,12 +93,20 @@ pub fn handle(event: Event, input: &Value, state_dir: &Path) -> anyhow::Result<S
         return Ok(String::new());
     };
 
-    match event {
-        // Recording a subagent's findings and nudging on a stale checkpoint both
-        // belong to later slices. The events are wired now so the plugin
-        // manifest stays stable and the no-op path is covered by tests.
-        Event::SubagentStop | Event::Stop => return Ok(String::new()),
-        _ => {}
+    // Read beside the session, in the same single point every event passes
+    // through, for the same reason the `last_seen_at` stamp lives here: a
+    // handler added later is covered without anybody remembering to wire it
+    // in. The harness documents both fields as present only inside a
+    // subagent's own events.
+    let agent = string_field(input, "agent_id");
+    let agent_type = string_field(input, "agent_type");
+
+    // Nudging on a stale checkpoint belongs to a later slice. `Stop` is wired
+    // now so the plugin manifest stays stable and the no-op path is covered
+    // by tests. `SubagentStop` cannot join it here: recording that a subagent
+    // returned needs the store, which is not open yet.
+    if event == Event::Stop {
+        return Ok(String::new());
     }
 
     let store = Store::open(&crate::paths::database_path(state_dir))?;
@@ -102,10 +121,24 @@ pub fn handle(event: Event, input: &Value, state_dir: &Path) -> anyhow::Result<S
     match event {
         Event::SessionStart => session_start(&store, &session, &cwd),
         Event::UserPromptSubmit => user_prompt_submit(&store, &session, &cwd, input),
-        Event::PostToolUse => post_tool_use(&store, &session, input),
+        Event::PostToolUse => post_tool_use(
+            &store,
+            &session,
+            agent.as_deref().map(|id| Subagent {
+                id,
+                kind: agent_type.as_deref(),
+            }),
+            input,
+        ),
         Event::PreCompact => pre_compact(&store, &session, &cwd, input),
         Event::SessionEnd => session_end(&store, &session, input),
-        Event::SubagentStop | Event::Stop => Ok(String::new()),
+        Event::SubagentStop => {
+            if let Some(agent) = agent.as_deref() {
+                store.mark_agent_returned(agent)?;
+            }
+            Ok(String::new())
+        }
+        Event::Stop => Ok(String::new()),
     }
 }
 
@@ -252,17 +285,29 @@ fn memory_index(
 
 /// Appends one observed mutation to the ledger. Deliberately silent: the ledger
 /// exists to be read at restore time, not narrated as it fills.
-fn post_tool_use(store: &Store, session: &str, input: &Value) -> anyhow::Result<String> {
+///
+/// Records the agent before appending, and in that order: `file_ledger.agent_id`
+/// references `agents(id)` with foreign keys on, so an insert naming an agent
+/// that was never recorded is refused outright — and since `hook.rs` swallows
+/// errors by contract, that refusal would drop the edit from the ledger
+/// entirely rather than merely lose its attribution.
+fn post_tool_use(
+    store: &Store,
+    session: &str,
+    subagent: Option<Subagent<'_>>,
+    input: &Value,
+) -> anyhow::Result<String> {
     let Some(path) = edited_path(input) else {
         return Ok(String::new());
     };
 
-    // `None` for now: the payload's `agent_id` is not read here yet. Wiring
-    // it through is the next task; this one only gives `append_ledger`
-    // somewhere to put it.
+    if let Some(Subagent { id, kind }) = subagent {
+        store.record_agent(session, id, kind)?;
+    }
+
     store.append_ledger_for_external_session(
         session,
-        None,
+        subagent.map(|subagent| subagent.id),
         &FileLedgerEntry {
             path,
             tool: string_field(input, "tool_name").unwrap_or_else(|| "unknown".into()),
